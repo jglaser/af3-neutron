@@ -17,6 +17,8 @@ from af3_neutron.af3_runner import ModelRunner, make_model_config
 from af3_neutron.topology import build_decoupled_topology_from_struct
 from af3_neutron.sampler import run_neutron_guided_diffusion, generate_final_oracle_coords
 
+import biotite.structure.io.pdbx as pdbx
+
 FLAGS = flags.FLAGS
 flags.DEFINE_string('mtz_path', '', 'Optional path to MTZ file for neutron refinement.')
 flags.DEFINE_string('json_path', 'betalac_tetramer_refinement_input.json', 'Path to JSON.')
