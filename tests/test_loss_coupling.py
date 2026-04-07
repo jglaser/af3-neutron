@@ -11,7 +11,7 @@ def test_loss_mapping_and_gradients():
     num_oracle_atoms = 7
     
     mapping = {
-        "oracle_heavy": jnp.array([0, 1, 2, 3, 4]), # Heavy atoms go here
+        "oracle_heavy": jnp.array([0, 1, 2, 3, 4]), 
         "af3_source": jnp.array([0, 1, 2, 3, 4]),
         "num_oracle_atoms": num_oracle_atoms
     }
@@ -26,30 +26,36 @@ def test_loss_mapping_and_gradients():
         "ideal_theta": jnp.array([109.5, 109.5]),
     }
     
+    # Empty water mappings for this test
+    water_mapping = {
+        "oxygen_source": jnp.array([], dtype=jnp.int32),
+        "h1_target": jnp.array([], dtype=jnp.int32),
+        "h2_target": jnp.array([], dtype=jnp.int32)
+    }
+    
     chi_angles = jnp.array([0.0, 0.0])
+    water_rotations = jnp.zeros((0, 3))
     
     # 1. Forward Pass Test
-    loss = decoupled_crystallographic_loss(x_af3_flat, chi_angles, rotor_table, mapping)
+    loss = decoupled_crystallographic_loss(
+        x_af3_flat, chi_angles, water_rotations, rotor_table, mapping, water_mapping
+    )
     assert loss.shape == ()
     assert loss > 0.0
     assert not jnp.isnan(loss)
     
-    # 2. Backward Pass Test
-    grad_fn = jax.value_and_grad(decoupled_crystallographic_loss, argnums=(0, 1))
-    _, (grad_heavy, grad_chi) = grad_fn(x_af3_flat, chi_angles, rotor_table, mapping)
+    # 2. Backward Pass Test (argnums=(0,1,2) to catch heavy, chi, and water)
+    grad_fn = jax.value_and_grad(decoupled_crystallographic_loss, argnums=(0, 1, 2))
+    _, (grad_heavy, grad_chi, grad_water) = grad_fn(
+        x_af3_flat, chi_angles, water_rotations, rotor_table, mapping, water_mapping
+    )
     
-    # The gradient returned to the ODE loop must perfectly match the AF3 tensor size
     assert grad_heavy.shape == x_af3_flat.shape
-    
-    # The chi gradients must match the number of rotors
     assert grad_chi.shape == chi_angles.shape
-    
-    # Ensure gradients exist (are non-zero) since we mapped atoms
+    assert grad_water.shape == water_rotations.shape
     assert jnp.any(jnp.abs(grad_heavy) > 0)
 
 def test_loss_empty_rotors():
-    # Ensure the code doesn't crash if Hydride finds ZERO missing protons 
-    # (e.g. a structure that is entirely heavy atoms or water)
     x_af3_flat = jnp.ones((3, 3))
     
     mapping = {
@@ -67,10 +73,58 @@ def test_loss_empty_rotors():
         "ideal_theta": jnp.array([], dtype=jnp.float32),
     }
     
-    chi_angles = jnp.array([], dtype=jnp.float32)
+    water_mapping = {
+        "oxygen_source": jnp.array([], dtype=jnp.int32),
+        "h1_target": jnp.array([], dtype=jnp.int32),
+        "h2_target": jnp.array([], dtype=jnp.int32)
+    }
     
-    grad_fn = jax.value_and_grad(decoupled_crystallographic_loss, argnums=(0, 1))
-    loss, (grad_heavy, grad_chi) = grad_fn(x_af3_flat, chi_angles, rotor_table, mapping)
+    chi_angles = jnp.array([], dtype=jnp.float32)
+    water_rotations = jnp.zeros((0, 3))
+    
+    grad_fn = jax.value_and_grad(decoupled_crystallographic_loss, argnums=(0, 1, 2))
+    loss, (grad_heavy, grad_chi, grad_water) = grad_fn(
+        x_af3_flat, chi_angles, water_rotations, rotor_table, mapping, water_mapping
+    )
     
     assert not jnp.isnan(loss)
     assert grad_heavy.shape == x_af3_flat.shape
+
+def test_water_loss_mapping():
+    # Test that SO(3) rotations properly propagate gradients to the water orientation tensor
+    x_af3_flat = jnp.array([[0.0, 0.0, 0.0]]) # Just one Oxygen
+    num_oracle_atoms = 3 # O, H1, H2
+    
+    mapping = {
+        "oracle_heavy": jnp.array([0]),
+        "af3_source": jnp.array([0]),
+        "num_oracle_atoms": num_oracle_atoms
+    }
+    
+    rotor_table = {
+        "target_idx": jnp.array([], dtype=jnp.int32),
+        "parent_idx": jnp.array([], dtype=jnp.int32),
+        "grandparent_idx": jnp.array([], dtype=jnp.int32),
+        "greatgrand_idx": jnp.array([], dtype=jnp.int32),
+        "ideal_r": jnp.array([], dtype=jnp.float32),
+        "ideal_theta": jnp.array([], dtype=jnp.float32),
+    }
+    
+    water_mapping = {
+        "oxygen_source": jnp.array([0], dtype=jnp.int32),
+        "h1_target": jnp.array([1], dtype=jnp.int32),
+        "h2_target": jnp.array([2], dtype=jnp.int32)
+    }
+    
+    chi_angles = jnp.array([], dtype=jnp.float32)
+    water_rotations = jnp.array([[0.1, 0.2, 0.3]]) # Tiny initial axis-angle rotation
+    
+    grad_fn = jax.value_and_grad(decoupled_crystallographic_loss, argnums=(0, 1, 2))
+    loss, (grad_heavy, grad_chi, grad_water) = grad_fn(
+        x_af3_flat, chi_angles, water_rotations, rotor_table, mapping, water_mapping
+    )
+    
+    assert not jnp.isnan(loss)
+    assert grad_water.shape == (1, 3)
+    # Ensure gradients flowed from the dummy loss back to the axis-angle vector
+    assert jnp.any(jnp.abs(grad_water) > 0)

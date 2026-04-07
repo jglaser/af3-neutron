@@ -6,23 +6,16 @@ import jax.numpy as jnp
 import biotite.structure as struc
 import biotite.structure.io.pdbx as pdbx
 import hydride
-
 from alphafold3.model.atom_layout import atom_layout
 
 def build_decoupled_topology_from_struct(cleaned_struc, ccd, fold_input):
-    """
-    Builds the Hydride Oracle using the pre-tokenized cleaned structure and 
-    templates, establishing the mappings before the neural network even runs.
-    """
     logging.info("Building Hydride Crystallographic Oracle from template...")
     
-    # 1. Get standard AF3 layout for mapping
     residues = atom_layout.residues_from_structure(cleaned_struc)
     flat_layout = atom_layout.make_flat_atom_layout(
         residues, ccd, with_hydrogens=True, skip_unk_residues=True
     )
     
-    # 2. Parse Template for Oracle Base
     template_cif_string = None
     for chain in fold_input.chains:
         if hasattr(chain, 'templates') and chain.templates:
@@ -34,7 +27,6 @@ def build_decoupled_topology_from_struct(cleaned_struc, ccd, fold_input):
     oracle_atoms = pdbx.get_structure(cif_file, model=1)
     oracle_atoms = oracle_atoms[oracle_atoms.element != "H"] 
     
-    # 3. Build Full Hydrogen Topology
     oracle_atoms.bonds = struc.connect_via_residue_names(oracle_atoms)
     if "charge" not in oracle_atoms.get_annotation_categories():
         oracle_atoms.add_annotation("charge", dtype=int)
@@ -44,34 +36,48 @@ def build_decoupled_topology_from_struct(cleaned_struc, ccd, fold_input):
     oracle_atoms.coord = hydride.relax_hydrogen(oracle_atoms)
     num_oracle_atoms = oracle_atoms.array_length()
 
-    # 4. Map AF3 flat_layout to fast lookup dictionary
     af3_lookup = {}
     for i in range(flat_layout.shape[0]):
         key = (flat_layout.chain_id[i], flat_layout.res_id[i], flat_layout.atom_name[i])
         af3_lookup[key] = i
 
-    # 5. Extract the Z-Matrix
     bonds, _ = oracle_atoms.bonds.get_all_bonds()
 
+    # --- WATER EXTRACTION PASS ---
+    water_o_source, water_h1_target, water_h2_target = [], [], []
+    for i in range(num_oracle_atoms):
+        is_water = oracle_atoms.res_name[i] in ['HOH', 'WAT', 'H2O']
+        if is_water and oracle_atoms.element[i] == 'O':
+            o_key = (oracle_atoms.chain_id[i], oracle_atoms.res_id[i], oracle_atoms.atom_name[i])
+            if o_key in af3_lookup:
+                bonded_idx = bonds[i][bonds[i] != -1]
+                h_idx = [idx for idx in bonded_idx if oracle_atoms.element[idx] == 'H']
+                if len(h_idx) == 2:
+                    water_o_source.append(af3_lookup[o_key])
+                    water_h1_target.append(h_idx[0])
+                    water_h2_target.append(h_idx[1])
+
+    # --- STANDARD EXTRACTION PASS ---
     rotor_table = {
-        "target_idx": [], "parent_idx": [], 
-        "grandparent_idx": [], "greatgrand_idx": [],
-        "ideal_r": [], "ideal_theta": []
+        "target_idx": [], "parent_idx": [], "grandparent_idx": [], 
+        "greatgrand_idx": [], "ideal_r": [], "ideal_theta": []
     }
-    
-    oracle_heavy_indices = []
-    af3_source_indices = []
+    oracle_heavy_indices, af3_source_indices = [], []
 
     for i in range(num_oracle_atoms):
         is_hydrogen = (oracle_atoms.element[i] == "H")
         h_key = (oracle_atoms.chain_id[i], oracle_atoms.res_id[i], oracle_atoms.atom_name[i])
         
+        # Heavy atoms (including water Oxygen) get mapped directly
         if h_key in af3_lookup:
             oracle_heavy_indices.append(i)
             af3_source_indices.append(af3_lookup[h_key])
             continue
             
         if not is_hydrogen: continue
+        
+        # Skip hydrogens that belong to water (handled by SO(3))
+        if i in water_h1_target or i in water_h2_target: continue
             
         p_indices = bonds[i][bonds[i] != -1]
         if len(p_indices) == 0: continue
@@ -108,8 +114,9 @@ def build_decoupled_topology_from_struct(cleaned_struc, ccd, fold_input):
         rotor_table["ideal_r"].append(r_ideal)
         rotor_table["ideal_theta"].append(theta_ideal)
 
-    logging.info(f"Pre-mapped {len(oracle_heavy_indices)} AF3 targets to Oracle space.")
-    logging.info(f"Delegated {len(rotor_table['target_idx'])} protons to JAX NeRF.")
+    logging.info(f"Mapped {len(oracle_heavy_indices)} AF3 heavy atoms.")
+    logging.info(f"Mapped {len(water_o_source)} SO(3) orientable water molecules.")
+    logging.info(f"Mapped {len(rotor_table['target_idx'])} NeRF protein protons.")
 
     return (
         {k: jnp.array(v, dtype=jnp.float32 if "ideal" in k else jnp.int32) for k, v in rotor_table.items()},
@@ -117,5 +124,10 @@ def build_decoupled_topology_from_struct(cleaned_struc, ccd, fold_input):
             "oracle_heavy": jnp.array(oracle_heavy_indices, dtype=jnp.int32),
             "af3_source": jnp.array(af3_source_indices, dtype=jnp.int32),
             "num_oracle_atoms": num_oracle_atoms
+        },
+        {
+            "oxygen_source": jnp.array(water_o_source, dtype=jnp.int32),
+            "h1_target": jnp.array(water_h1_target, dtype=jnp.int32),
+            "h2_target": jnp.array(water_h2_target, dtype=jnp.int32)
         }
     )

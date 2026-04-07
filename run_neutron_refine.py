@@ -31,15 +31,16 @@ def main(argv):
     ccd = chemical_components.Ccd()
     
     struct = fold_input.to_structure(ccd=ccd)
+    # Ensure waters are NOT filtered
     cleaned_struc, _ = structure_cleaning.clean_structure(
         struct, ccd=ccd, drop_non_standard_atoms=True, drop_missing_sequence=True,
-        filter_clashes=False, filter_crystal_aids=False, filter_waters=True,
+        filter_clashes=False, filter_crystal_aids=False, filter_waters=False,  # <--- MUST BE FALSE
         filter_hydrogens=False, filter_leaving_atoms=True,
         only_glycan_ligands_for_leaving_atoms=True, covalent_bonds_only=True,
         remove_polymer_polymer_bonds=True, remove_bad_bonds=True, remove_nonsymmetric_bonds=False
     )
-    
-    rotor_table, mapping = build_decoupled_topology_from_struct(cleaned_struc, ccd, fold_input)
+
+    rotor_table, mapping, water_mapping = build_decoupled_topology_from_struct(cleaned_struc, ccd, fold_input)
     
     logging.info("Running native AF3 featurisation...")
     featurised_examples = featurisation.featurise_input(
@@ -66,15 +67,16 @@ def main(argv):
     noise_levels = diffusion_head.noise_schedule(jnp.linspace(0, 1, 21))
     initial_noise = jax.random.normal(noise_key, mask_shape + (3,)) * noise_levels[0]
     
-    final_coords, final_chis = run_neutron_guided_diffusion(
+    final_coords, final_chis, final_waters = run_neutron_guided_diffusion(
         vf_step_fn=model_runner.evaluate_vector_field,
         batch=batch,
         embeddings=embeddings,
         initial_noise=initial_noise,
         rotor_table=rotor_table,
         mapping=mapping,
+        water_mapping=water_mapping,
         n_steps=20
-    )
+    ) 
     logging.info("Neutron ODE Refinement Complete!")
 
 if __name__ == "__main__":
