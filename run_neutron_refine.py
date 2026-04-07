@@ -14,7 +14,7 @@ from alphafold3.model.network import diffusion_head
 
 from af3_neutron.af3_runner import ModelRunner, make_model_config
 from af3_neutron.topology import build_decoupled_topology_from_struct
-from af3_neutron.sampler import run_neutron_guided_diffusion
+from af3_neutron.sampler import run_neutron_guided_diffusion, generate_final_oracle_coords
 
 FLAGS = flags.FLAGS
 flags.DEFINE_string('mtz_path', '', 'Optional path to MTZ file for neutron refinement.')
@@ -76,6 +76,7 @@ def main(argv):
     noise_levels = diffusion_head.noise_schedule(jnp.linspace(0, 1, 21))
     initial_noise = jax.random.normal(noise_key, mask_shape + (3,)) * noise_levels[0]
   
+    # 6. Phase 2: The Hijacked ODE Loop
     final_coords, final_chis, final_waters = run_neutron_guided_diffusion(
         vf_step_fn=model_runner.evaluate_vector_field,
         batch=batch,
@@ -88,6 +89,32 @@ def main(argv):
         n_steps=20
     )
     logging.info("Neutron ODE Refinement Complete!")
+    
+    # 7. Construct Final Structure
+    logging.info("Assembling final atomic coordinates...")
+    
+    # final_coords has shape (num_tokens, max_atoms_per_token, 3). Flatten it.
+    final_af3_flat = final_coords.reshape((-1, 3))
+    
+    # Generate the full coordinate array including optimized protons
+    final_x_full = generate_final_oracle_coords(
+        final_af3_flat, final_chis, final_waters, 
+        rotor_table, mapping, water_mapping
+    )
+    
+    # Apply coordinates to the Biotite Oracle
+    oracle_atoms.coord = np.array(final_x_full)
+    
+    # 8. Write to mmCIF
+    output_cif_path = pathlib.Path(FLAGS.output_path)
+    output_cif_path.parent.mkdir(parents=True, exist_ok=True)
+    
+    logging.info(f"Writing refined structure to {output_cif_path}...")
+    cif_file = pdbx.CIFFile()
+    pdbx.set_structure(cif_file, oracle_atoms, data_block="neutron_refined")
+    cif_file.write(output_cif_path)
+    
+    logging.info("Done.")
 
 if __name__ == "__main__":
     app.run(main)

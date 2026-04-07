@@ -97,3 +97,27 @@ def run_neutron_guided_diffusion(
         water_rotations = water_rotations - (lr_chi * grad_water)
         
     return positions * mask[..., None], chi_angles, water_rotations
+
+def generate_final_oracle_coords(x_af3_flat, chi_angles, water_rotations, rotor_table, mapping, water_mapping):
+    """
+    Reconstructs the full atomic coordinate array by combining the AF3 heavy
+    atoms, the NeRF protein protons, and the SO(3) water protons.
+    """
+    x_full = jnp.zeros((mapping["num_oracle_atoms"], 3))
+
+    # 1. Map Heavy Atoms
+    x_full = x_full.at[mapping["oracle_heavy"]].set(x_af3_flat[mapping["af3_source"]])
+
+    # 2. Map NeRF Protein Protons
+    if rotor_table["target_idx"].shape[0] > 0:
+        x_h = generalized_nerf_layer(x_af3_flat, rotor_table, chi_angles)
+        x_full = x_full.at[rotor_table["target_idx"]].set(x_h)
+
+    # 3. Map SO(3) Water Protons
+    if water_mapping["oxygen_source"].shape[0] > 0:
+        oxygen_coords = x_af3_flat[water_mapping["oxygen_source"]]
+        h1, h2 = so3_water_layer(oxygen_coords, water_rotations)
+        x_full = x_full.at[water_mapping["h1_target"]].set(h1)
+        x_full = x_full.at[water_mapping["h2_target"]].set(h2)
+
+    return x_full
