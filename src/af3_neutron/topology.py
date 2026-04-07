@@ -1,26 +1,32 @@
-import io
 import logging
 import numpy as np
 import jax.numpy as jnp
 
 import biotite.structure as struc
-import biotite.structure.io.pdbx as pdbx
 import hydride
 
-def build_decoupled_topology(flat_layout, fold_input):
-    logging.info("Building Hydride Crystallographic Oracle from template...")
+def build_decoupled_topology(flat_layout, x_af3_flat_baseline):
+    logging.info("Building full-complex Hydride Oracle from AF3 baseline prediction...")
     
-    template_cif_string = None
-    for chain in fold_input.chains:
-        if hasattr(chain, 'templates') and chain.templates:
-            for t in chain.templates:
-                if t.mmcif: template_cif_string = t.mmcif; break
-        if template_cif_string: break
-
-    cif_file = pdbx.CIFFile.read(io.StringIO(template_cif_string))
-    oracle_atoms = pdbx.get_structure(cif_file, model=1)
-    oracle_atoms = oracle_atoms[oracle_atoms.element != "H"] 
+    num_atoms = flat_layout.shape[0]
+    atoms = struc.AtomArray(num_atoms)
+    atoms.coord = np.array(x_af3_flat_baseline)
     
+    # Enforce standard datatypes
+    atoms.atom_name = np.array(flat_layout.atom_name, dtype="U")
+    atoms.res_name = np.array(flat_layout.res_name, dtype="U")
+    atoms.chain_id = np.array(flat_layout.chain_id, dtype="U")
+    atoms.res_id = np.array(flat_layout.res_id, dtype=int)
+    
+    # Force the sequence into standard uppercase strings, then cast to U2 NumPy array
+    elements = [str(e).strip().upper() for e in flat_layout.atom_element]
+    atoms.element = np.array(elements, dtype="U2")
+    
+    # 2. Start Oracle with Heavy Atoms only (The "Riding Proton" paradigm)
+    heavy_mask = (atoms.element != "H") & (atoms.element != "D")
+    oracle_atoms = atoms[heavy_mask]
+    
+    # 3. Add hydrogens dynamically to the entire complex
     oracle_atoms.bonds = struc.connect_via_residue_names(oracle_atoms)
     if "charge" not in oracle_atoms.get_annotation_categories():
         oracle_atoms.add_annotation("charge", dtype=int)
@@ -32,6 +38,7 @@ def build_decoupled_topology(flat_layout, fold_input):
 
     # The flat_layout matches the exact atom order DeepMind expects
     af3_lookup = {}
+
     for i in range(flat_layout.shape[0]):
         key = (flat_layout.chain_id[i], flat_layout.res_id[i], flat_layout.atom_name[i])
         af3_lookup[key] = i
@@ -105,9 +112,9 @@ def build_decoupled_topology(flat_layout, fold_input):
         rotor_table["ideal_r"].append(r_ideal)
         rotor_table["ideal_theta"].append(theta_ideal)
 
-    logging.info(f"Mapped {len(oracle_heavy_indices)} AF3 natively tracked atoms.")
+    logging.info(f"Mapped {len(oracle_heavy_indices)} AF3 natively tracked heavy atoms.")
     logging.info(f"Mapped {len(water_o_source)} SO(3) orientable water molecules.")
-    logging.info(f"Delegated {len(rotor_table['target_idx'])} dropped overflow protons to JAX NeRF.")
+    logging.info(f"Delegated {len(rotor_table['target_idx'])} dynamically generated protons to JAX NeRF.")
 
     return (
         {k: jnp.array(v, dtype=jnp.float32 if "ideal" in k else jnp.int32) for k, v in rotor_table.items()},

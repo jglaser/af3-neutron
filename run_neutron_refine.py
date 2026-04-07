@@ -66,14 +66,6 @@ def main(argv):
     )
     gather_idxs = jnp.array(gather_info.gather_idxs) 
 
-    # We pass DeepMind's flat_layout to build perfectly ordered anchors
-    rotor_table, mapping, water_mapping, oracle_atoms = build_decoupled_topology(flat_layout, fold_input)
-    
-    if FLAGS.mtz_path:
-        sfc_instance = init_neutron_sfc(oracle_atoms, FLAGS.mtz_path)
-    else:
-        sfc_instance = None
-    
     logging.info("Loading AF3 Weights...")
     device = jax.local_devices(backend='gpu')[FLAGS.gpu_device]
     model_runner = ModelRunner(config=make_model_config(), device=device, model_dir=model_dir)
@@ -87,7 +79,28 @@ def main(argv):
     mask_shape = batch['pred_dense_atom_mask'].shape
     noise_levels = diffusion_head.noise_schedule(jnp.linspace(0, 1, 21))
     initial_noise = jax.random.normal(noise_key, mask_shape + (3,)) * noise_levels[0]
+   
+    # --- NEW: Generate 1-step baseline prediction for Oracle initialization ---
+    logging.info("Generating 1-step baseline prediction for full-complex Oracle initialization...")
+    t_hat = jnp.array([noise_levels[0]])
+    positions_denoised = model_runner.evaluate_vector_field(
+        jax.random.PRNGKey(0), initial_noise, t_hat, batch, embeddings
+    )
     
+    positions_flat = positions_denoised.reshape((-1, 3))
+    x_af3_flat_baseline = np.array(positions_flat[gather_idxs])
+    
+    # We pass DeepMind's flat_layout and the baseline coordinates to build the full tetramer anchors
+    rotor_table, mapping, water_mapping, oracle_atoms = build_decoupled_topology(
+        flat_layout, x_af3_flat_baseline
+    )
+    # -------------------------------------------------------------------------
+
+    if FLAGS.mtz_path:
+        sfc_instance = init_neutron_sfc(oracle_atoms, FLAGS.mtz_path)
+    else:
+        sfc_instance = None
+
     final_coords, final_chis, final_waters = run_neutron_guided_diffusion(
         vf_step_fn=model_runner.evaluate_vector_field,
         batch=batch,
