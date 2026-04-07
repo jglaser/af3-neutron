@@ -51,14 +51,13 @@ def main(argv):
     featurised_examples = featurisation.featurise_input(
         fold_input=fold_input, buckets=[256, 512, 1024, 2048, 4096], ccd=ccd, verbose=False
     )
-    
+   
     batch_dict = featurised_examples[0]
-    batch = jax.tree_util.tree_map(jnp.asarray, utils.remove_invalidly_typed_feats(batch_dict))
-    
-    # Extract Native Mappings!
-    batch_obj = feat_batch.Batch.from_data_dict(batch_dict)
-    flat_layout = batch_obj.convert_model_output.flat_output_layout
-    token_layout = batch_obj.convert_model_output.token_atoms_layout
+    batch_obj_raw = feat_batch.Batch.from_data_dict(batch_dict)
+    flat_layout = batch_obj_raw.convert_model_output.flat_output_layout
+    token_layout = batch_obj_raw.convert_model_output.token_atoms_layout
+    batch = jax.tree.map(jnp.asarray, utils.remove_invalidly_typed_feats(batch_dict))
+    batch_obj = feat_batch.Batch.from_data_dict(batch)
     
     gather_info = atom_layout.compute_gather_idxs(
         source_layout=token_layout, 
@@ -99,11 +98,12 @@ def main(argv):
     if FLAGS.mtz_path:
         sfc_instance = init_neutron_sfc(oracle_atoms, FLAGS.mtz_path)
     else:
+        logging.info("No MTZ file provided. Running with dummy physics loss.")
         sfc_instance = None
-
-    # Grab the exact Diffusion config used by the network
+    
+    # Extract the diffusion config
     diff_config = model_runner._model_config.heads.diffusion.eval
-
+   
     final_coords, final_chis, final_waters = run_neutron_guided_diffusion(
         vf_step_fn=model_runner.evaluate_vector_field,
         batch=batch,
@@ -117,13 +117,13 @@ def main(argv):
         n_steps=200,
         diff_config=diff_config
     )
-    
+     
     logging.info("Assembling final atomic coordinates...")
     final_x_full = generate_final_oracle_coords(
         final_coords, final_chis, final_waters, gather_idxs, 
         rotor_table, mapping, water_mapping
     )
-    
+
     oracle_atoms.coord = np.array(final_x_full)
     
     output_cif_path = pathlib.Path(FLAGS.output_path)
