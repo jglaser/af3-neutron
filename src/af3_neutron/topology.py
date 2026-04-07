@@ -129,5 +129,6 @@ def build_decoupled_topology_from_struct(cleaned_struc, ccd, fold_input):
             "oxygen_source": jnp.array(water_o_source, dtype=jnp.int32),
             "h1_target": jnp.array(water_h1_target, dtype=jnp.int32),
             "h2_target": jnp.array(water_h2_target, dtype=jnp.int32)
-        }
+        },
+        oracle_atoms
     )

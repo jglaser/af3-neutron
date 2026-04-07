@@ -17,6 +17,7 @@ from af3_neutron.topology import build_decoupled_topology_from_struct
 from af3_neutron.sampler import run_neutron_guided_diffusion
 
 FLAGS = flags.FLAGS
+flags.DEFINE_string('mtz_path', '', 'Optional path to MTZ file for neutron refinement.')
 flags.DEFINE_string('json_path', 'betalac_tetramer_refinement_input.json', 'Path to JSON.')
 flags.DEFINE_string('model_dir', '../af3_model_parameters/', 'Path to weights.')
 flags.DEFINE_integer('gpu_device', 0, 'GPU to use.')
@@ -40,8 +41,16 @@ def main(argv):
         remove_polymer_polymer_bonds=True, remove_bad_bonds=True, remove_nonsymmetric_bonds=False
     )
 
-    rotor_table, mapping, water_mapping = build_decoupled_topology_from_struct(cleaned_struc, ccd, fold_input)
-    
+    from af3_neutron.sfc_adapter import init_neutron_sfc
+
+    rotor_table, mapping, water_mapping, oracle_atoms = build_decoupled_topology_from_struct(cleaned_struc, ccd, fold_input)
+
+    if FLAGS.mtz_path:
+        sfc_instance = init_neutron_sfc(oracle_atoms, FLAGS.mtz_path)
+    else:
+        logging.info("No MTZ file provided. Running with dummy physics loss.")
+        sfc_instance = None 
+
     logging.info("Running native AF3 featurisation...")
     featurised_examples = featurisation.featurise_input(
         fold_input=fold_input, buckets=[256, 512, 1024, 2048, 4096], ccd=ccd, verbose=False
@@ -66,7 +75,7 @@ def main(argv):
     mask_shape = batch['pred_dense_atom_mask'].shape
     noise_levels = diffusion_head.noise_schedule(jnp.linspace(0, 1, 21))
     initial_noise = jax.random.normal(noise_key, mask_shape + (3,)) * noise_levels[0]
-    
+  
     final_coords, final_chis, final_waters = run_neutron_guided_diffusion(
         vf_step_fn=model_runner.evaluate_vector_field,
         batch=batch,
@@ -75,8 +84,9 @@ def main(argv):
         rotor_table=rotor_table,
         mapping=mapping,
         water_mapping=water_mapping,
+        sfc_instance=sfc_instance,
         n_steps=20
-    ) 
+    )
     logging.info("Neutron ODE Refinement Complete!")
 
 if __name__ == "__main__":
