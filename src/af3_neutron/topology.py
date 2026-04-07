@@ -7,34 +7,50 @@ import biotite.structure as struc
 import biotite.structure.io.pdbx as pdbx
 import hydride
 
-def build_oracle_from_af3_result(inference_result):
+from alphafold3.model.atom_layout import atom_layout
+
+def build_decoupled_topology_from_struct(cleaned_struc, ccd, fold_input):
     """
-    Takes the final predicted AF3 structure, uses Hydride to build the full 
-    Crystallographic Oracle (including dropped hydrogens), and extracts the Z-matrix.
+    Builds the Hydride Oracle using the pre-tokenized cleaned structure and 
+    templates, establishing the mappings before the neural network even runs.
     """
-    logging.info("Building Hydride Oracle from AF3 output state...")
+    logging.info("Building Hydride Crystallographic Oracle from template...")
     
-    # 1. Load AF3's predicted state
-    cif_file = pdbx.CIFFile.read(io.StringIO(inference_result.cif_string))
-    af3_atoms = pdbx.get_structure(cif_file, model=1)
+    # 1. Get standard AF3 layout for mapping
+    residues = atom_layout.residues_from_structure(cleaned_struc)
+    flat_layout = atom_layout.make_flat_atom_layout(
+        residues, ccd, with_hydrogens=True, skip_unk_residues=True
+    )
     
-    # Fast lookup for AF3 atom indices
-    af3_lookup = {}
-    for i in range(af3_atoms.array_length()):
-        key = (af3_atoms.chain_id[i], af3_atoms.res_id[i], af3_atoms.atom_name[i])
-        af3_lookup[key] = i
+    # 2. Parse Template for Oracle Base
+    template_cif_string = None
+    for chain in fold_input.chains:
+        if hasattr(chain, 'templates') and chain.templates:
+            for t in chain.templates:
+                if t.mmcif: template_cif_string = t.mmcif; break
+        if template_cif_string: break
+
+    cif_file = pdbx.CIFFile.read(io.StringIO(template_cif_string))
+    oracle_atoms = pdbx.get_structure(cif_file, model=1)
+    oracle_atoms = oracle_atoms[oracle_atoms.element != "H"] 
+    
+    # 3. Build Full Hydrogen Topology
+    oracle_atoms.bonds = struc.connect_via_residue_names(oracle_atoms)
+    if "charge" not in oracle_atoms.get_annotation_categories():
+        oracle_atoms.add_annotation("charge", dtype=int)
+        oracle_atoms.charge[:] = 0 
         
-    # 2. Let Hydride build the Oracle
-    af3_atoms.bonds = struc.connect_via_residue_names(af3_atoms)
-    if "charge" not in af3_atoms.get_annotation_categories():
-        af3_atoms.add_annotation("charge", dtype=int)
-        af3_atoms.charge[:] = 0 
-        
-    oracle_atoms, _ = hydride.add_hydrogen(af3_atoms)
+    oracle_atoms, _ = hydride.add_hydrogen(oracle_atoms)
     oracle_atoms.coord = hydride.relax_hydrogen(oracle_atoms)
     num_oracle_atoms = oracle_atoms.array_length()
-    
-    # 3. Build the Decoupled Mappings
+
+    # 4. Map AF3 flat_layout to fast lookup dictionary
+    af3_lookup = {}
+    for i in range(flat_layout.shape[0]):
+        key = (flat_layout.chain_id[i], flat_layout.res_id[i], flat_layout.atom_name[i])
+        af3_lookup[key] = i
+
+    # 5. Extract the Z-Matrix
     bonds, _ = oracle_atoms.bonds.get_all_bonds()
 
     rotor_table = {
@@ -50,13 +66,11 @@ def build_oracle_from_af3_result(inference_result):
         is_hydrogen = (oracle_atoms.element[i] == "H")
         h_key = (oracle_atoms.chain_id[i], oracle_atoms.res_id[i], oracle_atoms.atom_name[i])
         
-        # If it's a heavy atom or a rigid hydrogen that AF3 kept, map directly
         if h_key in af3_lookup:
             oracle_heavy_indices.append(i)
             af3_source_indices.append(af3_lookup[h_key])
             continue
             
-        # If it's a dropped hydrogen, build its NeRF matrix
         if not is_hydrogen: continue
             
         p_indices = bonds[i][bonds[i] != -1]
@@ -77,7 +91,6 @@ def build_oracle_from_af3_result(inference_result):
         gp_key = (oracle_atoms.chain_id[gp_i], oracle_atoms.res_id[gp_i], oracle_atoms.atom_name[gp_i])
         ggp_key = (oracle_atoms.chain_id[ggp_i], oracle_atoms.res_id[ggp_i], oracle_atoms.atom_name[ggp_i])
         
-        # Anchors MUST exist in the AF3 network output
         if not (p_key in af3_lookup and gp_key in af3_lookup and ggp_key in af3_lookup):
             continue
             
@@ -88,21 +101,21 @@ def build_oracle_from_af3_result(inference_result):
         cos_theta = np.dot(v_hp, v_gpp) / (r_ideal * np.linalg.norm(v_gpp) + 1e-8)
         theta_ideal = np.degrees(np.arccos(np.clip(cos_theta, -1.0, 1.0)))
         
-        rotor_table["target_idx"].append(i) # Target is Oracle index
-        rotor_table["parent_idx"].append(af3_lookup[p_key]) # Anchors are AF3 indices
+        rotor_table["target_idx"].append(i) 
+        rotor_table["parent_idx"].append(af3_lookup[p_key]) 
         rotor_table["grandparent_idx"].append(af3_lookup[gp_key])
         rotor_table["greatgrand_idx"].append(af3_lookup[ggp_key])
         rotor_table["ideal_r"].append(r_ideal)
         rotor_table["ideal_theta"].append(theta_ideal)
 
-    logging.info(f"Mapped {len(oracle_heavy_indices)} atoms directly to AF3 state.")
-    logging.info(f"Delegated {len(rotor_table['target_idx'])} missing protons to JAX NeRF.")
+    logging.info(f"Pre-mapped {len(oracle_heavy_indices)} AF3 targets to Oracle space.")
+    logging.info(f"Delegated {len(rotor_table['target_idx'])} protons to JAX NeRF.")
 
-    rotor_table_jax = {k: jnp.array(v, dtype=jnp.float32 if "ideal" in k else jnp.int32) for k, v in rotor_table.items()}
-    mapping_jax = {
-        "oracle_heavy": jnp.array(oracle_heavy_indices, dtype=jnp.int32),
-        "af3_source": jnp.array(af3_source_indices, dtype=jnp.int32),
-        "num_oracle_atoms": num_oracle_atoms
-    }
-    
-    return rotor_table_jax, mapping_jax
+    return (
+        {k: jnp.array(v, dtype=jnp.float32 if "ideal" in k else jnp.int32) for k, v in rotor_table.items()},
+        {
+            "oracle_heavy": jnp.array(oracle_heavy_indices, dtype=jnp.int32),
+            "af3_source": jnp.array(af3_source_indices, dtype=jnp.int32),
+            "num_oracle_atoms": num_oracle_atoms
+        }
+    )

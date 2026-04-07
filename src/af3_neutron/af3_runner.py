@@ -4,78 +4,114 @@ import jax.numpy as jnp
 import numpy as np
 import haiku as hk
 import pathlib
-from collections.abc import Callable
 import tokamax
 
-from alphafold3.model import model, features, params
+from alphafold3.model import model, features, params, feat_batch
 from alphafold3.model.components import utils
+from alphafold3.model.network import evoformer as evoformer_network
+from alphafold3.model.network import diffusion_head
 
-def make_model_config(
-    *,
-    flash_attention_implementation: tokamax.DotProductAttentionImplementation = 'triton',
-    num_diffusion_samples: int = 1, # Changed to 1 to speed up testing
-    num_recycles: int = 10,
-    return_embeddings: bool = False,
-    return_distogram: bool = False,
-) -> model.Model.Config:
-    """Returns a model config with defaults overridden for neutron refinement."""
+def make_model_config():
     config = model.Model.Config()
-    config.global_config.flash_attention_implementation = flash_attention_implementation
-    config.heads.diffusion.eval.num_samples = num_diffusion_samples
-    config.num_recycles = num_recycles
-    config.return_embeddings = return_embeddings
-    config.return_distogram = return_distogram
+    config.global_config.flash_attention_implementation = 'triton'
+    config.heads.diffusion.eval.num_samples = 1
+    config.num_recycles = 1 # Set to 1 for fast testing
     return config
 
+# -------------------------------------------------------------------------
+# HAIKU NAMESPACE WRAPPERS
+# These force our detached components to inherit the 'diffuser/' prefix
+# so Haiku can find the DeepMind pre-trained weights.
+# -------------------------------------------------------------------------
+class TrunkWrapper(hk.Module):
+    def __init__(self, config, name='diffuser'):
+        super().__init__(name=name)
+        self.config = config
 
+    def __call__(self, batch):
+        embedding_module = evoformer_network.Evoformer(
+            self.config.evoformer, self.config.global_config
+        )
+        target_feat = model.create_target_feat_embedding(
+            batch=batch,
+            config=embedding_module.config,
+            global_config=self.config.global_config,
+        )
+
+        def recycle_body(_, args):
+            prev, key = args
+            key, subkey = jax.random.split(key)
+            embeddings = embedding_module(
+                batch=batch, prev=prev, target_feat=target_feat, key=subkey
+            )
+            embeddings['pair'] = embeddings['pair'].astype(jnp.float32)
+            embeddings['single'] = embeddings['single'].astype(jnp.float32)
+            return embeddings, key
+
+        num_res = batch.num_res
+        embeddings = {
+            'pair': jnp.zeros([num_res, num_res, self.config.evoformer.pair_channel], dtype=jnp.float32),
+            'single': jnp.zeros([num_res, self.config.evoformer.seq_channel], dtype=jnp.float32),
+            'target_feat': target_feat,
+        }
+        
+        key = hk.next_rng_key()
+        num_iter = self.config.num_recycles + 1
+        embeddings, _ = hk.fori_loop(0, num_iter, recycle_body, (embeddings, key))
+        
+        # Inject target_feat back into the final dict as the diffusion head expects it
+        embeddings['target_feat'] = target_feat
+        return embeddings
+
+
+class DiffusionWrapper(hk.Module):
+    def __init__(self, config, name='diffuser'):
+        super().__init__(name=name)
+        self.config = config
+        self.diffusion_module = diffusion_head.DiffusionHead(
+            self.config.heads.diffusion, self.config.global_config
+        )
+
+    def __call__(self, positions_noisy, noise_level, batch, embeddings):
+        return self.diffusion_module(
+            positions_noisy=positions_noisy,
+            noise_level=noise_level,
+            batch=batch,
+            embeddings=embeddings,
+            use_conditioning=True
+        )
+
+# -------------------------------------------------------------------------
+# MODEL RUNNER
+# -------------------------------------------------------------------------
 class ModelRunner:
-    """Helper class to run AF3 structure prediction stages."""
-
-    def __init__(self, config: model.Model.Config, device: jax.Device, model_dir: pathlib.Path):
+    def __init__(self, config, device, model_dir):
         self._model_config = config
         self._device = device
         self._model_dir = model_dir
 
     @functools.cached_property
-    def model_params(self) -> hk.Params:
-        """Loads model parameters from the model directory."""
+    def model_params(self):
         return params.get_model_haiku_params(model_dir=self._model_dir)
 
     @functools.cached_property
-    def _model(self) -> Callable[[jnp.ndarray, features.BatchDict], model.ModelResult]:
-        """Loads model parameters and returns a jitted model forward pass."""
+    def get_conditionings(self):
+        """Runs the Evoformer Trunk to get Pair and Single embeddings."""
         @hk.transform
-        def forward_fn(batch):
-            return model.Model(self._model_config)(batch)
+        def forward_trunk(batch_dict):
+            batch = feat_batch.Batch.from_data_dict(batch_dict)
+            return TrunkWrapper(self._model_config)(batch)
 
-        return functools.partial(
-            jax.jit(forward_fn.apply, device=self._device), self.model_params
-        )
+        return functools.partial(jax.jit(forward_trunk.apply, device=self._device), self.model_params)
 
-    def run_inference(self, featurised_example: features.BatchDict, rng_key: jnp.ndarray) -> model.ModelResult:
-        """Computes a forward pass of the model on a featurised example."""
-        featurised_example = jax.device_put(
-            jax.tree_util.tree_map(
-                jnp.asarray, utils.remove_invalidly_typed_feats(featurised_example)
-            ),
-            self._device,
-        )
-
-        result = self._model(rng_key, featurised_example)
-        result = jax.tree.map(np.asarray, result)
-        result = jax.tree.map(
-            lambda x: x.astype(jnp.float32) if x.dtype == jnp.bfloat16 else x,
-            result,
-        )
-        result = dict(result)
-        identifier = self.model_params['__meta__']['__identifier__'].tobytes()
-        result['__identifier__'] = identifier
-        return result
-
-    def extract_inference_results(self, batch: features.BatchDict, result: model.ModelResult, target_name: str):
-        """Extracts inference results from model outputs."""
-        return list(
-            model.Model.get_inference_result(
-                batch=batch, result=result, target_name=target_name
+    @functools.cached_property
+    def evaluate_vector_field(self):
+        """Evaluates the Diffusion Head to denoise positions."""
+        @hk.transform
+        def forward_diffusion(positions_noisy, noise_level, batch_dict, embeddings):
+            batch = feat_batch.Batch.from_data_dict(batch_dict)
+            return DiffusionWrapper(self._model_config)(
+                positions_noisy, noise_level, batch, embeddings
             )
-        )
+
+        return functools.partial(jax.jit(forward_diffusion.apply, device=self._device), self.model_params)
