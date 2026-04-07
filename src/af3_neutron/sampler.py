@@ -2,7 +2,8 @@ import logging
 import jax
 import jax.numpy as jnp
 from alphafold3.model.network import diffusion_head
-from alphafold3.model.network.diffusion_head import random_augmentation
+from alphafold3.model.network.diffusion_head import random_augmentation, random_rotation
+from alphafold3.model.components import utils
 from .kinematics import generalized_nerf_layer, so3_water_layer
 
 def placeholder_neutron_loss(x_full):
@@ -49,84 +50,130 @@ def run_neutron_guided_diffusion(
     rotor_table, mapping, water_mapping, sfc_instance=None, n_steps=200,
     diff_config=None
 ):
-    logging.info("Starting Dual-Kinematic SDE Loop (AF3 Native EDM)...")
-    
-    positions = initial_noise
-    mask = batch['pred_dense_atom_mask']
-    
+    logging.info("Starting Dual-Kinematic SDE Loop (AF3 Native EDM + Augmentation)...")
+
+    # Add the leading num_samples dimension (usually 1) for DeepMind compatibility
+    positions = jnp.expand_dims(initial_noise, axis=0)
+    mask = jnp.expand_dims(batch['pred_dense_atom_mask'], axis=0)
+
     num_rotors = rotor_table["target_idx"].shape[0]
     num_waters = water_mapping["oxygen_source"].shape[0]
-    
+
     chi_angles = jnp.zeros(num_rotors)
     water_rotations = jnp.zeros((num_waters, 3))
-    
+
     lr_heavy = 0.05
     lr_chi = 0.1
-    
+
     noise_levels = diffusion_head.noise_schedule(jnp.linspace(0, 1, n_steps + 1))
     key = jax.random.PRNGKey(42)
-    
-    # Safely extract DeepMind's native SDE parameters
+
     gamma_0 = getattr(diff_config, 'gamma_0', 0.0) if diff_config else 0.0
     gamma_min = getattr(diff_config, 'gamma_min', 0.0) if diff_config else 0.0
     noise_scale_cfg = getattr(diff_config, 'noise_scale', 1.0) if diff_config else 1.0
     step_scale = getattr(diff_config, 'step_scale', 1.0) if diff_config else 1.0
-    
+
     for step in range(n_steps):
         noise_level_prev = noise_levels[step]
         noise_level = noise_levels[step + 1]
 
         key, step_key, key_noise, key_aug = jax.random.split(key, 4)
-        
-        # 0. Native AF3 Augmentation (Centering)
-        # We strictly omit random 3D rotations to preserve the SFC_Jax crystal lattice frame,
-        # but we MUST apply masked centering to prevent multimer drift!
-        com = jnp.sum(positions * mask[..., None], axis=(0, 1)) / (jnp.sum(mask) + 1e-8)
-        positions = (positions - com) * mask[..., None]
-        
-        # 1. EDM SDE Noise Injection
+
+        # ---------------------------------------------------------
+        # 1. EXTRACT EXACT NATIVE TRANSFORMS
+        # ---------------------------------------------------------
+        # We split the key exactly as DeepMind does to capture the actual R and T
+        rotation_key, translation_key = jax.random.split(key_aug)
+        aug_R = random_rotation(rotation_key)
+        translation = jax.random.normal(translation_key, shape=(3,))
+
+        # Calculate the exact center of mass used during augmentation
+        center = utils.mask_mean(mask[..., None], positions, axis=(-2, -3), keepdims=True, eps=1e-6)
+
+        # Now safely apply the native AF3 augmentation
+        positions_aug = random_augmentation(rng_key=key_aug, positions=positions, mask=mask)
+
+        # ---------------------------------------------------------
+        # 2. NATIVE EDM NOISE INJECTION
+        # ---------------------------------------------------------
         gamma = gamma_0 * (noise_level > gamma_min)
         t_hat = noise_level_prev * (1 + gamma)
 
         var_diff = jnp.clip(t_hat**2 - noise_level_prev**2, a_min=0.0)
         noise_scale = noise_scale_cfg * jnp.sqrt(var_diff)
-        noise = noise_scale * jax.random.normal(key_noise, positions.shape) * mask[..., None]
-        
-        positions_noisy = positions + noise
+        noise = noise_scale * jax.random.normal(key_noise, positions_aug.shape) * mask[..., None]
 
-        # 2. Evaluate AF3 Denoising Step
+        positions_noisy = positions_aug + noise
+
+        # ---------------------------------------------------------
+        # 3. EVALUATE VECTOR FIELD (In Augmented Frame)
+        # ---------------------------------------------------------
         t_hat_arr = jnp.array([t_hat])
-        positions_denoised = vf_step_fn(step_key, positions_noisy, t_hat_arr, batch, embeddings)
-        
-        # 3. AF3 Score/Gradient
-        grad_af3 = (positions_noisy - positions_denoised) / t_hat
-        
-        # 4. Calculate Physics Loss using the clean denoised positions
+
+        # Strip batch dim for the custom vf_step_fn, then add it back
+        positions_denoised_aug = vf_step_fn(
+            step_key, positions_noisy[0], t_hat_arr, batch, embeddings
+        )
+        positions_denoised_aug = jnp.expand_dims(positions_denoised_aug, axis=0)
+
+        grad_af3_aug = (positions_noisy - positions_denoised_aug) / t_hat
+
+        # ---------------------------------------------------------
+        # 4. REVERSE AUGMENTATION TO CRYSTALLOGRAPHIC FRAME
+        # ---------------------------------------------------------
+        # Forward: x_aug = (x - center) @ R + T
+        # Inverse: x     = (x_aug - T) @ R^T + center
+
+        positions_denoised_cryst = jnp.einsum(
+            '...i,ij->...j',
+            positions_denoised_aug - translation,
+            aug_R.T,
+            precision=jax.lax.Precision.HIGHEST
+        ) + center
+
+        # The velocity gradient just needs the inverse rotation
+        grad_af3_cryst = jnp.einsum(
+            '...i,ij->...j',
+            grad_af3_aug,
+            aug_R.T,
+            precision=jax.lax.Precision.HIGHEST
+        )
+
+        # ---------------------------------------------------------
+        # 5. CALCULATE PHYSICS LOSS (In Crystallographic Frame)
+        # ---------------------------------------------------------
+        positions_flat = positions_denoised_cryst[0].reshape((-1, 3))
+
         loss_val, (grad_positions, grad_chi, grad_water) = grad_loss_fn(
-            positions_denoised, chi_angles, water_rotations, gather_idxs, 
+            positions_flat, chi_angles, water_rotations, gather_idxs,
             rotor_table, mapping, water_mapping, sfc_instance
         )
-        
+
         grad_positions = jnp.clip(grad_positions, -1.0, 1.0)
         grad_chi = jnp.clip(grad_chi, -0.1, 0.1)
         grad_water = jnp.clip(grad_water, -0.1, 0.1)
-        
+
         loss_type = "SFC L2" if sfc_instance else "Dummy"
         if step % 10 == 0 or step == n_steps - 1:
             logging.info(f"ODE Step {step} | {loss_type} Loss: {loss_val:.4f}")
-        
-        # 5. Native Update Step (Combining AF3 drift + Physics drift)
+
+        # Reshape gradient back to AF3 padded tensor (with batch dim)
+        grad_positions = grad_positions.reshape(positions_denoised_cryst[0].shape)
+        grad_positions = jnp.expand_dims(grad_positions, axis=0)
+
+        # ---------------------------------------------------------
+        # 6. INTEGRATION UPDATE (In Crystallographic Frame)
+        # ---------------------------------------------------------
         d_t = noise_level - t_hat
-        
-        positions_out = positions_noisy + step_scale * d_t * grad_af3 - (lr_heavy * grad_positions)
-        
-        # Apply mask to output
+
+        # Notice we are stepping the original `positions`, not `positions_noisy`
+        positions_out = positions + step_scale * d_t * grad_af3_cryst - (lr_heavy * grad_positions)
+
         positions = positions_out * mask[..., None]
-        
         chi_angles = chi_angles - (lr_chi * grad_chi)
         water_rotations = water_rotations - (lr_chi * grad_water)
-        
-    return positions_denoised * mask[..., None], chi_angles, water_rotations
+
+    return positions_denoised_cryst[0] * mask[0, ..., None], chi_angles, water_rotations
 
 def generate_final_oracle_coords(positions_denoised, chi_angles, water_rotations, gather_idxs, rotor_table, mapping, water_mapping):
     # FIX: Flatten and gather here as well
