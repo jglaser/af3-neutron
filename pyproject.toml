@@ -1,0 +1,18 @@
+[project]
+name = "af3_neutron"
+version = "0.1.0"
+description = "A JAX-based neutron crystallography refinement pipeline wrapping AlphaFold 3."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "alphafold3",
+    "numpy",
+    "rdkit",
+    "gemmi>=0.7.3",
+    "gemmi-program>=0.7.5",
+    "sfcalculator-jax",
+]
+
+[tool.uv.sources]
+sfcalculator-jax = { git = "https://github.com/Hekstra-Lab/SFcalculator_jax" }
+alphafold3 = { path = "/home/xvg/alphafold3" }

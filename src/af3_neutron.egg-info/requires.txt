@@ -1,0 +1,6 @@
+alphafold3
+numpy
+rdkit
+gemmi>=0.7.3
+gemmi-program>=0.7.5
+sfcalculator-jax
