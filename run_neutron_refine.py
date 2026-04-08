@@ -28,6 +28,20 @@ flags.DEFINE_string('model_dir', '../af3_model_parameters/', 'Path to weights.')
 flags.DEFINE_integer('gpu_device', 0, 'GPU to use.')
 flags.DEFINE_string('mtz_path', '', 'Optional path to MTZ file for neutron refinement.')
 flags.DEFINE_string('output_path', 'neutron_refined_output.cif', 'Path to save the final mmCIF.')
+from absl import flags
+
+_NUM_RECYCLES = flags.DEFINE_integer(
+    'num_recycles',
+    10,
+    'Number of recycles to use during inference.',
+    lower_bound=1,
+)
+_NUM_DIFFUSION_SAMPLES = flags.DEFINE_integer(
+    'num_diffusion_samples',
+    5,
+    'Number of diffusion samples to generate.',
+    lower_bound=1,
+)
 
 def main(argv):
     del argv
@@ -67,7 +81,18 @@ def main(argv):
 
     logging.info("Loading AF3 Weights...")
     device = jax.local_devices(backend='gpu')[FLAGS.gpu_device]
-    model_runner = ModelRunner(config=make_model_config(), device=device, model_dir=model_dir)
+
+    # Pass the flag values down into the config builder
+    model_config = make_model_config(
+        num_recycles=_NUM_RECYCLES.value,
+        num_diffusion_samples=_NUM_DIFFUSION_SAMPLES.value
+    )
+
+    model_runner = ModelRunner(
+        config=model_config,
+        device=device,
+        model_dir=model_dir,
+    )
    
     # 1. Extract Seed from JSON to perfectly match reference run
     model_seed = fold_input.rng_seeds[0] if fold_input.rng_seeds else 1

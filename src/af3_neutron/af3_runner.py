@@ -11,11 +11,14 @@ from alphafold3.model.components import utils
 from alphafold3.model.network import evoformer as evoformer_network
 from alphafold3.model.network import diffusion_head
 
-def make_model_config():
+def make_model_config(num_recycles=10, num_diffusion_samples=5):
     config = model.Model.Config()
     config.global_config.flash_attention_implementation = 'triton'
-    config.heads.diffusion.eval.num_samples = 1
-    config.num_recycles = 1 # Set to 1 for fast testing
+    
+    # Use the passed variables instead of hardcoding 1
+    config.heads.diffusion.eval.num_samples = num_diffusion_samples
+    config.num_recycles = num_recycles
+    
     return config
 
 # -------------------------------------------------------------------------
