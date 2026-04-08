@@ -111,8 +111,9 @@ def test_full_physics_pipeline():
         gather_idxs = jnp.array([0, 1], dtype=jnp.int32)
         
         initial_loss = decoupled_crystallographic_loss_pure(
-            initial_positions.reshape((-1, 3)), 
-            jnp.array([]), jnp.array([[0.0, 0.0, 0.0]]),
+            initial_positions,
+            jnp.expand_dims(rotor_table["initial_chi"], axis=0),
+            jnp.zeros((1, 1, 3)),
             gather_idxs, rotor_table, mapping, water_mapping, sfc
         )
         
@@ -133,9 +134,10 @@ def test_full_physics_pipeline():
         )
         
         final_loss = decoupled_crystallographic_loss_pure(
-            final_coords.reshape((-1, 3)), 
-            final_chis[0], final_waters[0], gather_idxs,
-            rotor_table, mapping, water_mapping, sfc
+            final_coords,
+            jnp.expand_dims(final_chis[0], axis=0),
+            jnp.expand_dims(final_waters[0], axis=0), 
+            gather_idxs, rotor_table, mapping, water_mapping, sfc
         )
 
         # --- ASSERTIONS ---

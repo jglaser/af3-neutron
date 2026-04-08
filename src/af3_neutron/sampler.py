@@ -26,20 +26,22 @@ def decoupled_crystallographic_loss_pure(
     positions_denoised_flat, chi_angles, water_rotations, gather_idxs, 
     rotor_table, mapping, water_mapping, sfc_instance
 ):
-    # positions_denoised_flat shape: (num_samples, num_total_atoms, 3) or (num_total_atoms, 3)
-    # We use advanced indexing to pull the AF3 atoms
-    x_af3_flat = positions_denoised_flat[..., gather_idxs, :]
+    # Because positions_denoised_flat is now strictly (num_samples, total_atoms, 3),
+    # gather_idxs operates exactly on the total_atoms axis.
+    x_af3_flat = positions_denoised_flat[:, gather_idxs, :]
     
-    # We must match the leading dimensions of x_af3_flat (which includes num_samples)
-    batch_dims = x_af3_flat.shape[:-2] 
+    num_samples = x_af3_flat.shape[0]
     
-    x_full = jnp.zeros((*batch_dims, mapping["num_oracle_atoms"], 3))
-    x_full = x_full.at[..., mapping["oracle_heavy"], :].set(x_af3_flat[..., mapping["af3_source"], :])
+    x_full = jnp.zeros((num_samples, mapping["num_oracle_atoms"], 3))
+    x_full = x_full.at[:, mapping["oracle_heavy"], :].set(x_af3_flat[:, mapping["af3_source"], :])
     
     if rotor_table["target_idx"].shape[0] > 0:
+        # x_af3_flat is (5, N, 3), so R will be (5, M, 3, 3)
+        # chi_angles is (5, M), so local_coords will be (5, M, 3)
+        # The einsum `...ij,...j->...i` will perfectly match (5, M)!
         x_h = generalized_nerf_layer(x_af3_flat, rotor_table, chi_angles)
-        x_full = x_full.at[..., rotor_table["target_idx"], :].set(x_h)
-        
+        x_full = x_full.at[:, rotor_table["target_idx"], :].set(x_h)        
+
     if water_mapping["oxygen_source"].shape[0] > 0:
         oxygen_coords = x_af3_flat[..., water_mapping["oxygen_source"], :]
         h1, h2 = so3_water_layer(oxygen_coords, water_rotations)
@@ -64,26 +66,19 @@ def run_neutron_guided_diffusion(
 ):
     logging.info("Delegating to Native AF3 SDE Loop with Batched Stateful Hydride Kinematics...")
     
-    # We no longer assume a single sample. We write the loss to naturally map over
-    # whatever batch dimension JAX provides.
     def batched_loss_fn(positions_denoised, chi_batched, water_batched):
-        # DeepMind's positions_denoised inside the loop is often shaped differently
-        # depending on if we are in the vmap or the scan.
-        # It typically arrives as (*batch_axes, num_tokens, atoms_per_token, 3)
-        # We want to flatten the last two dimensions to match gather_idxs
-        shape = positions_denoised.shape
-        flat_shape = shape[:-2] + (-1, 3) 
-        positions_flat = positions_denoised.reshape(flat_shape)
+        # Aggressively flatten the DeepMind output tensor.
+        # DeepMind outputs (num_samples, num_tokens, max_atoms_per_token, 3).
+        # We MUST flatten the middle two dimensions so the physics engine only sees 
+        # (num_samples, total_atoms, 3).
+        num_samples = positions_denoised.shape[0]
+        positions_flat = positions_denoised.reshape((num_samples, -1, 3))
         
-        # Compute loss natively on the batched tensors! JAX will naturally 
-        # broadcast the arrays if decoupled_crystallographic_loss_pure is written well.
         return decoupled_crystallographic_loss_pure(
             positions_flat, chi_batched, water_batched, gather_idxs, 
             rotor_table, mapping, water_mapping, sfc_instance
         )
 
-    # Natively compute gradient w.r.t to all 3 arguments. 
-    # Because batched_loss_fn handles the batch shapes natively, no vmap is needed!
     grad_fn = jax.value_and_grad(batched_loss_fn, argnums=(0, 1, 2))
 
     initial_chis = rotor_table["initial_chi"]
