@@ -10,6 +10,7 @@ from .kinematics import generalized_nerf_layer, so3_water_layer
 def placeholder_neutron_loss(x_full):
     return 0*jnp.mean(x_full ** 2) * 0.01
 
+@jax.jit
 def sfc_neutron_loss(x_full, sfc_instance):
     f_calc_complex = sfc_instance.Calc_Fprotein(atoms_position_tensor=x_full, NO_Bfactor=True, Return=True)
     f_calc_mag = jnp.abs(f_calc_complex)
