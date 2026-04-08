@@ -46,12 +46,12 @@ grad_loss_fn = jax.value_and_grad(decoupled_crystallographic_loss, argnums=(0, 1
 def run_neutron_guided_diffusion(
     vf_step_fn, batch, embeddings, initial_noise, gather_idxs,
     rotor_table, mapping, water_mapping, sfc_instance=None,
-    diff_config=None, sample_key=None
+    diff_config=None, sample_key=None, physics_start_step=150
 ):
     n_steps = getattr(diff_config, 'steps', 200) if diff_config else 200
-    logging.info(f"Starting Dual-Kinematic SDE Loop (Stateless Reversal - {n_steps} steps)...")
+    logging.info(f"Starting FULLY COMPILED Stateless SDE Scan Loop ({n_steps} steps)...")
+    logging.info(f"Physics SFC Guidance will activate at step {physics_start_step} to prevent early-noise divergence.")
     
-    # State ALWAYS lives in the Crystallographic Frame
     positions = jnp.expand_dims(initial_noise, axis=0)
     mask = jnp.expand_dims(batch['pred_dense_atom_mask'], axis=0)
     
@@ -66,38 +66,31 @@ def run_neutron_guided_diffusion(
     
     noise_levels = diffusion_head.noise_schedule(jnp.linspace(0, 1, n_steps + 1))
     
-    # Match DeepMind's exact key sequence
-    loop_keys = jax.random.split(sample_key, 1)
-    key = loop_keys[0]
-    
     gamma_0 = getattr(diff_config, 'gamma_0', 0.8) if diff_config else 0.8
     gamma_min = getattr(diff_config, 'gamma_min', 1.0) if diff_config else 1.0
     noise_scale_cfg = getattr(diff_config, 'noise_scale', 1.003) if diff_config else 1.003
     step_scale = getattr(diff_config, 'step_scale', 1.5) if diff_config else 1.5
     
-    for step in range(n_steps):
+    def sde_step_fn(carry, step):
+        positions, chi_angles, water_rotations, key = carry
+        
         noise_level_prev = noise_levels[step]
         noise_level = noise_levels[step + 1]
 
         key, key_noise, key_aug = jax.random.split(key, 3)
         step_key = jax.random.fold_in(jax.random.PRNGKey(0), step)
         
-        # ---------------------------------------------------------
-        # 1. NATIVE AUGMENTATION (Crystal Frame -> SDE Frame)
-        # ---------------------------------------------------------
+        # position augmentation
         rotation_key, translation_key = jax.random.split(key_aug)
         aug_R = random_rotation(rotation_key)
         translation = jax.random.normal(translation_key, shape=(3,))
         
-        # Determine pivot point
         center = utils.mask_mean(mask[..., None], positions, axis=(-2, -3), keepdims=True, eps=1e-6)
         
         positions_aug = jnp.einsum('...i,ij->...j', positions - center, aug_R, precision=jax.lax.Precision.HIGHEST) + translation
         positions_aug = positions_aug * mask[..., None]
 
-        # ---------------------------------------------------------
-        # 2. NATIVE NOISE INJECTION (In SDE Frame)
-        # ---------------------------------------------------------
+        # noise injection
         gamma = gamma_0 * (noise_level > gamma_min)
         t_hat = noise_level_prev * (1 + gamma)
         var_diff = jnp.clip(t_hat**2 - noise_level_prev**2, a_min=0.0)
@@ -106,64 +99,94 @@ def run_neutron_guided_diffusion(
         
         positions_noisy_aug = positions_aug + noise
 
-        # ---------------------------------------------------------
-        # 3. EVALUATE VECTOR FIELD (In SDE Frame)
-        # ---------------------------------------------------------
+        # eval vector field
         t_hat_arr = jnp.array([t_hat])
         positions_denoised_aug = vf_step_fn(step_key, positions_noisy_aug[0], t_hat_arr, batch, embeddings)
         positions_denoised_aug = jnp.expand_dims(positions_denoised_aug, axis=0)
         
         grad_af3_aug = (positions_noisy_aug - positions_denoised_aug) / t_hat
         
-        # ---------------------------------------------------------
-        # 4. NATIVE STEP UPDATE (In SDE Frame)
-        # ---------------------------------------------------------
+        # step
         d_t = noise_level - t_hat
         positions_out_aug = positions_noisy_aug + step_scale * d_t * grad_af3_aug
 
-        # ---------------------------------------------------------
-        # 5. PHYSICS REVERSAL (SDE Frame -> Crystal Frame)
-        # ---------------------------------------------------------
-        # We bring the DENOISED prediction back to calculate accurate MTZ forces
+        # physics reversal (SDE Frame -> Crystal Frame)
         positions_denoised_cryst = jnp.einsum('...i,ij->...j', positions_denoised_aug - translation, aug_R.T, precision=jax.lax.Precision.HIGHEST) + center
-        
         positions_flat = positions_denoised_cryst[0].reshape((-1, 3))
-        loss_val, (grad_positions, grad_chi, grad_water) = grad_loss_fn(
-            positions_flat, chi_angles, water_rotations, gather_idxs, 
-            rotor_table, mapping, water_mapping, sfc_instance
+        
+        def compute_physics(pos_flat, chi, wat):
+            loss_val, (g_pos, g_chi, g_wat) = grad_loss_fn(
+                pos_flat, chi, wat, gather_idxs, 
+                rotor_table, mapping, water_mapping, sfc_instance
+            )
+
+            jax.debug.print("SDE Step {s} | Phase: Physics Active | SFC Loss: {l}", s=step, l=loss_val)
+            return jnp.clip(g_pos, -1.0, 1.0), jnp.clip(g_chi, -0.1, 0.1), jnp.clip(g_wat, -0.1, 0.1)
+
+        def skip_physics(pos_flat, chi, wat):
+            jax.debug.print("SDE Step {s} | Phase: Pure Denoising", s=step)
+            return jnp.zeros_like(pos_flat), jnp.zeros_like(chi), jnp.zeros_like(wat)
+
+        do_physics = step >= physics_start_step
+        
+        grad_positions, grad_chi, grad_water = jax.lax.cond(
+            do_physics,
+            compute_physics,
+            skip_physics,
+            positions_flat, chi_angles, water_rotations
         )
-        
-        grad_positions = jnp.clip(grad_positions, -1.0, 1.0)
-        grad_chi = jnp.clip(grad_chi, -0.1, 0.1)
-        grad_water = jnp.clip(grad_water, -0.1, 0.1)
-        
-        loss_type = "SFC L2" if sfc_instance else "Dummy"
-        if step % 10 == 0 or step == n_steps - 1:
-            logging.info(f"ODE Step {step} | {loss_type} Loss: {loss_val:.4f}")
             
-        # ---------------------------------------------------------
-        # 6. APPLY FORCES & REVERSE UPDATED STATE
-        # ---------------------------------------------------------
-        # Bring the final SDE output back to the crystal frame
+        # 6. apply force and reverse updated state 
         positions_out_cryst = jnp.einsum('...i,ij->...j', positions_out_aug - translation, aug_R.T, precision=jax.lax.Precision.HIGHEST) + center
         
         grad_positions = grad_positions.reshape(positions_denoised_cryst[0].shape)
         grad_positions = jnp.expand_dims(grad_positions, axis=0)
 
-        # Apply the physics torque to the crystal-frame state
-        positions = positions_out_cryst - (lr_heavy * grad_positions)
-        positions = positions * mask[..., None]
+        new_positions = positions_out_cryst - (lr_heavy * grad_positions)
+        new_positions = new_positions * mask[..., None]
         
-        chi_angles = chi_angles - (lr_chi * grad_chi)
-        water_rotations = water_rotations - (lr_chi * grad_water)
+        new_chi_angles = chi_angles - (lr_chi * grad_chi)
+        new_water_rotations = water_rotations - (lr_chi * grad_water)
         
-    return positions_denoised_cryst[0] * mask[0, ..., None], chi_angles, water_rotations
+        # Return new state (carry) and the DENOISED prediction for extraction
+        new_carry = (new_positions, new_chi_angles, new_water_rotations, key)
+        return new_carry, positions_denoised_cryst[0]
+        
+    # scan phase
+    loop_keys = jax.random.split(sample_key, 1)
+    initial_carry = (positions, chi_angles, water_rotations, loop_keys[0])
+    steps_array = jnp.arange(n_steps)
+   
+    final_carry, all_denoised = jax.lax.scan(sde_step_fn, initial_carry, steps_array)
+    
+    final_chis = final_carry[1]
+    final_waters = final_carry[2]
+    final_denoised_cryst = all_denoised[-1] # Extract the denoised output of the final step (t=0)
+    
+    return final_denoised_cryst * mask[0, ..., None], final_chis, final_waters
 
 def generate_final_oracle_coords(positions_denoised_cryst, chi_angles, water_rotations, gather_idxs, rotor_table, mapping, water_mapping):
-    # The output is already perfectly in the crystal frame, so we just map it!
     positions_flat = positions_denoised_cryst.reshape((-1, 3))
     x_af3_flat = positions_flat[gather_idxs]
+
+    # # Final Kabsch Alignment to experimental MTZ Unit Cell
+    # x_drift_heavy = x_af3_flat[mapping["af3_source"]]
+    # x_ref_heavy = reference_coords[mapping["af3_source"]]
     
+    # com_drift = jnp.mean(x_drift_heavy, axis=0)
+    # com_ref = jnp.mean(x_ref_heavy, axis=0)
+    
+    # p = x_drift_heavy - com_drift
+    # q = x_ref_heavy - com_ref
+    
+    # H = jnp.einsum('ni,nj->ij', p, q)
+    # U, S, Vt = jnp.linalg.svd(H)
+    # d = jnp.sign(jnp.linalg.det(U) * jnp.linalg.det(Vt))
+    # R = U @ jnp.diag(jnp.array([1.0, 1.0, d])) @ Vt
+    
+    # x_af3_aligned = (x_af3_flat - com_drift) @ R + com_ref
+    
+    # Assemble full complex in experimental frame
     x_full = jnp.zeros((mapping["num_oracle_atoms"], 3))
     x_full = x_full.at[mapping["oracle_heavy"]].set(x_af3_flat[mapping["af3_source"]])
     
