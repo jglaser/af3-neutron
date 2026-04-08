@@ -36,30 +36,23 @@ def test_batched_kinematics_and_loss():
     
     gather_idxs = jnp.arange(num_af3_atoms, dtype=jnp.int32)
     
-    # Create a wrapper that captures the static arguments
-    def single_sample_loss(x, chi, water):
-        return decoupled_crystallographic_loss_pure(
-            x, chi, water, gather_idxs, rotor_table, mapping, water_mapping, sfc_instance=None
-        )
-        
-    # VMAP to handle the num_samples dimension, exactly as the real runner does!
-    batched_loss_fn = jax.vmap(single_sample_loss, in_axes=(0, 0, 0))
-    
     # 1. Test the pure loss function forward pass
-    loss = batched_loss_fn(x_af3_batched, chi_batched, water_batched)
-    
-    # Loss should now return an array of 5 scalars (one for each sample)
-    assert loss.shape == (num_samples,)
-    assert not jnp.any(jnp.isnan(loss))
-    
-    # 2. Test Batched Gradients
-    batched_grad_fn = jax.vmap(
-        jax.value_and_grad(single_sample_loss, argnums=(0, 1, 2)), 
-        in_axes=(0, 0, 0)
+    loss = decoupled_crystallographic_loss_pure(
+        x_af3_batched, chi_batched, water_batched, gather_idxs, 
+        rotor_table, mapping, water_mapping, sfc_instance=None
     )
     
-    loss_val, (grad_x0, grad_chi, grad_water) = batched_grad_fn(
-        x_af3_batched, chi_batched, water_batched
+    # Since placeholder_neutron_loss averages across the batch, it should return a scalar
+    assert loss.shape == ()
+    assert not jnp.isnan(loss)
+    
+    # 2. Test Batched Gradients (This guarantees no shape crashes inside the VMAP/Scan!)
+    # We want gradients w.r.t the 0th, 1st, and 2nd arguments
+    grad_fn = jax.value_and_grad(decoupled_crystallographic_loss_pure, argnums=(0, 1, 2))
+    
+    loss_val, (grad_x0, grad_chi, grad_water) = grad_fn(
+        x_af3_batched, chi_batched, water_batched, gather_idxs, 
+        rotor_table, mapping, water_mapping, sfc_instance=None
     )
     
     assert grad_x0.shape == x_af3_batched.shape

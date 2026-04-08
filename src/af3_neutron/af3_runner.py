@@ -98,38 +98,46 @@ class GuidedDiffusionWrapper(hk.Module):
             self.config.heads.diffusion, self.config.global_config
         )
 
+    # --- In GuidedDiffusionWrapper ---
     def __call__(self, batch, embeddings, grad_fn, sample_key, initial_chis, num_waters):
         sample_config = self.config.heads.diffusion.eval
         num_samples = sample_config.num_samples
 
         def guided_denoising_step(positions_noisy, t_hat):
-            # x_0 shape: (5, num_tokens, atoms_per_token, 3)
+            # 1. Native Prediction
             x_0 = self.diffusion_module(
                 positions_noisy=positions_noisy, noise_level=t_hat,
                 batch=batch, embeddings=embeddings, use_conditioning=True
             )
-
-            # initial_chis shape: (num_rotors,) -> chi shape: (5, num_rotors)
+            
+            # 2. BATCHED KINEMATIC STATE
+            # We initialize the state with a leading `num_samples` dimension
+            # initial_chis shape: (num_rotors,) -> Batched shape: (num_samples, num_rotors)
             chi_init_fn = lambda shape, dtype: jnp.tile(initial_chis[None, ...], (num_samples, 1))
             chi = hk.get_state("chi_angles", shape=(num_samples, initial_chis.shape[0]), init=chi_init_fn)
-
+            
             water_init_fn = lambda shape, dtype: jnp.zeros((num_samples, num_waters, 3))
             water = hk.get_state("water_rotations", shape=(num_samples, num_waters, 3), init=water_init_fn)
-
-            # Evaluates the batched_grad_fn correctly over the 5 samples!
+            
+            # 3. BATCHED GRADIENT EVALUATION
+            # We evaluate the gradients for all 5 samples simultaneously
             loss_val, (grad_x0, grad_chi, grad_water) = grad_fn(x_0, chi, water)
-
+            
+            # Since loss_val might be an array of 5 losses, we take the mean for printing
+            jax.debug.print("SDE Step Mean Loss (Covariant): {loss:.4f}", loss=jnp.mean(loss_val))
+            
+            # 4. BATCHED UPDATE
             lr_chi = 0.1
             hk.set_state("chi_angles", chi - lr_chi * jnp.clip(grad_chi, -0.1, 0.1))
             hk.set_state("water_rotations", water - lr_chi * jnp.clip(grad_water, -0.1, 0.1))
-
+            
             lr_heavy = 0.05
             x_0_guided = x_0 - (lr_heavy * jnp.clip(grad_x0, -1.0, 1.0))
-
+            
             return x_0_guided
 
         return diffusion_head.sample(
-            denoising_step=guided_denoising_step, batch=batch,
+            denoising_step=guided_denoising_step, batch=batch, 
             key=sample_key, config=sample_config
         )
 
