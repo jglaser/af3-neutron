@@ -71,7 +71,6 @@ def main(argv):
     flat_layout = batch_obj_raw.convert_model_output.flat_output_layout
     token_layout = batch_obj_raw.convert_model_output.token_atoms_layout
     batch = jax.tree.map(jnp.asarray, utils.remove_invalidly_typed_feats(batch_dict))
-    batch_obj = feat_batch.Batch.from_data_dict(batch)
     
     gather_info = atom_layout.compute_gather_idxs(
         source_layout=token_layout, 
