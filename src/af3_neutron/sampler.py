@@ -26,24 +26,36 @@ def decoupled_crystallographic_loss_pure(
     positions_denoised_flat, chi_angles, water_rotations, gather_idxs, 
     rotor_table, mapping, water_mapping, sfc_instance
 ):
-    x_af3_flat = positions_denoised_flat[gather_idxs]
+    # positions_denoised_flat shape: (num_samples, num_total_atoms, 3) or (num_total_atoms, 3)
+    # We use advanced indexing to pull the AF3 atoms
+    x_af3_flat = positions_denoised_flat[..., gather_idxs, :]
     
-    x_full = jnp.zeros((mapping["num_oracle_atoms"], 3))
-    x_full = x_full.at[mapping["oracle_heavy"]].set(x_af3_flat[mapping["af3_source"]])
+    # We must match the leading dimensions of x_af3_flat (which includes num_samples)
+    batch_dims = x_af3_flat.shape[:-2] 
+    
+    x_full = jnp.zeros((*batch_dims, mapping["num_oracle_atoms"], 3))
+    x_full = x_full.at[..., mapping["oracle_heavy"], :].set(x_af3_flat[..., mapping["af3_source"], :])
     
     if rotor_table["target_idx"].shape[0] > 0:
         x_h = generalized_nerf_layer(x_af3_flat, rotor_table, chi_angles)
-        x_full = x_full.at[rotor_table["target_idx"]].set(x_h)
+        x_full = x_full.at[..., rotor_table["target_idx"], :].set(x_h)
         
     if water_mapping["oxygen_source"].shape[0] > 0:
-        oxygen_coords = x_af3_flat[water_mapping["oxygen_source"]]
+        oxygen_coords = x_af3_flat[..., water_mapping["oxygen_source"], :]
         h1, h2 = so3_water_layer(oxygen_coords, water_rotations)
-        x_full = x_full.at[water_mapping["h1_target"]].set(h1)
-        x_full = x_full.at[water_mapping["h2_target"]].set(h2)
+        x_full = x_full.at[..., water_mapping["h1_target"], :].set(h1)
+        x_full = x_full.at[..., water_mapping["h2_target"], :].set(h2)
         
     if sfc_instance is not None:
-        return se3_invariant_neutron_loss(x_full, sfc_instance)
+        # Since SFC is evaluated separately for each sample in the batch,
+        # we wrap it in a quick vmap to process the batch dimension!
+        def single_loss(x):
+            return se3_invariant_neutron_loss(x, sfc_instance)
+        # Apply over the last two dimensions (N, 3), batching over anything else
+        batched_sfc = jnp.vectorize(single_loss, signature='(n,d)->()') 
+        return jnp.mean(batched_sfc(x_full))
     else:
+        # Our placeholder handles batches natively
         return placeholder_neutron_loss(x_full)
 
 def run_neutron_guided_diffusion(
@@ -52,34 +64,36 @@ def run_neutron_guided_diffusion(
 ):
     logging.info("Delegating to Native AF3 SDE Loop with Batched Stateful Hydride Kinematics...")
     
-    # 1. The Core Loss Function (Expects a SINGLE sample, i.e., no batch dimension)
-    def single_sample_loss_fn(positions_denoised_single, chi_single, water_single):
-        # We reshape down to exactly the number of atoms expected by the MTZ mapping
-        positions_flat = positions_denoised_single.reshape((-1, 3))
+    # We no longer assume a single sample. We write the loss to naturally map over
+    # whatever batch dimension JAX provides.
+    def batched_loss_fn(positions_denoised, chi_batched, water_batched):
+        # DeepMind's positions_denoised inside the loop is often shaped differently
+        # depending on if we are in the vmap or the scan.
+        # It typically arrives as (*batch_axes, num_tokens, atoms_per_token, 3)
+        # We want to flatten the last two dimensions to match gather_idxs
+        shape = positions_denoised.shape
+        flat_shape = shape[:-2] + (-1, 3) 
+        positions_flat = positions_denoised.reshape(flat_shape)
+        
+        # Compute loss natively on the batched tensors! JAX will naturally 
+        # broadcast the arrays if decoupled_crystallographic_loss_pure is written well.
         return decoupled_crystallographic_loss_pure(
-            positions_flat, chi_single, water_single, gather_idxs, 
+            positions_flat, chi_batched, water_batched, gather_idxs, 
             rotor_table, mapping, water_mapping, sfc_instance
         )
 
-    # 2. VMAP the gradient!
-    # By mapping the value_and_grad over axis 0 of all inputs, it will automatically
-    # return an array of 5 losses and a batched (5, N, ...) gradient tensor.
-    batched_grad_fn = jax.vmap(
-        jax.value_and_grad(single_sample_loss_fn, argnums=(0, 1, 2)), 
-        in_axes=(0, 0, 0)
-    )
+    # Natively compute gradient w.r.t to all 3 arguments. 
+    # Because batched_loss_fn handles the batch shapes natively, no vmap is needed!
+    grad_fn = jax.value_and_grad(batched_loss_fn, argnums=(0, 1, 2))
 
     initial_chis = rotor_table["initial_chi"]
     num_waters = water_mapping["oxygen_source"].shape[0]
 
-    # Execute the runner with the BATCHED gradient function
     sample_results, final_state = model_runner.sample_guided_diffusion(
-        jax.random.PRNGKey(0), batch_dict, embeddings, batched_grad_fn, sample_key,
+        jax.random.PRNGKey(0), batch_dict, embeddings, grad_fn, sample_key,
         initial_chis, num_waters
     )
 
-    # Extract all samples! 
-    # atom_positions is already shape (num_samples, num_tokens, atoms_per_token, 3)
     final_coords_batched = sample_results['atom_positions']
     final_chis_batched = final_state['diffuser']['chi_angles']
     final_waters_batched = final_state['diffuser']['water_rotations']

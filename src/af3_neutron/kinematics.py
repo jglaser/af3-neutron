@@ -5,9 +5,9 @@ def safe_norm(x, axis=-1, keepdims=True):
     return jnp.sqrt(jnp.sum(x**2, axis=axis, keepdims=keepdims) + 1e-8)
 
 def generalized_nerf_layer(heavy_coords, rotor_table, chi_angles):
-    p2 = heavy_coords[rotor_table["parent_idx"]]       
-    p1 = heavy_coords[rotor_table["grandparent_idx"]]  
-    p0 = heavy_coords[rotor_table["greatgrand_idx"]]   
+    p2 = heavy_coords[..., rotor_table["parent_idx"], :]       
+    p1 = heavy_coords[..., rotor_table["grandparent_idx"], :]  
+    p0 = heavy_coords[..., rotor_table["greatgrand_idx"], :]   
     
     v1 = p2 - p1
     v2 = p1 - p0
@@ -19,26 +19,39 @@ def generalized_nerf_layer(heavy_coords, rotor_table, chi_angles):
     
     R = jnp.stack([x_axis, y_axis, z_axis], axis=-1)
     
+    # Get the number of extra batch dimensions chi_angles has compared to r
+    num_batch_dims = chi_angles.ndim - rotor_table["ideal_r"].ndim
+    
     r = rotor_table["ideal_r"]
-    theta = jnp.radians(rotor_table["ideal_theta"])
+    theta_deg = rotor_table["ideal_theta"]
+    for _ in range(num_batch_dims):
+        r = jnp.expand_dims(r, axis=0)
+        theta_deg = jnp.expand_dims(theta_deg, axis=0)
+        
+    theta = jnp.radians(theta_deg)
     
-    local_coords = jnp.stack([
-        r * jnp.sin(theta) * jnp.cos(chi_angles),
-        r * jnp.sin(theta) * jnp.sin(chi_angles),
-        -r * jnp.cos(theta)
-    ], axis=-1)
+    # ----------------------------------------------------
+    # FIX: Explicitly broadcast the Z-coordinate to match 
+    # the shape of the X and Y coordinates (which inherit 
+    # their shape from chi_angles).
+    # ----------------------------------------------------
+    x_coord = r * jnp.sin(theta) * jnp.cos(chi_angles)
+    y_coord = r * jnp.sin(theta) * jnp.sin(chi_angles)
+    z_coord = -r * jnp.cos(theta)
     
-    return jnp.einsum('nij,nj->ni', R, local_coords) + p2
+    z_coord_broadcasted = jnp.broadcast_to(z_coord, chi_angles.shape)
+    
+    local_coords = jnp.stack([x_coord, y_coord, z_coord_broadcasted], axis=-1)
+    
+    return jnp.einsum('...ij,...j->...i', R, local_coords) + p2
 
 def so3_water_layer(oxygen_coords, rotation_vectors):
     """
     Applies SO(3) rigid-body rotations to idealized water hydrogens.
     """
-    # Idealized geometry (0.958 Angstroms, 104.5 degrees)
     ideal_h1 = jnp.array([0.757, 0.586, 0.0])
     ideal_h2 = jnp.array([-0.757, 0.586, 0.0])
     
-    # Axis-Angle to Rotation Matrix (Rodrigues' Formula)
     theta = safe_norm(rotation_vectors, axis=-1, keepdims=True)
     u = rotation_vectors / theta
     
@@ -59,7 +72,6 @@ def so3_water_layer(oxygen_coords, rotation_vectors):
     
     R = I + sin_t[..., jnp.newaxis] * K + (1 - cos_t[..., jnp.newaxis]) * K2
     
-    # Rotate and translate to Oxygen
     h1_global = jnp.einsum('...ij,j->...i', R, ideal_h1) + oxygen_coords
     h2_global = jnp.einsum('...ij,j->...i', R, ideal_h2) + oxygen_coords
     
