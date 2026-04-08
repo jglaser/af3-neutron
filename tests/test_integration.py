@@ -37,26 +37,31 @@ def create_mock_water_oracle():
     return atoms
 
 class MockModelRunner:
+    """Mocks the Haiku-compiled AF3 ModelRunner for integration testing."""
     def __init__(self, initial_positions):
         self.initial_positions = initial_positions
-
+        
     def sample_guided_diffusion(self, rng_key, batch_dict, embeddings, grad_fn, sample_key, initial_chis, num_waters):
-        positions = self.initial_positions[0]
-        chi = initial_chis
-        water = jnp.zeros((num_waters, 3))
-
+        # 1. KEEP the sample dimension (1, 2, 3)
+        positions = self.initial_positions
+        
+        # 2. Add the sample dimension to the kinematic tensors (1, 2) and (1, 1, 3)
+        chi = jnp.expand_dims(initial_chis, axis=0)
+        water = jnp.zeros((1, num_waters, 3))
+        
         lr = 0.05
         for _ in range(15):
             loss_val, (grad_x0, grad_chi, grad_water) = grad_fn(positions, chi, water)
             positions = positions - lr * jnp.clip(grad_x0, -1.0, 1.0)
             chi = chi - 0.1 * jnp.clip(grad_chi, -0.1, 0.1)
             water = water - 0.1 * jnp.clip(grad_water, -0.1, 0.1)
-
+            
         final_state = {
             'diffuser': {'chi_angles': chi, 'water_rotations': water}
         }
-
-        return {'atom_positions': jnp.expand_dims(positions, axis=0)}, final_state
+        
+        # We don't need to expand dims anymore since positions is already batched
+        return {'atom_positions': positions}, final_state
 
 def test_full_physics_pipeline():
     oracle = create_mock_water_oracle()
@@ -129,7 +134,7 @@ def test_full_physics_pipeline():
         
         final_loss = decoupled_crystallographic_loss_pure(
             final_coords.reshape((-1, 3)), 
-            final_chis, final_waters, gather_idxs,
+            final_chis[0], final_waters[0], gather_idxs,
             rotor_table, mapping, water_mapping, sfc
         )
 

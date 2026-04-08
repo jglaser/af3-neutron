@@ -50,32 +50,41 @@ def run_neutron_guided_diffusion(
     model_runner, batch_dict, embeddings, gather_idxs,
     rotor_table, mapping, water_mapping, sfc_instance=None, sample_key=None
 ):
-    logging.info("Delegating to Native AF3 SDE Loop with Stateful Hydride Kinematics...")
+    logging.info("Delegating to Native AF3 SDE Loop with Batched Stateful Hydride Kinematics...")
     
-    def loss_fn(positions_denoised, chi, water):
-        positions_flat = positions_denoised.reshape((-1, 3))
+    # 1. The Core Loss Function (Expects a SINGLE sample, i.e., no batch dimension)
+    def single_sample_loss_fn(positions_denoised_single, chi_single, water_single):
+        # We reshape down to exactly the number of atoms expected by the MTZ mapping
+        positions_flat = positions_denoised_single.reshape((-1, 3))
         return decoupled_crystallographic_loss_pure(
-            positions_flat, chi, water, gather_idxs, 
+            positions_flat, chi_single, water_single, gather_idxs, 
             rotor_table, mapping, water_mapping, sfc_instance
         )
 
-    # Gradient is now w.r.t arg 0 (x0), arg 1 (chi), and arg 2 (water)
-    grad_fn = jax.value_and_grad(loss_fn, argnums=(0, 1, 2))
+    # 2. VMAP the gradient!
+    # By mapping the value_and_grad over axis 0 of all inputs, it will automatically
+    # return an array of 5 losses and a batched (5, N, ...) gradient tensor.
+    batched_grad_fn = jax.vmap(
+        jax.value_and_grad(single_sample_loss_fn, argnums=(0, 1, 2)), 
+        in_axes=(0, 0, 0)
+    )
 
-    # Pass initial_chis down to the runner instead of num_rotors
     initial_chis = rotor_table["initial_chi"]
     num_waters = water_mapping["oxygen_source"].shape[0]
 
+    # Execute the runner with the BATCHED gradient function
     sample_results, final_state = model_runner.sample_guided_diffusion(
-        jax.random.PRNGKey(0), batch_dict, embeddings, grad_fn, sample_key,
+        jax.random.PRNGKey(0), batch_dict, embeddings, batched_grad_fn, sample_key,
         initial_chis, num_waters
     )
 
-    final_coords = sample_results['atom_positions'][0]
-    final_chis = final_state['diffuser']['chi_angles']
-    final_waters = final_state['diffuser']['water_rotations']
+    # Extract all samples! 
+    # atom_positions is already shape (num_samples, num_tokens, atoms_per_token, 3)
+    final_coords_batched = sample_results['atom_positions']
+    final_chis_batched = final_state['diffuser']['chi_angles']
+    final_waters_batched = final_state['diffuser']['water_rotations']
 
-    return final_coords, final_chis, final_waters
+    return final_coords_batched, final_chis_batched, final_waters_batched
 
 def generate_final_oracle_coords(positions_denoised_final, chi_angles, water_rotations, gather_idxs, rotor_table, mapping, water_mapping, reference_coords):
     # 1. Map to oracle heavy atoms

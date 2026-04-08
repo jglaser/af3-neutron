@@ -134,9 +134,10 @@ def main(argv):
         sfc_instance = None
     
    
-    final_coords, final_chis, final_waters = run_neutron_guided_diffusion(
+    # Run the Guided Diffusion Loop via the batched JIT wrapper
+    final_coords_batched, final_chis_batched, final_waters_batched = run_neutron_guided_diffusion(
         model_runner=model_runner,
-        batch_dict=batch,         # For native vf_step_fn
+        batch_dict=batch,
         embeddings=embeddings,
         gather_idxs=gather_idxs,
         rotor_table=rotor_table,
@@ -145,16 +146,25 @@ def main(argv):
         sfc_instance=sfc_instance,
         sample_key=sample_key
     )
-     
-    logging.info("Assembling final atomic coordinates...")
-    reference_coords = jnp.array(oracle_atoms.coord, dtype=jnp.float32)
-    final_x_full = generate_final_oracle_coords(
-        final_coords, final_chis, final_waters, gather_idxs,
-        rotor_table, mapping, water_mapping, reference_coords
-    )
-
-    oracle_atoms.coord = np.array(final_x_full)
     
+    # Since DeepMind's sample_results returns a dictionary designed for multi-sample extraction,
+    # we need to overwrite the output structure in the script to handle them independently.
+    
+    logging.info("Assembling final atomic coordinates for all samples...")
+    num_samples = final_coords_batched.shape[0]
+    
+    all_final_structures = []
+    for i in range(num_samples):
+        final_x_full = generate_final_oracle_coords(
+            final_coords_batched[i], final_chis_batched[i], final_waters_batched[i], 
+            gather_idxs, rotor_table, mapping, water_mapping, reference_coords
+        )
+        all_final_structures.append(final_x_full)
+        
+    # Example logic for writing the best one, or saving all to list:
+    # (Adapt this block based on how your post_processing module expects to save the CIFs)
+    oracle_atoms.coord = np.array(all_final_structures[0]) # Storing sample 0 as the reference    
+
     output_cif_path = pathlib.Path(FLAGS.output_path)
     output_cif_path.parent.mkdir(parents=True, exist_ok=True)
     
