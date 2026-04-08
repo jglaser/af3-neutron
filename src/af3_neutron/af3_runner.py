@@ -165,13 +165,13 @@ class ModelRunner:
 
     @functools.cached_property
     def sample_guided_diffusion(self):
-        @hk.transform_with_state  # critical switch for maintaining state
+        @hk.transform_with_state # critical for passing chi_angles and water orientations
         def forward_sample(batch_dict, embeddings, grad_fn, sample_key, initial_chis, num_waters):
             batch = feat_batch.Batch.from_data_dict(batch_dict)
             return GuidedDiffusionWrapper(self._model_config)(
                 batch, embeddings, grad_fn, sample_key, initial_chis, num_waters
             )
-
+            
         def apply_fn(params, rng, batch_dict, embeddings, grad_fn, sample_key, initial_chis, num_waters):
             _, init_state = forward_sample.init(
                 rng, batch_dict, embeddings, grad_fn, sample_key, initial_chis, num_waters
@@ -182,6 +182,6 @@ class ModelRunner:
             return out, final_state
 
         return functools.partial(
-            jax.jit(apply_fn, static_argnums=(4,), device=self._device),
+            jax.jit(apply_fn, static_argnums=(4, 7), device=self._device), 
             self.model_params
         )
