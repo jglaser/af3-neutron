@@ -23,7 +23,7 @@ from af3_neutron.sampler import run_neutron_guided_diffusion, generate_final_ora
 from af3_neutron.sfc_adapter import init_neutron_sfc
 
 from jax.experimental.compilation_cache import compilation_cache as cc
-cc.set_cache_dir(os.path.expanduser('./jax_cache'))
+cc.set_cache_dir(os.path.expanduser('./.jax_cache'))
 
 FLAGS = flags.FLAGS
 flags.DEFINE_string('json_path', 'betalac_tetramer_refinement_input.json', 'Path to JSON.')
