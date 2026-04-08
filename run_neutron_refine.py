@@ -62,8 +62,9 @@ def main(argv):
     )
     
     logging.info("Running native AF3 featurisation...")
+    buckets = list(range(128, 8192+1, 128))
     featurised_examples = featurisation.featurise_input(
-        fold_input=fold_input, buckets=[256, 512, 1024, 2048, 4096], ccd=ccd, verbose=False
+        fold_input=fold_input, buckets=buckets, ccd=ccd, verbose=False
     )
    
     batch_dict = featurised_examples[0]
