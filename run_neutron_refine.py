@@ -4,6 +4,10 @@ import os
 import numpy as np
 import jax
 import jax.numpy as jnp
+
+from jax.experimental.compilation_cache import compilation_cache as cc
+cc.set_cache_dir(os.path.expanduser('.jax_cache'))
+
 import biotite.structure.io.pdbx as pdbx
 from absl import app
 from absl import flags
@@ -48,8 +52,9 @@ def main(argv):
     )
     
     logging.info("Running native AF3 featurisation...")
+    buckets = list(range(128, 8192+1, 128))
     featurised_examples = featurisation.featurise_input(
-        fold_input=fold_input, buckets=[256, 512, 1024, 2048, 4096], ccd=ccd, verbose=False
+        fold_input=fold_input, buckets=buckets, ccd=ccd, verbose=False
     )
    
     batch_dict = featurised_examples[0]

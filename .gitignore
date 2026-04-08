@@ -2,3 +2,4 @@
 build/
 *.pyc
 .python-version
+.jax_cache

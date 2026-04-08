@@ -3,7 +3,7 @@ name = "af3_neutron"
 version = "0.1.0"
 description = "A JAX-based neutron crystallography refinement pipeline wrapping AlphaFold 3."
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = ">=3.12,<3.14"
 dependencies = [
     "alphafold3",
     "numpy",
@@ -14,6 +14,10 @@ dependencies = [
     "biotite>=1.6.0",
     "hydride>=1.2.3",
 ]
+
+[build-system]
+requires = ["uv_build<0.12"]
+build-backend = "uv_build"
 
 [tool.uv.sources]
 sfcalculator-jax = { git = "https://github.com/Hekstra-Lab/SFcalculator_jax" }
