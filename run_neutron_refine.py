@@ -22,13 +22,15 @@ from af3_neutron.topology import build_decoupled_topology
 from af3_neutron.sampler import run_neutron_guided_diffusion, generate_final_oracle_coords
 from af3_neutron.sfc_adapter import init_neutron_sfc
 
+from jax.experimental.compilation_cache import compilation_cache as cc
+cc.set_cache_dir(os.path.expanduser('./jax_cache'))
+
 FLAGS = flags.FLAGS
 flags.DEFINE_string('json_path', 'betalac_tetramer_refinement_input.json', 'Path to JSON.')
 flags.DEFINE_string('model_dir', '../af3_model_parameters/', 'Path to weights.')
 flags.DEFINE_integer('gpu_device', 0, 'GPU to use.')
 flags.DEFINE_string('mtz_path', '', 'Optional path to MTZ file for neutron refinement.')
 flags.DEFINE_string('output_path', 'neutron_refined_output.cif', 'Path to save the final mmCIF.')
-from absl import flags
 
 _NUM_RECYCLES = flags.DEFINE_integer(
     'num_recycles',
