@@ -5,6 +5,16 @@ from alphafold3.model.network import diffusion_head
 
 from .kinematics import generalized_nerf_layer, so3_water_layer
 
+def remove_center_of_mass(positions, mask):
+    # positions (N, 24, 3) or (N_flat, 3)
+    mask_expanded = mask[..., None]
+    
+    sum_coords = jnp.sum(positions * mask_expanded, axis=(0, 1) if positions.ndim == 3 else 0)
+    num_atoms = jnp.sum(mask) + 1e-8
+    com = sum_coords / num_atoms
+    
+    return positions - com
+
 def placeholder_neutron_loss(x_full):
     return 0*jnp.mean(x_full ** 2) * 0.01
 
@@ -17,9 +27,10 @@ def se3_invariant_neutron_loss(x_full, sfc_instance):
     return jnp.mean(radii**2) * 0.001
 
 def decoupled_crystallographic_loss_pure(
-    positions_denoised_flat, gather_idxs, rotor_table, mapping, water_mapping, sfc_instance
+    positions_denoised_flat, gather_idxs, rotor_table, mapping, water_mapping, sfc_instance, atom_mask_flat
 ):
-    x_af3_flat = positions_denoised_flat[gather_idxs]
+    positions_centered =positions_denoised_flat - jnp.mean(positions_denoised_flat[atom_mask_flat], axis=0)
+    x_af3_flat = positions_centered[gather_idxs]
 
     chi_angles = jnp.zeros(rotor_table["target_idx"].shape[0])
     water_rotations = jnp.zeros((water_mapping["oxygen_source"].shape[0], 3))
@@ -48,11 +59,14 @@ def run_neutron_guided_diffusion(
 ):
     logging.info("Delegating to Native AF3 SDE Loop with SE(3) Covariant Physics Hook...")
 
+    atom_mask = batch_dict['pred_dense_atom_mask']
+    atom_mask_flat = atom_mask.reshape(-1)
+
     # Create the pure closure
     def loss_fn(positions_denoised):
         positions_flat = positions_denoised.reshape((-1, 3))
         return decoupled_crystallographic_loss_pure(
-            positions_flat, gather_idxs, rotor_table, mapping, water_mapping, sfc_instance
+            positions_flat, gather_idxs, rotor_table, mapping, water_mapping, sfc_instance, atom_mask_flat
         )
 
     grad_fn = jax.value_and_grad(loss_fn)
@@ -64,6 +78,7 @@ def run_neutron_guided_diffusion(
     )
 
     final_coords = sample_results['atom_positions'][0]
+    final_coords =remove_center_of_mass(final_coords, atom_mask)
 
     # Return stateless kinematics
     chi_angles = jnp.zeros(rotor_table["target_idx"].shape[0])
