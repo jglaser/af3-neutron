@@ -98,30 +98,26 @@ class GuidedDiffusionWrapper(hk.Module):
             self.config.heads.diffusion, self.config.global_config
         )
 
-    def __call__(self, batch, embeddings, grad_fn, sample_key, num_rotors, num_waters):
+    def __call__(self, batch, embeddings, grad_fn, sample_key, initial_chis, num_waters):
         sample_config = self.config.heads.diffusion.eval
 
         def guided_denoising_step(positions_noisy, t_hat):
-            # 1. Native Prediction
             x_0 = self.diffusion_module(
                 positions_noisy=positions_noisy, noise_level=t_hat,
                 batch=batch, embeddings=embeddings, use_conditioning=True
             )
             
-            # 2. Retrieve the current kinematic state from Haiku's hidden dictionary
-            chi = hk.get_state("chi_angles", shape=(num_rotors,), init=jnp.zeros)
+            # Initialize state with the specific hydride angles!
+            chi = hk.get_state("chi_angles", shape=initial_chis.shape, init=lambda shape, dtype: initial_chis)
             water = hk.get_state("water_rotations", shape=(num_waters, 3), init=jnp.zeros)
             
-            # 3. Evaluate the gradient with respect to ALL mobile degrees of freedom
             loss_val, (grad_x0, grad_chi, grad_water) = grad_fn(x_0, chi, water)
             jax.debug.print("SDE Step Loss (Covariant): {loss:.4f}", loss=loss_val)
             
-            # 4. Update and store the sub-states back into Haiku
             lr_chi = 0.1
             hk.set_state("chi_angles", chi - lr_chi * jnp.clip(grad_chi, -0.1, 0.1))
             hk.set_state("water_rotations", water - lr_chi * jnp.clip(grad_water, -0.1, 0.1))
             
-            # 5. Apply the main heavy-atom torque
             lr_heavy = 0.05
             x_0_guided = x_0 - (lr_heavy * jnp.clip(grad_x0, -1.0, 1.0))
             
@@ -170,24 +166,22 @@ class ModelRunner:
     @functools.cached_property
     def sample_guided_diffusion(self):
         @hk.transform_with_state  # critical switch for maintaining state
-        def forward_sample(batch_dict, embeddings, grad_fn, sample_key, num_rotors, num_waters):
+        def forward_sample(batch_dict, embeddings, grad_fn, sample_key, initial_chis, num_waters):
             batch = feat_batch.Batch.from_data_dict(batch_dict)
             return GuidedDiffusionWrapper(self._model_config)(
-                batch, embeddings, grad_fn, sample_key, num_rotors, num_waters
+                batch, embeddings, grad_fn, sample_key, initial_chis, num_waters
             )
-            
-        def apply_fn(params, rng, batch_dict, embeddings, grad_fn, sample_key, num_rotors, num_waters):
-            # Generate the empty initial state dictionary
+
+        def apply_fn(params, rng, batch_dict, embeddings, grad_fn, sample_key, initial_chis, num_waters):
             _, init_state = forward_sample.init(
-                rng, batch_dict, embeddings, grad_fn, sample_key, num_rotors, num_waters
+                rng, batch_dict, embeddings, grad_fn, sample_key, initial_chis, num_waters
             )
-            # Run the SDE loop, actively threading the state dictionary
             out, final_state = forward_sample.apply(
-                params, init_state, rng, batch_dict, embeddings, grad_fn, sample_key, num_rotors, num_waters
+                params, init_state, rng, batch_dict, embeddings, grad_fn, sample_key, initial_chis, num_waters
             )
             return out, final_state
 
         return functools.partial(
-            jax.jit(apply_fn, static_argnums=(4,), device=self._device), 
+            jax.jit(apply_fn, static_argnums=(4,), device=self._device),
             self.model_params
         )

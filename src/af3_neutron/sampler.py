@@ -50,7 +50,7 @@ def run_neutron_guided_diffusion(
     model_runner, batch_dict, embeddings, gather_idxs,
     rotor_table, mapping, water_mapping, sfc_instance=None, sample_key=None
 ):
-    logging.info("Delegating to Native AF3 SDE Loop with Stateful Kinematics...")
+    logging.info("Delegating to Native AF3 SDE Loop with Stateful Hydride Kinematics...")
     
     def loss_fn(positions_denoised, chi, water):
         positions_flat = positions_denoised.reshape((-1, 3))
@@ -62,19 +62,16 @@ def run_neutron_guided_diffusion(
     # Gradient is now w.r.t arg 0 (x0), arg 1 (chi), and arg 2 (water)
     grad_fn = jax.value_and_grad(loss_fn, argnums=(0, 1, 2))
 
-    num_rotors = rotor_table["target_idx"].shape[0]
+    # Pass initial_chis down to the runner instead of num_rotors
+    initial_chis = rotor_table["initial_chi"]
     num_waters = water_mapping["oxygen_source"].shape[0]
 
-    # The runner now returns a tuple: (outputs, final_state_dict)
     sample_results, final_state = model_runner.sample_guided_diffusion(
         jax.random.PRNGKey(0), batch_dict, embeddings, grad_fn, sample_key,
-        num_rotors, num_waters
+        initial_chis, num_waters
     )
 
     final_coords = sample_results['atom_positions'][0]
-    
-    # Extract the optimized kinematics from the final Haiku state dictionary
-    # 'diffuser' maps to the `name='diffuser'` argument in GuidedDiffusionWrapper
     final_chis = final_state['diffuser']['chi_angles']
     final_waters = final_state['diffuser']['water_rotations']
 

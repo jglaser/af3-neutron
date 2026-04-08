@@ -37,13 +37,12 @@ def create_mock_water_oracle():
     return atoms
 
 class MockModelRunner:
-    """Mocks the Haiku-compiled AF3 ModelRunner for integration testing."""
     def __init__(self, initial_positions):
         self.initial_positions = initial_positions
 
-    def sample_guided_diffusion(self, rng_key, batch_dict, embeddings, grad_fn, sample_key, num_rotors, num_waters):
+    def sample_guided_diffusion(self, rng_key, batch_dict, embeddings, grad_fn, sample_key, initial_chis, num_waters):
         positions = self.initial_positions[0]
-        chi = jnp.zeros(num_rotors)
+        chi = initial_chis
         water = jnp.zeros((num_waters, 3))
 
         lr = 0.05
@@ -93,6 +92,8 @@ def test_full_physics_pipeline():
         }
         rotor_table = {k: jnp.array([], dtype=jnp.int32 if "idx" in k else jnp.float32) 
                        for k in ["target_idx", "parent_idx", "grandparent_idx", "greatgrand_idx", "ideal_r", "ideal_theta"]}
+        rotor_table["initial_chi"] = jnp.array([0.0, 0.0])
+
         water_mapping = {
             "oxygen_source": jnp.array([1], dtype=jnp.int32),
             "h1_target": jnp.array([2], dtype=jnp.int32),

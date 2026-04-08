@@ -60,7 +60,7 @@ def build_decoupled_topology(flat_layout, x_af3_flat_baseline):
 
     rotor_table = {
         "target_idx": [], "parent_idx": [], "grandparent_idx": [], 
-        "greatgrand_idx": [], "ideal_r": [], "ideal_theta": []
+        "greatgrand_idx": [], "ideal_r": [], "ideal_theta": [], "initial_chi": []
     }
     oracle_heavy_indices, af3_source_indices = [], []
 
@@ -99,25 +99,42 @@ def build_decoupled_topology(flat_layout, x_af3_flat_baseline):
             continue
             
         c_h, c_p, c_gp = oracle_atoms.coord[i], oracle_atoms.coord[p_i], oracle_atoms.coord[gp_i]
+        c_ggp = oracle_atoms.coord[ggp_i] # We need the great-grandparent coord to define the local X-axis
         v_hp, v_gpp = c_h - c_p, c_gp - c_p
         
         r_ideal = np.linalg.norm(v_hp)
         cos_theta = np.dot(v_hp, v_gpp) / (r_ideal * np.linalg.norm(v_gpp) + 1e-8)
         theta_ideal = np.degrees(np.arccos(np.clip(cos_theta, -1.0, 1.0)))
+       
+        # Extract the hydride-optimized Chi Angle
+        # Match the generalized_nerf_layer axes exactly
+        v1 = c_p - c_gp
+        v2 = c_gp - c_ggp
         
+        z_axis = v1 / (np.linalg.norm(v1) + 1e-8)
+        x_axis_raw = np.cross(v2, z_axis)
+        x_axis = x_axis_raw / (np.linalg.norm(x_axis_raw) + 1e-8)
+        y_axis = np.cross(z_axis, x_axis)
+        
+        # Project the Hydrogen vector onto the local X and Y axes
+        x_proj = np.dot(v_hp, x_axis)
+        y_proj = np.dot(v_hp, y_axis)
+        chi_initial = np.arctan2(y_proj, x_proj)
+
         rotor_table["target_idx"].append(i) 
         rotor_table["parent_idx"].append(af3_lookup[p_key]) 
         rotor_table["grandparent_idx"].append(af3_lookup[gp_key])
         rotor_table["greatgrand_idx"].append(af3_lookup[ggp_key])
         rotor_table["ideal_r"].append(r_ideal)
         rotor_table["ideal_theta"].append(theta_ideal)
+        rotor_table["initial_chi"].append(chi_initial)
 
     logging.info(f"Mapped {len(oracle_heavy_indices)} AF3 natively tracked heavy atoms.")
     logging.info(f"Mapped {len(water_o_source)} SO(3) orientable water molecules.")
     logging.info(f"Delegated {len(rotor_table['target_idx'])} dynamically generated protons to JAX NeRF.")
 
     return (
-        {k: jnp.array(v, dtype=jnp.float32 if "ideal" in k else jnp.int32) for k, v in rotor_table.items()},
+        {k: jnp.array(v, dtype=jnp.float32 if ("ideal" in k or "chi" in k) else jnp.int32) for k, v in rotor_table.items()},
         {
             "oracle_heavy": jnp.array(oracle_heavy_indices, dtype=jnp.int32),
             "af3_source": jnp.array(af3_source_indices, dtype=jnp.int32),

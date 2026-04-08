@@ -20,6 +20,7 @@ def test_loss_mapping_and_gradients():
         "greatgrand_idx": jnp.array([2, 1]),
         "ideal_r": jnp.array([1.0, 1.0]),
         "ideal_theta": jnp.array([109.5, 109.5]),
+        "initial_chi": jnp.array([0.0, 0.0]),
     }
     
     water_mapping = {
