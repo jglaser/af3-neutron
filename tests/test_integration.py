@@ -40,19 +40,24 @@ class MockModelRunner:
     """Mocks the Haiku-compiled AF3 ModelRunner for integration testing."""
     def __init__(self, initial_positions):
         self.initial_positions = initial_positions
-        
-    def sample_guided_diffusion(self, rng_key, batch_dict, embeddings, grad_fn, sample_key):
-        # We strip the sample dim
+
+    def sample_guided_diffusion(self, rng_key, batch_dict, embeddings, grad_fn, sample_key, num_rotors, num_waters):
         positions = self.initial_positions[0]
-        
-        # Run a simple gradient descent loop to prove the physics torque works
+        chi = jnp.zeros(num_rotors)
+        water = jnp.zeros((num_waters, 3))
+
         lr = 0.05
         for _ in range(15):
-            loss_val, grad_val = grad_fn(positions)
-            positions = positions - lr * jnp.clip(grad_val, -1.0, 1.0)
-            
-        # Repackage exactly as DeepMind's sample() would
-        return {'atom_positions': jnp.expand_dims(positions, axis=0)}
+            loss_val, (grad_x0, grad_chi, grad_water) = grad_fn(positions, chi, water)
+            positions = positions - lr * jnp.clip(grad_x0, -1.0, 1.0)
+            chi = chi - 0.1 * jnp.clip(grad_chi, -0.1, 0.1)
+            water = water - 0.1 * jnp.clip(grad_water, -0.1, 0.1)
+
+        final_state = {
+            'diffuser': {'chi_angles': chi, 'water_rotations': water}
+        }
+
+        return {'atom_positions': jnp.expand_dims(positions, axis=0)}, final_state
 
 def test_full_physics_pipeline():
     oracle = create_mock_water_oracle()
@@ -101,6 +106,7 @@ def test_full_physics_pipeline():
         
         initial_loss = decoupled_crystallographic_loss_pure(
             initial_positions.reshape((-1, 3)), 
+            jnp.array([]), jnp.array([[0.0, 0.0, 0.0]]),
             gather_idxs, rotor_table, mapping, water_mapping, sfc
         )
         
@@ -122,7 +128,8 @@ def test_full_physics_pipeline():
         
         final_loss = decoupled_crystallographic_loss_pure(
             final_coords.reshape((-1, 3)), 
-            gather_idxs, rotor_table, mapping, water_mapping, sfc
+            final_chis, final_waters, gather_idxs,
+            rotor_table, mapping, water_mapping, sfc
         )
 
         # --- ASSERTIONS ---

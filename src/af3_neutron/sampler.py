@@ -23,26 +23,24 @@ def se3_invariant_neutron_loss(x_full, sfc_instance):
     return sfc_neutron_loss(x_full, sfc_instance)
 
 def decoupled_crystallographic_loss_pure(
-    positions_denoised_flat, gather_idxs, rotor_table, mapping, water_mapping, sfc_instance
+    positions_denoised_flat, chi_angles, water_rotations, gather_idxs, 
+    rotor_table, mapping, water_mapping, sfc_instance
 ):
     x_af3_flat = positions_denoised_flat[gather_idxs]
-
-    chi_angles = jnp.zeros(rotor_table["target_idx"].shape[0])
-    water_rotations = jnp.zeros((water_mapping["oxygen_source"].shape[0], 3))
-
+    
     x_full = jnp.zeros((mapping["num_oracle_atoms"], 3))
     x_full = x_full.at[mapping["oracle_heavy"]].set(x_af3_flat[mapping["af3_source"]])
-
+    
     if rotor_table["target_idx"].shape[0] > 0:
         x_h = generalized_nerf_layer(x_af3_flat, rotor_table, chi_angles)
         x_full = x_full.at[rotor_table["target_idx"]].set(x_h)
-
+        
     if water_mapping["oxygen_source"].shape[0] > 0:
         oxygen_coords = x_af3_flat[water_mapping["oxygen_source"]]
         h1, h2 = so3_water_layer(oxygen_coords, water_rotations)
         x_full = x_full.at[water_mapping["h1_target"]].set(h1)
         x_full = x_full.at[water_mapping["h2_target"]].set(h2)
-
+        
     if sfc_instance is not None:
         return se3_invariant_neutron_loss(x_full, sfc_instance)
     else:
@@ -52,30 +50,35 @@ def run_neutron_guided_diffusion(
     model_runner, batch_dict, embeddings, gather_idxs,
     rotor_table, mapping, water_mapping, sfc_instance=None, sample_key=None
 ):
-    logging.info("Delegating to Native AF3 SDE Loop with SE(3) Covariant Physics Hook...")
-
-    # Create the pure closure
-    def loss_fn(positions_denoised):
+    logging.info("Delegating to Native AF3 SDE Loop with Stateful Kinematics...")
+    
+    def loss_fn(positions_denoised, chi, water):
         positions_flat = positions_denoised.reshape((-1, 3))
         return decoupled_crystallographic_loss_pure(
-            positions_flat, gather_idxs, rotor_table, mapping, water_mapping, sfc_instance
+            positions_flat, chi, water, gather_idxs, 
+            rotor_table, mapping, water_mapping, sfc_instance
         )
 
-    grad_fn = jax.value_and_grad(loss_fn)
+    # Gradient is now w.r.t arg 0 (x0), arg 1 (chi), and arg 2 (water)
+    grad_fn = jax.value_and_grad(loss_fn, argnums=(0, 1, 2))
 
-    # Execute the JIT-compiled native sampling loop!
-    # jax.random.PRNGKey(0) is passed for the dummy Haiku transform RNG; sample_key drives the SDE.
-    sample_results = model_runner.sample_guided_diffusion(
-        jax.random.PRNGKey(0), batch_dict, embeddings, grad_fn, sample_key
+    num_rotors = rotor_table["target_idx"].shape[0]
+    num_waters = water_mapping["oxygen_source"].shape[0]
+
+    # The runner now returns a tuple: (outputs, final_state_dict)
+    sample_results, final_state = model_runner.sample_guided_diffusion(
+        jax.random.PRNGKey(0), batch_dict, embeddings, grad_fn, sample_key,
+        num_rotors, num_waters
     )
 
     final_coords = sample_results['atom_positions'][0]
+    
+    # Extract the optimized kinematics from the final Haiku state dictionary
+    # 'diffuser' maps to the `name='diffuser'` argument in GuidedDiffusionWrapper
+    final_chis = final_state['diffuser']['chi_angles']
+    final_waters = final_state['diffuser']['water_rotations']
 
-    # Return stateless kinematics
-    chi_angles = jnp.zeros(rotor_table["target_idx"].shape[0])
-    water_rotations = jnp.zeros((water_mapping["oxygen_source"].shape[0], 3))
-
-    return final_coords, chi_angles, water_rotations
+    return final_coords, final_chis, final_waters
 
 def generate_final_oracle_coords(positions_denoised_final, chi_angles, water_rotations, gather_idxs, rotor_table, mapping, water_mapping, reference_coords):
     # 1. Map to oracle heavy atoms

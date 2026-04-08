@@ -98,36 +98,38 @@ class GuidedDiffusionWrapper(hk.Module):
             self.config.heads.diffusion, self.config.global_config
         )
 
-    def __call__(self, batch, embeddings, grad_fn, sample_key):
+    def __call__(self, batch, embeddings, grad_fn, sample_key, num_rotors, num_waters):
         sample_config = self.config.heads.diffusion.eval
 
         def guided_denoising_step(positions_noisy, t_hat):
-            # 1. Native AF3 Vector Field (Evaluates in the Augmented Frame)
+            # 1. Native Prediction
             x_0 = self.diffusion_module(
-                positions_noisy=positions_noisy,
-                noise_level=t_hat,
-                batch=batch,
-                embeddings=embeddings,
-                use_conditioning=True
+                positions_noisy=positions_noisy, noise_level=t_hat,
+                batch=batch, embeddings=embeddings, use_conditioning=True
             )
             
-            # 2. Covariant Loss Gradient
-            loss_val, grad_x0 = grad_fn(x_0)
+            # 2. Retrieve the current kinematic state from Haiku's hidden dictionary
+            chi = hk.get_state("chi_angles", shape=(num_rotors,), init=jnp.zeros)
+            water = hk.get_state("water_rotations", shape=(num_waters, 3), init=jnp.zeros)
+            
+            # 3. Evaluate the gradient with respect to ALL mobile degrees of freedom
+            loss_val, (grad_x0, grad_chi, grad_water) = grad_fn(x_0, chi, water)
             jax.debug.print("SDE Step Loss (Covariant): {loss:.4f}", loss=loss_val)
             
-            # 3. Apply physics torque directly to x_0
+            # 4. Update and store the sub-states back into Haiku
+            lr_chi = 0.1
+            hk.set_state("chi_angles", chi - lr_chi * jnp.clip(grad_chi, -0.1, 0.1))
+            hk.set_state("water_rotations", water - lr_chi * jnp.clip(grad_water, -0.1, 0.1))
+            
+            # 5. Apply the main heavy-atom torque
             lr_heavy = 0.05
-            grad_x0_clipped = jnp.clip(grad_x0, -1.0, 1.0)
-            x_0_guided = x_0 - (lr_heavy * grad_x0_clipped)
+            x_0_guided = x_0 - (lr_heavy * jnp.clip(grad_x0, -1.0, 1.0))
             
             return x_0_guided
 
-        # Run Native Sample Loop entirely inside the Haiku context!
         return diffusion_head.sample(
-            denoising_step=guided_denoising_step,
-            batch=batch,
-            key=sample_key,
-            config=sample_config
+            denoising_step=guided_denoising_step, batch=batch, 
+            key=sample_key, config=sample_config
         )
 
 # -------------------------------------------------------------------------
@@ -167,16 +169,25 @@ class ModelRunner:
 
     @functools.cached_property
     def sample_guided_diffusion(self):
-        """Executes the entire Guided Diffusion Loop natively inside Haiku."""
-        @hk.transform
-        def forward_sample(batch_dict, embeddings, grad_fn, sample_key):
+        @hk.transform_with_state  # critical switch for maintaining state
+        def forward_sample(batch_dict, embeddings, grad_fn, sample_key, num_rotors, num_waters):
             batch = feat_batch.Batch.from_data_dict(batch_dict)
-            return GuidedDiffusionWrapper(self._model_config)(batch, embeddings, grad_fn, sample_key)
+            return GuidedDiffusionWrapper(self._model_config)(
+                batch, embeddings, grad_fn, sample_key, num_rotors, num_waters
+            )
+            
+        def apply_fn(params, rng, batch_dict, embeddings, grad_fn, sample_key, num_rotors, num_waters):
+            # Generate the empty initial state dictionary
+            _, init_state = forward_sample.init(
+                rng, batch_dict, embeddings, grad_fn, sample_key, num_rotors, num_waters
+            )
+            # Run the SDE loop, actively threading the state dictionary
+            out, final_state = forward_sample.apply(
+                params, init_state, rng, batch_dict, embeddings, grad_fn, sample_key, num_rotors, num_waters
+            )
+            return out, final_state
 
-        # Note: grad_fn is a Python closure, so it MUST be marked as a static_argnum.
-        # Apply signature: (params, rng, batch_dict, embeddings, grad_fn, sample_key)
-        # Index 4 is grad_fn.
         return functools.partial(
-            jax.jit(forward_sample.apply, static_argnums=(4,), device=self._device),
+            jax.jit(apply_fn, static_argnums=(4,), device=self._device), 
             self.model_params
         )

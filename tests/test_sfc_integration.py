@@ -103,23 +103,29 @@ def test_sfc_loss_gradients():
        
         # Neural Network
         x_af3_flat = jnp.array([[0.1, 0.2, 0.3]]) # Slightly off-center Oxygen
-
         gather_idxs = jnp.array([0], dtype=jnp.int32)
+        chi_angles = jnp.array([], dtype=jnp.float32)
+        water_rotations = jnp.array([[0.1, -0.1, 0.05]]) # Initial axis-angle rotation
 
         # 1. Test Forward Pass
         loss = decoupled_crystallographic_loss_pure(
-            x_af3_flat, gather_idxs, rotor_table, mapping, water_mapping, sfc
+            x_af3_flat, chi_angles, water_rotations, gather_idxs, rotor_table, mapping, water_mapping, sfc
         )
         assert not jnp.isnan(loss)
-        
-        # 2. Test Backward Pass (Only positions!)
-        grad_fn = jax.value_and_grad(decoupled_crystallographic_loss_pure, argnums=0)
-        loss, grad_heavy = grad_fn(
-            x_af3_flat, gather_idxs, rotor_table, mapping, water_mapping, sfc
+
+        # 2. Test Backward Pass
+        grad_fn = jax.value_and_grad(decoupled_crystallographic_loss_pure, argnums=(0, 1, 2))
+        _, (grad_heavy, grad_chi, grad_water) = grad_fn(
+            x_af3_flat, chi_angles, water_rotations, gather_idxs, rotor_table, mapping, water_mapping, sfc
         )
-        
+
         # Assert dimensionalities remain intact
         assert grad_heavy.shape == x_af3_flat.shape
-        
-        # Assert gradients are flowing cleanly without exploding into NaNs
-        assert not jnp.any(jnp.isnan(grad_heavy)) 
+        assert grad_water.shape == water_rotations.shape
+
+         # Assert gradients are flowing cleanly without exploding into NaNs
+        assert not jnp.any(jnp.isnan(grad_heavy))
+        assert not jnp.any(jnp.isnan(grad_water))
+
+        # Assert SFC is actively applying torque to the water orientations
+        assert jnp.any(jnp.abs(grad_water) > 0)
