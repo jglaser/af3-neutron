@@ -79,20 +79,29 @@ def build_decoupled_topology(
 
     water_o_source, water_h1_target, water_h2_target = [], [], []
     for i in range(num_oracle_atoms):
-        is_water = oracle_atoms.res_name[i] in ["HOH", "WAT", "H2O"]
-        if is_water and oracle_atoms.element[i] == "O":
-            o_key = (
-                oracle_atoms.chain_id[i],
-                oracle_atoms.res_id[i],
-                oracle_atoms.atom_name[i],
-            )
-            if o_key in af3_lookup:
-                bonded_idx = bonds[i][bonds[i] != -1]
-                h_idx = [idx for idx in bonded_idx if oracle_atoms.element[idx] == "H"]
-                if len(h_idx) == 2:
-                    water_o_source.append(af3_lookup[o_key])
-                    water_h1_target.append(h_idx[0])
-                    water_h2_target.append(h_idx[1])
+        if oracle_atoms.res_name[i] not in ["HOH", "WAT", "H2O"]:
+            continue
+
+        if oracle_atoms.element[i] != "O":
+            continue
+
+        o_key = (
+            oracle_atoms.chain_id[i],
+            oracle_atoms.res_id[i],
+            oracle_atoms.atom_name[i],
+        )
+
+        if o_key not in af3_lookup:
+            continue
+
+        bonded_idx = bonds[i][bonds[i] != -1]
+        h_idx = [idx for idx in bonded_idx if oracle_atoms.element[idx] == "H"]
+        if len(h_idx) != 2:
+            continue
+
+        water_o_source.append(af3_lookup[o_key])
+        water_h1_target.append(h_idx[0])
+        water_h2_target.append(h_idx[1])
 
     rotor_table = {
         "target_idx": [],
@@ -125,18 +134,21 @@ def build_decoupled_topology(
         p_indices = bonds[i][bonds[i] != -1]
         if len(p_indices) == 0:
             continue
+
         p_i = p_indices[0]
 
         gp_indices = bonds[p_i][bonds[p_i] != -1]
         gp_indices = gp_indices[gp_indices != i]
         if len(gp_indices) == 0:
             continue
+
         gp_i = gp_indices[0]
 
         ggp_indices = bonds[gp_i][bonds[gp_i] != -1]
         ggp_indices = ggp_indices[ggp_indices != p_i]
         if len(ggp_indices) == 0:
             continue
+
         ggp_i = ggp_indices[0]
 
         p_key = (
