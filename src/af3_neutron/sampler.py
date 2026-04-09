@@ -4,7 +4,7 @@ import jax
 import jax.numpy as jnp
 
 from .kinematics import generalized_nerf_layer, so3_water_layer
-from .af3_runner import ModelRunner
+from .runner import ModelRunner
 
 
 def placeholder_neutron_loss(x_full: jnp.ndarray) -> jnp.ndarray:

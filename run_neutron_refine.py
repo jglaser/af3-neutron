@@ -14,10 +14,10 @@ from alphafold3.constants import chemical_components
 from alphafold3.model.pipeline import structure_cleaning
 from alphafold3.model.components import utils
 from alphafold3.model.network import diffusion_head
-from alphafold3.model import feat_batch # <--- NEW IMPORT
-from alphafold3.model.atom_layout import atom_layout # <--- NEW IMPORT
+from alphafold3.model import feat_batch
+from alphafold3.model.atom_layout import atom_layout
 
-from af3_neutron.af3_runner import ModelRunner, make_model_config
+from af3_neutron.runner import ModelRunner, make_model_config
 from af3_neutron.topology import build_decoupled_topology
 from af3_neutron.sampler import run_neutron_guided_diffusion, generate_final_oracle_coords
 from af3_neutron.sfc_adapter import init_neutron_sfc
