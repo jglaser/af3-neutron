@@ -1,10 +1,13 @@
 import logging
-import jax.numpy as jnp
-import numpy as np
-import tempfile
 import os
+import tempfile
+from typing import Any
+
+from biotite.structure import AtomArray
 import biotite.structure.io.pdb as pdb
 import gemmi
+import jax.numpy as jnp
+import numpy as np
 from SFC_Jax.Fmodel import SFcalculator
 
 # --- MONKEY PATCH GEMMI FOR SFC_JAX COMPATIBILITY ---
@@ -14,11 +17,27 @@ if not hasattr(gemmi.UnitCell, "orthogonalization_matrix"):
     gemmi.UnitCell.orthogonalization_matrix = property(lambda self: self.orth.mat)
 # ----------------------------------------------------
 
-def init_neutron_sfc(oracle_atoms, mtz_path):
+def init_neutron_sfc(oracle_atoms: AtomArray, mtz_path: str) -> SFcalculator:
     """
-    Writes the oracle to a temp PDB, initializes SFC_Jax, and dynamically 
-    replaces the X-ray form factor tensor with constant neutron scattering 
-    lengths using Gemmi's neutron92 tables.
+    Initializes the SFC_Jax crystallographic engine for neutron diffraction.
+
+    This function performs a "physics swap" by initializing a standard X-ray 
+    structure factor calculator and replacing its internal atomic form factor 
+    tensors with nuclear scattering lengths derived from Gemmi's neutron92 
+    tables.
+
+    Parameters
+    ----------
+    oracle_atoms : biotite.structure.AtomArray
+        The molecular structure used to define the unit cell and atomic 
+    mtz_path : str
+        Path to the experimental MTZ file containing reflections (Fo and SigF).
+
+    Returns
+    -------
+    SFC_Jax.Fmodel.SFcalculator
+        A JAX-compatible structure factor calculator instance configured for 
+        neutron scattering.
     """
     logging.info("Initializing SFC_Jax Crystallographic Engine...")
     
