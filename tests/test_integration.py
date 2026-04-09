@@ -60,8 +60,11 @@ class MockModelRunner:
             'diffuser': {'chi_angles': chi, 'water_rotations': water}
         }
         
-        # We don't need to expand dims anymore since positions is already batched
-        return {'atom_positions': positions}, final_state
+        return {
+            'atom_positions': jnp.expand_dims(positions, axis=0),
+            'chi_angles': jnp.expand_dims(chi, 0), 
+            'water_rotations': jnp.expand_dims(water, 0)
+        }
 
 def test_full_physics_pipeline():
     oracle = create_mock_water_oracle()
@@ -111,12 +114,12 @@ def test_full_physics_pipeline():
         gather_idxs = jnp.array([0, 1], dtype=jnp.int32)
         
         initial_loss = decoupled_crystallographic_loss_pure(
-            initial_positions,
-            jnp.expand_dims(rotor_table["initial_chi"], axis=0),
-            jnp.zeros((1, 1, 3)),
+            initial_positions[0], # Evaluate purely on the 2D atoms
+            rotor_table["initial_chi"], 
+            jnp.zeros((1, 3)), # 1 water molecule
             gather_idxs, rotor_table, mapping, water_mapping, sfc
         )
-        
+
         # Initialize the mock runner
         mock_runner = MockModelRunner(initial_positions)
         

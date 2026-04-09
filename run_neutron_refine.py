@@ -154,6 +154,7 @@ def main(argv):
     # we need to overwrite the output structure in the script to handle them independently.
     
     logging.info("Assembling final atomic coordinates for all samples...")
+    reference_coords = jnp.array(oracle_atoms.coord, dtype=jnp.float32)
     num_samples = final_coords_batched.shape[0]
     
     all_final_structures = []

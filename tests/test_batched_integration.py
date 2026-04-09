@@ -44,17 +44,18 @@ class MockBatchedModelRunner:
         positions = self.initial_positions
         num_samples = positions.shape[0]
         
-        # Simulate Haiku state initialization across the batch
-        # initial_chis: (num_rotors,) -> chi: (num_samples, num_rotors)
         chi = jnp.tile(initial_chis[None, :], (num_samples, 1))
         water = jnp.zeros((num_samples, num_waters, 3))
         
+        # --- FIX: THE GRADIENT FUNCTION MUST BE VMAPPED NATIVELY ---
+        # Because we are mimicking the *outer* Haiku pipeline, 
+        # we map the gradient function over the batch axis (0) for the positions, chi, and water.
+        batched_grad_fn = jax.vmap(grad_fn, in_axes=(0, 0, 0))
+        
         lr = 0.05
         for _ in range(15):
-            # Evaluate gradients natively across the batch
-            loss_val, (grad_x0, grad_chi, grad_water) = grad_fn(positions, chi, water)
+            loss_val, (grad_x0, grad_chi, grad_water) = batched_grad_fn(positions, chi, water)
             
-            # Apply torque concurrently
             positions = positions - lr * jnp.clip(grad_x0, -1.0, 1.0)
             chi = chi - 0.1 * jnp.clip(grad_chi, -0.1, 0.1)
             water = water - 0.1 * jnp.clip(grad_water, -0.1, 0.1)
@@ -63,8 +64,11 @@ class MockBatchedModelRunner:
             'diffuser': {'chi_angles': chi, 'water_rotations': water}
         }
         
-        # Return batched coordinates exactly as AlphaFold does
-        return {'atom_positions': positions}, final_state
+        return {
+            'atom_positions': positions,
+            'chi_angles': chi, 
+            'water_rotations': water
+        }
 
 def test_batched_integration_pipeline():
     oracle = create_mock_water_oracle()

@@ -98,48 +98,109 @@ class GuidedDiffusionWrapper(hk.Module):
             self.config.heads.diffusion, self.config.global_config
         )
 
-    # --- In GuidedDiffusionWrapper ---
     def __call__(self, batch, embeddings, grad_fn, sample_key, initial_chis, num_waters):
         sample_config = self.config.heads.diffusion.eval
-        num_samples = sample_config.num_samples
+
+        # --- THE PSEUDO-ATOM SMUGGLE ---
+        orig_mask = batch.predicted_structure_info.atom_mask
+        num_tokens = orig_mask.shape[-2]
+        orig_A = orig_mask.shape[-1]
+
+        num_rotors = initial_chis.shape[0]
+        num_floats = num_rotors + num_waters * 3
+
+        # FIX: Use standard Python math so JAX doesn't convert the shape into a Tracer!
+        if num_floats > 0:
+            import math
+            N_extra = math.ceil(num_floats / (num_tokens * 3.0))
+        else:
+            N_extra = 0
+
+        if N_extra > 0:
+            pad_shape = orig_mask.shape[:-1] + (N_extra,)
+            pad_mask = jnp.zeros(pad_shape, dtype=orig_mask.dtype) # Mask is 0 so augmentations ignore them
+            padded_mask = jnp.concatenate([orig_mask, pad_mask], axis=-1)
+            
+            # FIX: Safely replace the mask anywhere it appears in the PyTree
+            def replace_mask(x):
+                if id(x) == id(orig_mask):
+                    return padded_mask
+                return x
+            padded_batch = jax.tree_util.tree_map(replace_mask, batch)
+        else:
+            padded_batch = batch
 
         def guided_denoising_step(positions_noisy, t_hat):
-            # 1. Native Prediction
-            x_0 = self.diffusion_module(
-                positions_noisy=positions_noisy, noise_level=t_hat,
+            if N_extra > 0:
+                # SDE provides an unbatched tensor: (num_tokens, orig_A + N_extra, 3)
+                real_coords = positions_noisy[..., :orig_A, :]
+                angle_trackers = positions_noisy[..., orig_A:, :]
+                
+                # Flatten the trackers to extract our continuous variables
+                flat_angles = angle_trackers.reshape(-1) 
+                chi = flat_angles[:num_rotors]
+                
+                water_flat = flat_angles[num_rotors:num_floats]
+                water = water_flat.reshape((num_waters, 3)) if num_waters > 0 else jnp.zeros((0, 3))
+            else:
+                real_coords = positions_noisy
+                chi = initial_chis
+                water = jnp.zeros((0, 3))
+
+            # MUST pass the original unpadded batch to avoid neural network shape crashes
+            x_0_real = self.diffusion_module(
+                positions_noisy=real_coords, noise_level=t_hat,
                 batch=batch, embeddings=embeddings, use_conditioning=True
             )
             
-            # 2. BATCHED KINEMATIC STATE
-            # We initialize the state with a leading `num_samples` dimension
-            # initial_chis shape: (num_rotors,) -> Batched shape: (num_samples, num_rotors)
-            chi_init_fn = lambda shape, dtype: jnp.tile(initial_chis[None, ...], (num_samples, 1))
-            chi = hk.get_state("chi_angles", shape=(num_samples, initial_chis.shape[0]), init=chi_init_fn)
-            
-            water_init_fn = lambda shape, dtype: jnp.zeros((num_samples, num_waters, 3))
-            water = hk.get_state("water_rotations", shape=(num_samples, num_waters, 3), init=water_init_fn)
-            
-            # 3. BATCHED GRADIENT EVALUATION
-            # We evaluate the gradients for all 5 samples simultaneously
-            loss_val, (grad_x0, grad_chi, grad_water) = grad_fn(x_0, chi, water)
-            
-            # Since loss_val might be an array of 5 losses, we take the mean for printing
-            jax.debug.print("SDE Step Mean Loss (Covariant): {loss:.4f}", loss=jnp.mean(loss_val))
-            
-            # 4. BATCHED UPDATE
-            lr_chi = 0.1
-            hk.set_state("chi_angles", chi - lr_chi * jnp.clip(grad_chi, -0.1, 0.1))
-            hk.set_state("water_rotations", water - lr_chi * jnp.clip(grad_water, -0.1, 0.1))
+            loss_val, (grad_x0, grad_chi, grad_water) = grad_fn(x_0_real, chi, water)
             
             lr_heavy = 0.05
-            x_0_guided = x_0 - (lr_heavy * jnp.clip(grad_x0, -1.0, 1.0))
+            x_0_guided = x_0_real - (lr_heavy * jnp.clip(grad_x0, -1.0, 1.0))
             
-            return x_0_guided
+            if N_extra > 0:
+                # Pack the physics gradients back into the pseudo-atom shape
+                flat_grad = jnp.concatenate([
+                    grad_chi.reshape(-1), 
+                    grad_water.reshape(-1), 
+                    jnp.zeros(num_tokens * N_extra * 3 - num_floats)
+                ])
+                grad_trackers = flat_grad.reshape(angle_trackers.shape)
+                
+                # By offsetting the noisy state by our gradient, the SDE step naturally performs SGD!
+                denoised_angles = angle_trackers + grad_trackers
+                positions_denoised = jnp.concatenate([x_0_guided, denoised_angles], axis=-2)
+            else:
+                positions_denoised = x_0_guided
 
-        return diffusion_head.sample(
-            denoising_step=guided_denoising_step, batch=batch, 
+            return positions_denoised
+
+        sample_results = diffusion_head.sample(
+            denoising_step=guided_denoising_step, batch=padded_batch, 
             key=sample_key, config=sample_config
         )
+       
+        pos_tensor = sample_results['atom_positions']
+        
+        if N_extra > 0:
+            final_positions = pos_tensor[..., :orig_A, :]
+            final_trackers = pos_tensor[..., orig_A:, :]
+            
+            # final_trackers shape is (num_samples, num_tokens, N_extra, 3)
+            # We flatten everything except num_samples
+            num_samples = pos_tensor.shape[0]
+            flat_angles = final_trackers.reshape(num_samples, -1)
+            
+            chi_out = flat_angles[:, :num_rotors]
+            water_flat = flat_angles[:, num_rotors:num_floats]
+            water_out = water_flat.reshape((num_samples, num_waters, 3)) if num_waters > 0 else jnp.zeros((num_samples, 0, 3))
+        else:
+            final_positions = sample_results
+            num_samples = sample_config.num_samples
+            chi_out = jnp.tile(initial_chis[None, ...], (num_samples, 1))
+            water_out = jnp.zeros((num_samples, 0, 3))
+
+        return {'atom_positions': final_positions, 'chi_angles': chi_out, 'water_rotations': water_out}
 
 # -------------------------------------------------------------------------
 # MODEL RUNNER
@@ -178,7 +239,7 @@ class ModelRunner:
 
     @functools.cached_property
     def sample_guided_diffusion(self):
-        @hk.transform_with_state # critical for passing chi_angles and water orientations
+        @hk.transform
         def forward_sample(batch_dict, embeddings, grad_fn, sample_key, initial_chis, num_waters):
             batch = feat_batch.Batch.from_data_dict(batch_dict)
             return GuidedDiffusionWrapper(self._model_config)(
@@ -186,13 +247,11 @@ class ModelRunner:
             )
             
         def apply_fn(params, rng, batch_dict, embeddings, grad_fn, sample_key, initial_chis, num_waters):
-            _, init_state = forward_sample.init(
-                rng, batch_dict, embeddings, grad_fn, sample_key, initial_chis, num_waters
+            # No state required!
+            out = forward_sample.apply(
+                params, rng, batch_dict, embeddings, grad_fn, sample_key, initial_chis, num_waters
             )
-            out, final_state = forward_sample.apply(
-                params, init_state, rng, batch_dict, embeddings, grad_fn, sample_key, initial_chis, num_waters
-            )
-            return out, final_state
+            return out
 
         return functools.partial(
             jax.jit(apply_fn, static_argnums=(4, 7), device=self._device), 

@@ -101,10 +101,10 @@ def test_sfc_loss_gradients():
             "h2_target": jnp.array([2], dtype=jnp.int32)
         }
        
-        # Neural Network states
-        x_af3_flat = jnp.array([[[0.1, 0.2, 0.3]]])          # Shape: (1, 1, 3)
-        chi_angles = jnp.zeros((1, 0), dtype=jnp.float32)    # Shape: (1, 0)
-        water_rotations = jnp.array([[[0.1, -0.1, 0.05]]])   # Shape: (1, 1, 3)
+        # Neural Network states (STRICT 2D)
+        x_af3_flat = jnp.array([[0.1, 0.2, 0.3]])            # Shape: (1, 3)
+        chi_angles = jnp.zeros((0,), dtype=jnp.float32)      # Shape: (0,)
+        water_rotations = jnp.array([[0.1, -0.1, 0.05]])     # Shape: (1, 3)
 
         gather_idxs = jnp.array([0], dtype=jnp.int32)
 
