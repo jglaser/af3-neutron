@@ -12,7 +12,8 @@ dependencies = [
     "gemmi-program>=0.7.5",
     "sfcalculator-jax",
     "biotite>=1.6.0",
-    "hydride>=1.2.3",
+    # "hydride>=1.2.3",
+    "hydride",
 ]
 
 [build-system]
@@ -22,6 +23,7 @@ build-backend = "uv_build"
 [tool.uv.sources]
 sfcalculator-jax = { git = "https://github.com/Hekstra-Lab/SFcalculator_jax" }
 alphafold3 = { path = "/home/xvg/alphafold3" }
+hydride = { git = "https://github.com/vivek-booshan/hydride-jax" }
 
 [dependency-groups]
 dev = [
