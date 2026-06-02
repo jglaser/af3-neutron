@@ -6,10 +6,11 @@ import jax.numpy as jnp
 
 import biotite.structure as struc
 import hydride
+from hydride import estimate_amino_acid_charges
 
 
 def build_decoupled_topology(
-    flat_layout: Any, x_af3_flat_baseline: jnp.ndarray
+    flat_layout: Any, x_af3_flat_baseline: jnp.ndarray, pH: float = 7.0,
 ) -> Tuple[
     Dict[str, jnp.ndarray], Dict[str, Any], Dict[str, jnp.ndarray], struc.AtomArray
 ]:
@@ -63,6 +64,9 @@ def build_decoupled_topology(
     if "charge" not in oracle_atoms.get_annotation_categories():
         oracle_atoms.add_annotation("charge", dtype=int)
         oracle_atoms.charge[:] = 0
+
+    charges = estimate_amino_acid_charges(atoms, ph=pH)
+    oracle_atoms.charge[:] = charges
 
     oracle_atoms, _ = hydride.add_hydrogen(oracle_atoms)
     oracle_atoms.coord = hydride.relax_hydrogen(oracle_atoms)

@@ -44,6 +44,13 @@ _NUM_DIFFUSION_SAMPLES = flags.DEFINE_integer(
     'Number of diffusion samples to generate.',
     lower_bound=1,
 )
+_NUM_DIFFUSION_STEPS = flags.DEFINE_integer(
+    'num_diffusion_steps',
+    200,
+    'Number of diffusion steps.',
+    lower_bound=0,
+)
+
 
 def main(argv):
     del argv
@@ -147,7 +154,8 @@ def main(argv):
         mapping=mapping,
         water_mapping=water_mapping,
         sfc_instance=sfc_instance,
-        sample_key=sample_key
+        sample_key=sample_key,
+        steps=_NUM_DIFFUSION_STEPS.value,
     )
     
     # Since DeepMind's sample_results returns a dictionary designed for multi-sample extraction,

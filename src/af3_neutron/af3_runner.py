@@ -8,6 +8,8 @@ import haiku as hk
 import jax
 import jax.numpy as jnp
 
+from functools import partial
+
 from alphafold3.model import model, params, feat_batch
 from alphafold3.model.network import evoformer as evoformer_network
 from alphafold3.model.network import diffusion_head
@@ -200,7 +202,10 @@ class GuidedDiffusionWrapper(hk.Module):
         The Haiku variable scope name, by default 'diffuser'.
     """
 
-    def __init__(self, config: model.Model.Config, name: str = "diffuser"):
+    def __init__(self,
+                 config: model.Model.Config,
+                 name: str = "diffuser",
+            ):
         super().__init__(name=name)
         self.config = config
         self.diffusion_module = diffusion_head.DiffusionHead(
@@ -215,6 +220,7 @@ class GuidedDiffusionWrapper(hk.Module):
         sample_key: jnp.ndarray,
         initial_chis: jnp.ndarray,
         num_waters: int,
+        steps: int,
     ) -> Dict[str, jnp.ndarray]:
         """
         Executes the guided SDE sampling process.
@@ -241,6 +247,7 @@ class GuidedDiffusionWrapper(hk.Module):
             'atom_positions', 'chi_angles', and 'water_rotations'.
         """
         sample_config = self.config.heads.diffusion.eval
+        sample_config.steps = steps
 
         # --- THE PSEUDO-ATOM SMUGGLE ---
         orig_mask = batch.predicted_structure_info.atom_mask
@@ -468,11 +475,17 @@ class ModelRunner:
         """
         @hk.transform
         def forward_sample(
-            batch_dict: Dict[str, Any], embeddings: Dict[str, jnp.ndarray], grad_fn: Callable, sample_key: jnp.ndarray, initial_chis: jnp.ndarray, num_waters: int
+            batch_dict: Dict[str, Any],
+            embeddings: Dict[str, jnp.ndarray],
+            grad_fn: Callable,
+            sample_key: jnp.ndarray,
+            initial_chis: jnp.ndarray,
+            num_waters: int,
+            steps: int,
         ) -> Dict[str, jnp.ndarray]:
             batch = feat_batch.Batch.from_data_dict(batch_dict)
             return GuidedDiffusionWrapper(self._model_config)(
-                batch, embeddings, grad_fn, sample_key, initial_chis, num_waters
+                batch, embeddings, grad_fn, sample_key, initial_chis, num_waters, steps
             )
 
         def apply_fn(
@@ -484,6 +497,7 @@ class ModelRunner:
             sample_key: jnp.ndarray,
             initial_chis: jnp.ndarray,
             num_waters: int,
+            steps: int,
         ) -> Dict[str, jnp.ndarray]:
             # No state required!
             out = forward_sample.apply(
@@ -495,10 +509,11 @@ class ModelRunner:
                 sample_key,
                 initial_chis,
                 num_waters,
+                steps,
             )
             return out
 
         return functools.partial(
-            jax.jit(apply_fn, static_argnums=(4, 7), device=self._device),
+            jax.jit(apply_fn, static_argnums=(4, 7, 8), device=self._device),
             self.model_params,
         )

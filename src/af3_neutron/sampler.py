@@ -131,6 +131,7 @@ def run_neutron_guided_diffusion(
     water_mapping: Dict[str, jnp.ndarray],
     sfc_instance: Optional[Any] = None,
     sample_key: Optional[jnp.ndarray] = None,
+    steps: int = 200,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
     """
     Executes the guided SDE loop to refine protein and hydrogen positions.
@@ -155,6 +156,8 @@ def run_neutron_guided_diffusion(
         Experimental data adapter, by default None.
     sample_key : Optional[jnp.ndarray], optional
         PRNG key for diffusion sampling, by default None.
+    steps : int, optional
+        Number of diffusion steps
 
     Returns
     -------
@@ -191,6 +194,7 @@ def run_neutron_guided_diffusion(
         sample_key,
         initial_chis,
         num_waters,
+        steps,
     )
 
     final_coords_batched = sample_results["atom_positions"]
