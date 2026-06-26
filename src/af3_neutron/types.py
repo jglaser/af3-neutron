@@ -1,5 +1,8 @@
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Annotated
+
+
+from  biotite.structure import AtomArray
 import jax
 import jax.numpy as jnp
 
@@ -38,3 +41,54 @@ class WaterMapping:
     oxygen_source: jnp.ndarray
     h1_target: jnp.ndarray
     h2_target: jnp.ndarray
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class OracleMapping:
+    """Unified behavioral domain model representing the complete all-atom molecular blueprint."""
+    num_atoms: int
+    heavy_indices: Annotated[jax.Array, int]
+    source_indices: Annotated[jax.Array, int]
+    rotor_table: RotorTable
+    water_mapping: WaterMapping
+
+    def assemble_coordinates(
+        self, x_af3_flat: jnp.ndarray, chi_angles: jnp.ndarray, water_rotations: jnp.ndarray
+    ) -> jnp.ndarray:
+        """Translates and kinematically expands Host backbone coordinates to full all-atom space."""
+
+        # local imports break initialization cyclic dependency paths cleanly
+        from .kinematics import generalized_nerf_layer, so3_water_layer
+
+        x_full = jnp.zeros((self.num_atoms, 3))
+
+        # heavy atoms tracked natively from the Host layout
+        x_full = (x_full
+            .at[self.heavy_indices]
+            .set(
+                x_af3_flat[self.source_indices]
+                .reshape(self.heavy_indices.shape[0], 3)
+            )
+        )
+
+        # kinematically place protons via NeRF layers
+        if self.rotor_table.target_idx.shape[0] > 0:
+            x_h = generalized_nerf_layer(x_af3_flat, self.rotor_table, chi_angles)
+            x_h_reshaped = x_h.reshape((self.rotor_table.target_idx.shape[0], 3))
+            x_full = x_full.at[self.rotor_table.target_idx].set(x_h_reshaped)
+
+        # rotate explicit water structures via SO(3) layers
+        if self.water_mapping.oxygen_source.shape[0] > 0:
+            oxygen_coords = x_af3_flat[self.water_mapping.oxygen_source]
+            h1, h2 = so3_water_layer(oxygen_coords, water_rotations)
+            h1_reshaped = h1.reshape((self.water_mapping.h1_target.shape[0], 3))
+            h2_reshaped = h2.reshape((self.water_mapping.h2_target.shape[0], 3))
+            x_full = x_full.at[self.water_mapping.h1_target].set(h1_reshaped)
+            x_full = x_full.at[self.water_mapping.h2_target].set(h2_reshaped)
+
+        return x_full
+
+@dataclass
+class Oracle:
+    mapping: OracleMapping
+    atoms: AtomArray
