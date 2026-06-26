@@ -1,17 +1,17 @@
 # src/af3_neutron/topology.py
 import logging
-from typing import Any, Tuple
+from typing import Any
 import numpy as np
 import jax.numpy as jnp
 import biotite.structure as struc
 import hydride
 
-from .types import RotorTable, AtomMapping, WaterMapping
+from .types import RotorTable, WaterMapping, Oracle, OracleMapping
 
 
 def build_hijack_topology(
     flat_layout: Any, x_af3_flat_baseline: jnp.ndarray
-) -> Tuple[RotorTable, AtomMapping, WaterMapping, struc.AtomArray]:
+) -> Oracle:
     """Builds a full complex topological oracle from an unguided baseline prediction."""
     logging.info(
         "Building full-complex Hydride Oracle from Host baseline prediction..."
@@ -156,24 +156,20 @@ def build_hijack_topology(
         rotor_table["ideal_theta"].append(theta_ideal)
         rotor_table["initial_chi"].append(chi_initial)
 
-    return (
-        RotorTable(
-            **{
-                k: jnp.array(
-                    v, dtype=jnp.float32 if ("ideal" in k or "chi" in k) else jnp.int32
-                )
-                for k, v in rotor_table.items()
-            }
+    return Oracle(
+        mapping=OracleMapping(
+            num_atoms=num_oracle_atoms,
+            heavy_indices=jnp.array(oracle_heavy_indices, dtype=jnp.int32),
+            source_indices=jnp.array(af3_source_indices, dtype=jnp.int32),
+            rotor_table = RotorTable(
+                **{ k: jnp.array(v, dtype=jnp.float32 if k in ("ideal", "chi") else jnp.int32)
+                    for k, v in rotor_table.items()
+                }),
+            water_mapping=WaterMapping(
+                oxygen_source=jnp.array(water_o_source, dtype=jnp.int32),
+                h1_target=jnp.array(water_h1_target, dtype=jnp.int32),
+                h2_target=jnp.array(water_h2_target, dtype=jnp.int32),
+            )
         ),
-        AtomMapping(
-            oracle_heavy=jnp.array(oracle_heavy_indices, dtype=jnp.int32),
-            af3_source=jnp.array(af3_source_indices, dtype=jnp.int32),
-            num_oracle_atoms=num_oracle_atoms,
-        ),
-        WaterMapping(
-            oxygen_source=jnp.array(water_o_source, dtype=jnp.int32),
-            h1_target=jnp.array(water_h1_target, dtype=jnp.int32),
-            h2_target=jnp.array(water_h2_target, dtype=jnp.int32),
-        ),
-        oracle_atoms,
+        atoms=oracle_atoms,
     )

@@ -80,7 +80,6 @@ def main(argv):
             target_layout=batch_obj.convert_model_output.flat_output_layout,
         ).gather_idxs
     )
-
     # runner
     device = jax.local_devices(backend="gpu")[FLAGS.gpu_device]
     runner = HostRunner(
@@ -111,20 +110,19 @@ def main(argv):
     )
 
     # hijack
-    rotor_table, mapping, water_map, oracle_atoms = build_hijack_topology(
+    oracle = build_hijack_topology(
         batch_obj.convert_model_output.flat_output_layout,
         np.array(positions_denoised.reshape((-1, 3))[gather_idxs]),
     )
-    sfc = init_neutron_sfc(oracle_atoms, FLAGS.mtz_path) if FLAGS.mtz_path else None
+    sfc = init_neutron_sfc(oracle.atoms, FLAGS.mtz_path) if FLAGS.mtz_path else None
 
+    # NOTE(vivek): we only use [0] of coords, chis, waters. Should we just return those values instead? 
     coords, chis, waters = run_diffusion_hijack(
         runner,
         batch,
         embeddings,
         gather_idxs,
-        rotor_table,
-        mapping,
-        water_map,
+        oracle.mapping,
         sfc,
         jax.random.PRNGKey(0),
     )
@@ -135,19 +133,17 @@ def main(argv):
         chis[0],
         waters[0],
         gather_idxs,
-        rotor_table,
-        mapping,
-        water_map,
-        jnp.array(oracle_atoms.coord, dtype=jnp.float32),
+        oracle.mapping,
+        jnp.array(oracle.atoms.coord, dtype=jnp.float32),
     )
 
     # irrelevant file writing nonsense nobody cares about
-    oracle_atoms.coord = np.array(final_complex)
+    oracle.atoms.coord = np.array(final_complex)
     output_path = pathlib.Path(FLAGS.output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
     cif_file = pdbx.CIFFile()
-    pdbx.set_structure(cif_file, oracle_atoms, data_block="neutron_refined")
+    pdbx.set_structure(cif_file, oracle.atoms, data_block="neutron_refined")
     cif_file.write(output_path)
     logging.info("Refinement pipeline finished successfully.")
 

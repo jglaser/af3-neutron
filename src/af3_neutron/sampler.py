@@ -4,7 +4,7 @@ import jax.numpy as jnp
 
 from .kinematics import generalized_nerf_layer, so3_water_layer
 from .runner import HostRunner
-from .types import RotorTable, AtomMapping, WaterMapping, HostEmbeddings
+from .types import HostEmbeddings, OracleMapping
 
 
 def placeholder_neutron_loss(x_full: jnp.ndarray) -> jnp.ndarray:
@@ -25,38 +25,13 @@ def hijack_physics_loss(
     chi_angles: jnp.ndarray,
     water_rotations: jnp.ndarray,
     gather_idxs: jnp.ndarray,
-    rotor_table: RotorTable,
-    mapping: AtomMapping,
-    water_mapping: WaterMapping,
+    oracle_mapping: OracleMapping,
     sfc_instance: Optional[Any],
 ) -> jnp.ndarray:
     """Assembles structural primitives across Host frames and returns crystallographic gradients."""
     x_af3_flat = positions_denoised.reshape(-1, 3)[gather_idxs]
-    x_full = (
-        jnp.zeros((mapping.num_oracle_atoms, 3))
-        .at[mapping.oracle_heavy]
-        .set(x_af3_flat[mapping.af3_source].reshape(mapping.oracle_heavy.shape[0], 3))
-    )
 
-    if rotor_table.target_idx.shape[0] > 0:
-        x_full = (x_full
-            .at[rotor_table.target_idx]
-            .set(
-                generalized_nerf_layer(x_af3_flat, rotor_table, chi_angles)
-                .reshape((rotor_table.target_idx.shape[0], 3))
-            )
-        )
-
-    if water_mapping.oxygen_source.shape[0] > 0:
-        h1, h2 = so3_water_layer(
-            x_af3_flat[water_mapping.oxygen_source], water_rotations
-        )
-        x_full = (x_full
-            .at[water_mapping.h1_target]
-            .set(h1.reshape((water_mapping.h1_target.shape[0], 3)))
-            .at[water_mapping.h2_target]
-            .set(h2.reshape((water_mapping.h2_target.shape[0], 3)))
-        )
+    x_full = oracle_mapping.assemble_coordinates(x_af3_flat, chi_angles, water_rotations)
 
     if sfc_instance is not None:
         return jnp.mean(
@@ -72,9 +47,7 @@ def run_diffusion_hijack(
     batch_dict: dict,
     embeddings: HostEmbeddings,
     gather_idxs: jnp.ndarray,
-    rotor_table: RotorTable,
-    mapping: AtomMapping,
-    water_mapping: WaterMapping,
+    oracle_mapping: OracleMapping,
     sfc_instance: Optional[Any] = None,
     sample_key: Optional[jnp.ndarray] = None,
 ) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
@@ -86,9 +59,7 @@ def run_diffusion_hijack(
             c_single,
             w_single,
             gather_idxs,
-            rotor_table,
-            mapping,
-            water_mapping,
+            oracle_mapping,
             sfc_instance,
         )
 
@@ -99,8 +70,8 @@ def run_diffusion_hijack(
         embeddings,
         grad_fn,
         sample_key,
-        rotor_table.initial_chi,
-        water_mapping.oxygen_source.shape[0],
+        oracle_mapping.rotor_table.initial_chi,
+        oracle_mapping.water_mapping.oxygen_source.shape[0],
     )
     return (
         sample_results["atom_positions"],
@@ -114,56 +85,46 @@ def assemble_hijacked_complex(
     chi_angles: jnp.ndarray,
     water_rotations: jnp.ndarray,
     gather_idxs: jnp.ndarray,
-    rotor_table: RotorTable,
-    mapping: AtomMapping,
-    water_mapping: WaterMapping,
+    oracle_mapping: OracleMapping,
     reference_coords: jnp.ndarray,
 ) -> jnp.ndarray:
     """Snaps coordinates back into the crystal's global reference frame via Kabsch alignment."""
     x_af3_flat = positions_denoised_final.reshape((-1, 3))[gather_idxs]
-    p, q = (
-        x_af3_flat[mapping.af3_source]
-        - jnp.mean(x_af3_flat[mapping.af3_source], axis=0),
-        reference_coords[mapping.oracle_heavy]
-        - jnp.mean(reference_coords[mapping.oracle_heavy], axis=0),
-    )
+
+    p = x_af3_flat[oracle_mapping.source_indices] - jnp.mean(x_af3_flat[oracle_mapping.source_indices], axis=0)
+    q = reference_coords[oracle_mapping.heavy_indices] - jnp.mean(reference_coords[oracle_mapping.heavy_indices], axis=0)
 
     U, _, Vt = jnp.linalg.svd(jnp.einsum("ni,nj->ij", p, q))
-    R = (
-        U
-        @ jnp.diag(
-            jnp.array([1.0, 1.0, jnp.sign(jnp.linalg.det(U) * jnp.linalg.det(Vt))])
-        )
-        @ Vt
-    )
+
+    thingy = jnp.array([1.0, 1.0, jnp.sign(jnp.linalg.det(U) * jnp.linalg.det(Vt))])
+    R = U @ jnp.diag(thingy) @ Vt
+
     x_af3_aligned = (
-        x_af3_flat - jnp.mean(x_af3_flat[mapping.af3_source], axis=0)
-    ) @ R + jnp.mean(reference_coords[mapping.oracle_heavy], axis=0)
+        x_af3_flat - jnp.mean(x_af3_flat[oracle_mapping.source_indices], axis=0)
+    ) @ R + jnp.mean(reference_coords[oracle_mapping.heavy_indices], axis=0)
 
     x_full = (
-        jnp.zeros((mapping.num_oracle_atoms, 3))
-        .at[mapping.oracle_heavy]
-        .set(x_af3_aligned[mapping.af3_source])
+        jnp.zeros((oracle_mapping.num_atoms, 3))
+        .at[oracle_mapping.heavy_indices]
+        .set(x_af3_aligned[oracle_mapping.source_indices])
     )
-    if rotor_table.target_idx.shape[0] > 0:
-        rotor_dict = {
-            "parent_idx": rotor_table.parent_idx,
-            "grandparent_idx": rotor_table.grandparent_idx,
-            "greatgrand_idx": rotor_table.greatgrand_idx,
-            "ideal_r": rotor_table.ideal_r,
-            "ideal_theta": rotor_table.ideal_theta,
-        }
-        x_full = x_full.at[rotor_table.target_idx].set(
-            generalized_nerf_layer(x_af3_aligned, rotor_dict, chi_angles)
+    if oracle_mapping.rotor_table.target_idx.shape[0] > 0:
+        x_full = (x_full
+            .at[oracle_mapping.rotor_table.target_idx]
+            .set(
+                 generalized_nerf_layer(x_af3_aligned, oracle_mapping.rotor_table, chi_angles)
+                .reshape((oracle_mapping.rotor_table.target_idx.shape[0], 3))
+            )
         )
-    if water_mapping.oxygen_source.shape[0] > 0:
+    if oracle_mapping.water_mapping.oxygen_source.shape[0] > 0:
         h1, h2 = so3_water_layer(
-            x_af3_aligned[water_mapping.oxygen_source], water_rotations
+            x_af3_aligned[oracle_mapping.water_mapping.oxygen_source],
+            water_rotations
         )
-        x_full = (
-            x_full.at[water_mapping.h1_target]
+        x_full = (x_full
+            .at[oracle_mapping.water_mapping.h1_target]
             .set(h1)
-            .at[water_mapping.h2_target]
+            .at[oracle_mapping.water_mapping.h2_target]
             .set(h2)
         )
     return x_full

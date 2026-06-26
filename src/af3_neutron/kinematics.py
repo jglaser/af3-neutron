@@ -1,7 +1,8 @@
-from typing import Any, Dict, Tuple
+from typing import Tuple
 
 import jax.numpy as jnp
 
+from .types import RotorTable
 
 def safe_norm(x: jnp.ndarray, axis: int = -1, keepdims: bool = True):
     """Calculates L2 norm safely, preventing NaN gradients when x == 0."""
