@@ -225,15 +225,13 @@ def _hijack_diffusion_with_custom_loss(
 
 
 def _assemble_coordinates_from_conformation(
-    positions_denoised_final: jnp.ndarray,
-    chi_angles: jnp.ndarray,
-    water_rotations: jnp.ndarray,
+    conformation: Conformation,
     gather_idxs: jnp.ndarray,
     oracle_mapping: OracleMapping,
     reference_coords: jnp.ndarray,
 ) -> jnp.ndarray:
     """Snaps coordinates back into the crystal's global reference frame via Kabsch alignment."""
-    x_af3_flat = positions_denoised_final.reshape((-1, 3))[gather_idxs]
+    x_af3_flat = conformation.atom_positions.reshape((-1, 3))[gather_idxs]
 
     p = x_af3_flat[oracle_mapping.source_indices] - jnp.mean(x_af3_flat[oracle_mapping.source_indices], axis=0)
     q = reference_coords[oracle_mapping.heavy_indices] - jnp.mean(reference_coords[oracle_mapping.heavy_indices], axis=0)
@@ -247,7 +245,7 @@ def _assemble_coordinates_from_conformation(
         x_af3_flat - jnp.mean(x_af3_flat[oracle_mapping.source_indices], axis=0)
     ) @ R + jnp.mean(reference_coords[oracle_mapping.heavy_indices], axis=0)
 
-    return oracle_mapping.assemble_coordinates(x_af3_aligned, chi_angles, water_rotations)
+    return oracle_mapping.assemble_coordinates(x_af3_aligned, conformation.chi_angles, conformation.water_rotations)
 
 # TODO: need descriptive comments and type annotation
 class Hijacker:
