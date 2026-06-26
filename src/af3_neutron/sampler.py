@@ -39,16 +39,11 @@ def hijack_physics_loss(
     )
 
     if rotor_table.target_idx.shape[0] > 0:
-        rotor_dict = {
-            "parent_idx": rotor_table.parent_idx,
-            "grandparent_idx": rotor_table.grandparent_idx,
-            "greatgrand_idx": rotor_table.greatgrand_idx,
-            "ideal_r": rotor_table.ideal_r,
-            "ideal_theta": rotor_table.ideal_theta,
-        }
-        x_full = x_full.at[rotor_table.target_idx].set(
-            generalized_nerf_layer(x_af3_flat, rotor_dict, chi_angles).reshape(
-                (rotor_table.target_idx.shape[0], 3)
+        x_full = (x_full
+            .at[rotor_table.target_idx]
+            .set(
+                generalized_nerf_layer(x_af3_flat, rotor_table, chi_angles)
+                .reshape((rotor_table.target_idx.shape[0], 3))
             )
         )
 
@@ -56,8 +51,8 @@ def hijack_physics_loss(
         h1, h2 = so3_water_layer(
             x_af3_flat[water_mapping.oxygen_source], water_rotations
         )
-        x_full = (
-            x_full.at[water_mapping.h1_target]
+        x_full = (x_full
+            .at[water_mapping.h1_target]
             .set(h1.reshape((water_mapping.h1_target.shape[0], 3)))
             .at[water_mapping.h2_target]
             .set(h2.reshape((water_mapping.h2_target.shape[0], 3)))

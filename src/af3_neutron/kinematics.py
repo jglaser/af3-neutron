@@ -8,7 +8,7 @@ def safe_norm(x: jnp.ndarray, axis: int = -1, keepdims: bool = True):
     return jnp.sqrt(jnp.sum(x**2, axis=axis, keepdims=keepdims) + 1e-8)
 
 
-def generalized_nerf_layer(heavy_coords: jnp.ndarray, rotor_table: Dict[str, Any], chi_angles: jnp.ndarray) -> jnp.ndarray:
+def generalized_nerf_layer(heavy_coords: jnp.ndarray, rotor_table: RotorTable, chi_angles: jnp.ndarray) -> jnp.ndarray:
     """
     Places hydrogen atoms using the Natural Extension Reference Frame (NeRF) method.
 
@@ -36,9 +36,9 @@ def generalized_nerf_layer(heavy_coords: jnp.ndarray, rotor_table: Dict[str, Any
     jnp.ndarray
         The 3D coordinates of the placed hydrogen atoms in the global frame.
     """
-    p2 = heavy_coords[..., rotor_table["parent_idx"], :]
-    p1 = heavy_coords[..., rotor_table["grandparent_idx"], :]
-    p0 = heavy_coords[..., rotor_table["greatgrand_idx"], :]
+    p2 = heavy_coords[..., rotor_table.parent_idx, :]
+    p1 = heavy_coords[..., rotor_table.grandparent_idx, :]
+    p0 = heavy_coords[..., rotor_table.greatgrand_idx, :]
 
     v1 = p2 - p1
     v2 = p1 - p0
@@ -51,10 +51,10 @@ def generalized_nerf_layer(heavy_coords: jnp.ndarray, rotor_table: Dict[str, Any
     R = jnp.stack([x_axis, y_axis, z_axis], axis=-1)
 
     # Get the number of extra batch dimensions chi_angles has compared to r
-    num_batch_dims = chi_angles.ndim - rotor_table["ideal_r"].ndim
+    num_batch_dims = chi_angles.ndim - rotor_table.ideal_r.ndim
 
-    r = rotor_table["ideal_r"]
-    theta_deg = rotor_table["ideal_theta"]
+    r = rotor_table.ideal_r
+    theta_deg = rotor_table.ideal_theta
     for _ in range(num_batch_dims):
         r = jnp.expand_dims(r, axis=0)
         theta_deg = jnp.expand_dims(theta_deg, axis=0)
