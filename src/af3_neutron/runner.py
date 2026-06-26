@@ -81,6 +81,7 @@ class _HostDiffusionWrapper(_HostModule):
             use_conditioning=True,
         )
 
+# NOTE: woe be the day when I come back to this and forget everything
 class _DiffusionHijackWrapper(_HostModule):
     """Hijacks the Host solver trajectory to update non-native physics state."""
     def __init__(self, config: model.Model.Config, name: str = "diffuser"):
@@ -129,6 +130,7 @@ class _DiffusionHijackWrapper(_HostModule):
         sample_results = diffusion_head.sample(denoising_step=hijacked_denoising_step, batch=padded_batch, key=sample_key, config=sample_config)
         pos_tensor = sample_results["atom_positions"]
 
+        # TODO(vivek): return conformation directly from here
         if N_extra > 0:
             final_positions = pos_tensor[..., :orig_A, :]
             flat_angles = pos_tensor[..., orig_A:, :].reshape(pos_tensor.shape[0], -1)

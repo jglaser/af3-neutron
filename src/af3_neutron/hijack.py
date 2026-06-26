@@ -8,8 +8,6 @@ import jax.numpy as jnp
 import numpy as np
 from SFC_Jax.Fmodel import SFcalculator as SFC
 
-
-from .kinematics import generalized_nerf_layer, so3_water_layer
 from .loss import hijack_physics_loss # expose into this file later
 from .runner import HostRunner
 from .types import (
@@ -18,11 +16,11 @@ from .types import (
     WaterMapping,
     Oracle,
     OracleMapping,
-    HijackResult,
-    HijackResults
+    Conformation,
+    Conformations
 )
 
-def build_hijack_topology(
+def _build_oracle_from_baseline_af3_prediction(
     flat_layout: Any, x_af3_flat_baseline: jnp.ndarray
 ) -> Oracle:
     """Builds a full complex topological oracle from an unguided baseline prediction."""
@@ -187,7 +185,8 @@ def build_hijack_topology(
         atoms=oracle_atoms,
     )
 
-def run_diffusion_hijack(
+# TODO(vivek): let user handle desired loss (or default) to pass and directly run guided diffusion
+def _hijack_diffusion_with_custom_loss(
     model_runner: HostRunner,
     batch_dict: dict,
     embeddings: HostEmbeddings,
@@ -195,7 +194,7 @@ def run_diffusion_hijack(
     oracle_mapping: OracleMapping,
     sfc_instance: Optional[SFC] = None,
     sample_key: Optional[jnp.ndarray] = None,
-) -> HijackResults:
+) -> Conformations:
     """Intercepts and steers Host diffusion trajectories."""
 
     def single_sample_loss_fn(p_single, c_single, w_single):
@@ -218,14 +217,14 @@ def run_diffusion_hijack(
         oracle_mapping.rotor_table.initial_chi,
         oracle_mapping.water_mapping.oxygen_source.shape[0],
     )
-    return HijackResults(
+    return Conformations(
         sample_results["atom_positions"],
         sample_results["chi_angles"],
         sample_results["water_rotations"],
     )
 
 
-def assemble_hijacked_complex(
+def _assemble_coordinates_from_conformation(
     positions_denoised_final: jnp.ndarray,
     chi_angles: jnp.ndarray,
     water_rotations: jnp.ndarray,
@@ -248,45 +247,23 @@ def assemble_hijacked_complex(
         x_af3_flat - jnp.mean(x_af3_flat[oracle_mapping.source_indices], axis=0)
     ) @ R + jnp.mean(reference_coords[oracle_mapping.heavy_indices], axis=0)
 
-    x_full = (
-        jnp.zeros((oracle_mapping.num_atoms, 3))
-        .at[oracle_mapping.heavy_indices]
-        .set(x_af3_aligned[oracle_mapping.source_indices])
-    )
-    if oracle_mapping.rotor_table.target_idx.shape[0] > 0:
-        x_full = (x_full
-            .at[oracle_mapping.rotor_table.target_idx]
-            .set(
-                 generalized_nerf_layer(x_af3_aligned, oracle_mapping.rotor_table, chi_angles)
-                .reshape((oracle_mapping.rotor_table.target_idx.shape[0], 3))
-            )
-        )
-    if oracle_mapping.water_mapping.oxygen_source.shape[0] > 0:
-        h1, h2 = so3_water_layer(
-            x_af3_aligned[oracle_mapping.water_mapping.oxygen_source],
-            water_rotations
-        )
-        x_full = (x_full
-            .at[oracle_mapping.water_mapping.h1_target]
-            .set(h1)
-            .at[oracle_mapping.water_mapping.h2_target]
-            .set(h2)
-        )
-    return x_full
+    return oracle_mapping.assemble_coordinates(x_af3_aligned, chi_angles, water_rotations)
 
+# TODO: need descriptive comments and type annotation
 class Hijacker:
     @staticmethod
     def build_oracle(layout, denoised_vector_field_positions) -> Oracle:
-        return build_hijack_topology(layout, denoised_vector_field_positions)
+        return _build_oracle_from_baseline_af3_prediction(layout, denoised_vector_field_positions)
 
     @staticmethod
-    def hijack_diffusion(runner: HostRunner, batch_dict: dict, embeddings: HostEmbeddings, gather_idxs: jnp.ndarray, oracle_mapping: OracleMapping, sfc: Optional[SFC] = None, key: Optional[jnp.ndarray] = None) -> HijackResults:
-        return run_diffusion_hijack(runner, batch_dict, embeddings, gather_idxs, oracle_mapping, sfc, key)
+    def hijack_diffusion(runner: HostRunner, batch_dict: dict, embeddings: HostEmbeddings, gather_idxs: jnp.ndarray, oracle_mapping: OracleMapping, sfc: Optional[SFC] = None, key: Optional[jnp.ndarray] = None) -> Conformations:
+        return _hijack_diffusion_with_custom_loss(runner, batch_dict, embeddings, gather_idxs, oracle_mapping, sfc, key)
 
     @staticmethod
-    def assemble_complex(hr: HijackResult, gather_idxs, oracle: Oracle) -> jax.Array:
+    def assemble_coordinates(conformation: Conformation, gather_idxs: jnp.ndarray, oracle: Oracle) -> np.ndarray:
+        "Assemble AtomArray compatible coordinates from conformations and oracle"
         oracle_atoms_coord = jnp.array(oracle.atoms.coord, dtype=jnp.float32)
-        complex = assemble_hijacked_complex(hr.atom_positions, hr.chi_angles, hr.water_rotations, gather_idxs, oracle.mapping, oracle_atoms_coord)
+        complex = _assemble_coordinates_from_conformation(conformation.atom_positions, conformation.chi_angles, conformation.water_rotations, gather_idxs, oracle.mapping, oracle_atoms_coord)
         return np.array(complex)
 
 

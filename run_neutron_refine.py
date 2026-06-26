@@ -111,7 +111,7 @@ def main(argv):
     sfc = init_neutron_sfc(oracle.atoms, FLAGS.mtz_path) if FLAGS.mtz_path else None
 
     # hijack
-    results = Hijacker.hijack_diffusion(
+    conformations = Hijacker.hijack_diffusion(
         runner,
         batch,
         embeddings,
@@ -122,10 +122,11 @@ def main(argv):
     )
 
     logging.info("Assembling final atomic coordinates...")
+    # NOTE(vivek): two approaches: take best result in results or write ensemble of all results into pdb to see all trajectories
     # for result in results:
     #     ??? = Hijacker.assemble_complex(result, gather_idxs, oracle)
-    oracle.atoms.coord = Hijacker.assemble_complex(
-        results[0],
+    oracle.atoms.coord = Hijacker.assemble_coordinates(
+        conformations[0],
         gather_idxs,
         oracle,
     )
