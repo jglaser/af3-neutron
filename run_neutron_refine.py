@@ -16,13 +16,7 @@ from alphafold3.model.network import diffusion_head
 from alphafold3.model import feat_batch
 from alphafold3.model.atom_layout import atom_layout
 
-from af3_neutron import (
-    HostRunner,
-    make_model_config,
-    build_hijack_topology,
-    run_diffusion_hijack,
-    assemble_hijacked_complex,
-)
+from af3_neutron import make_model_config, HostRunner, Hijacker
 from af3_neutron.sfc_adapter import init_neutron_sfc
 
 from jax.experimental.compilation_cache import compilation_cache as cc
@@ -80,6 +74,8 @@ def main(argv):
             target_layout=batch_obj.convert_model_output.flat_output_layout,
         ).gather_idxs
     )
+
+    # NOTE(vivek): Merge HostRunner into Hijacker?
     # runner
     device = jax.local_devices(backend="gpu")[FLAGS.gpu_device]
     runner = HostRunner(
@@ -110,14 +106,13 @@ def main(argv):
     )
 
     # hijack
-    oracle = build_hijack_topology(
+    oracle = Hijacker.build_topology(
         batch_obj.convert_model_output.flat_output_layout,
         np.array(positions_denoised.reshape((-1, 3))[gather_idxs]),
     )
     sfc = init_neutron_sfc(oracle.atoms, FLAGS.mtz_path) if FLAGS.mtz_path else None
 
-    # NOTE(vivek): we only use [0] of coords, chis, waters. Should we just return those values instead? 
-    coords, chis, waters = run_diffusion_hijack(
+    results = Hijacker.hijack_diffusion(
         runner,
         batch,
         embeddings,
@@ -128,10 +123,10 @@ def main(argv):
     )
 
     logging.info("Assembling final atomic coordinates...")
-    final_complex = assemble_hijacked_complex(
-        coords[0],
-        chis[0],
-        waters[0],
+    final_complex = Hijacker.assemble_complex(
+        results.atom_positions[0],
+        results.chi_angles[0],
+        results.water_rotations[0],
         gather_idxs,
         oracle.mapping,
         jnp.array(oracle.atoms.coord, dtype=jnp.float32),

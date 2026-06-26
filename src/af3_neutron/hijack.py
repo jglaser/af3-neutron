@@ -1,13 +1,24 @@
-# src/af3_neutron/topology.py
 import logging
-from typing import Any
-import numpy as np
-import jax.numpy as jnp
-import biotite.structure as struc
+from typing import Any, Optional
+
 import hydride
+import biotite.structure as struc
+import jax
+import jax.numpy as jnp
+import numpy as np
 
-from .types import RotorTable, WaterMapping, Oracle, OracleMapping
 
+from .kinematics import generalized_nerf_layer, so3_water_layer
+from .loss import hijack_physics_loss # expose into this file later
+from .runner import HostRunner
+from .types import (
+    HostEmbeddings,
+    RotorTable,
+    WaterMapping,
+    Oracle,
+    OracleMapping,
+    SampleResults
+)
 
 def build_hijack_topology(
     flat_layout: Any, x_af3_flat_baseline: jnp.ndarray
@@ -173,3 +184,103 @@ def build_hijack_topology(
         ),
         atoms=oracle_atoms,
     )
+
+def run_diffusion_hijack(
+    model_runner: HostRunner,
+    batch_dict: dict,
+    embeddings: HostEmbeddings,
+    gather_idxs: jnp.ndarray,
+    oracle_mapping: OracleMapping,
+    sfc_instance: Optional[Any] = None,
+    sample_key: Optional[jnp.ndarray] = None,
+) -> SampleResults:
+    """Intercepts and steers Host diffusion trajectories."""
+
+    def single_sample_loss_fn(p_single, c_single, w_single):
+        return hijack_physics_loss(
+            p_single.reshape((-1, 3)),
+            c_single,
+            w_single,
+            gather_idxs,
+            oracle_mapping,
+            sfc_instance,
+        )
+
+    grad_fn = jax.value_and_grad(single_sample_loss_fn, argnums=(0, 1, 2))
+    sample_results = model_runner.sample_guided_diffusion(
+        jax.random.PRNGKey(0),
+        batch_dict,
+        embeddings,
+        grad_fn,
+        sample_key,
+        oracle_mapping.rotor_table.initial_chi,
+        oracle_mapping.water_mapping.oxygen_source.shape[0],
+    )
+    return SampleResults(
+        sample_results["atom_positions"],
+        sample_results["chi_angles"],
+        sample_results["water_rotations"],
+    )
+
+
+def assemble_hijacked_complex(
+    positions_denoised_final: jnp.ndarray,
+    chi_angles: jnp.ndarray,
+    water_rotations: jnp.ndarray,
+    gather_idxs: jnp.ndarray,
+    oracle_mapping: OracleMapping,
+    reference_coords: jnp.ndarray,
+) -> jnp.ndarray:
+    """Snaps coordinates back into the crystal's global reference frame via Kabsch alignment."""
+    x_af3_flat = positions_denoised_final.reshape((-1, 3))[gather_idxs]
+
+    p = x_af3_flat[oracle_mapping.source_indices] - jnp.mean(x_af3_flat[oracle_mapping.source_indices], axis=0)
+    q = reference_coords[oracle_mapping.heavy_indices] - jnp.mean(reference_coords[oracle_mapping.heavy_indices], axis=0)
+
+    U, _, Vt = jnp.linalg.svd(jnp.einsum("ni,nj->ij", p, q))
+
+    thingy = jnp.array([1.0, 1.0, jnp.sign(jnp.linalg.det(U) * jnp.linalg.det(Vt))])
+    R = U @ jnp.diag(thingy) @ Vt
+
+    x_af3_aligned = (
+        x_af3_flat - jnp.mean(x_af3_flat[oracle_mapping.source_indices], axis=0)
+    ) @ R + jnp.mean(reference_coords[oracle_mapping.heavy_indices], axis=0)
+
+    x_full = (
+        jnp.zeros((oracle_mapping.num_atoms, 3))
+        .at[oracle_mapping.heavy_indices]
+        .set(x_af3_aligned[oracle_mapping.source_indices])
+    )
+    if oracle_mapping.rotor_table.target_idx.shape[0] > 0:
+        x_full = (x_full
+            .at[oracle_mapping.rotor_table.target_idx]
+            .set(
+                 generalized_nerf_layer(x_af3_aligned, oracle_mapping.rotor_table, chi_angles)
+                .reshape((oracle_mapping.rotor_table.target_idx.shape[0], 3))
+            )
+        )
+    if oracle_mapping.water_mapping.oxygen_source.shape[0] > 0:
+        h1, h2 = so3_water_layer(
+            x_af3_aligned[oracle_mapping.water_mapping.oxygen_source],
+            water_rotations
+        )
+        x_full = (x_full
+            .at[oracle_mapping.water_mapping.h1_target]
+            .set(h1)
+            .at[oracle_mapping.water_mapping.h2_target]
+            .set(h2)
+        )
+    return x_full
+
+class Hijacker:
+    @staticmethod
+    def build_topology(layout, denoised_vector_field_positions) -> Oracle:
+        return build_hijack_topology(layout, denoised_vector_field_positions)
+
+    @staticmethod
+    def hijack_diffusion(runner, batch, embeddings, gather_idxs, oracle_mapping, sfc, key):
+        return run_diffusion_hijack(runner, batch, embeddings, gather_idxs, oracle_mapping, sfc, key)
+
+    @staticmethod
+    def assemble_complex(final_denoised_positions, chi_angles, water_rotations, gather_idxs, oracle_mapping, oracle_atom_array) -> jax.Array:
+        return assemble_hijacked_complex(final_denoised_positions, chi_angles, water_rotations, gather_idxs, oracle_mapping, oracle_atom_array)

@@ -1,11 +1,11 @@
+# definitely need to rename this project to "hijax"
+# or maybe play on words with parasite and host
+
 from .runner import HostRunner, make_model_config
-from .topology import build_hijack_topology
-from .sampler import run_diffusion_hijack, assemble_hijacked_complex
+from .hijack import Hijacker
 
 __all__ = [
     "HostRunner",
     "make_model_config",
-    "build_hijack_topology",
-    "run_diffusion_hijack",
-    "assemble_hijacked_complex",
+    "Hijacker",
 ]

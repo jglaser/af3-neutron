@@ -92,3 +92,10 @@ class OracleMapping:
 class Oracle:
     mapping: OracleMapping
     atoms: AtomArray
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class SampleResults:
+    atom_positions: jnp.ndarray
+    chi_angles: jnp.ndarray
+    water_rotations: jnp.ndarray
