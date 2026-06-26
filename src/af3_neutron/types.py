@@ -95,7 +95,28 @@ class Oracle:
 
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
-class SampleResults:
-    atom_positions: jnp.ndarray
-    chi_angles: jnp.ndarray
-    water_rotations: jnp.ndarray
+class HijackResult:
+    atom_positions: jnp.ndarray # [num_atoms, 3]
+    chi_angles: jnp.ndarray # [chi_angles]
+    water_rotations: jnp.ndarray # [num_waters, 3]
+
+@jax.tree_util.register_dataclass
+@dataclass(frozen=True)
+class HijackResults:
+    atom_positions: jnp.ndarray # [B, num_atoms, 3]
+    chi_angles: jnp.ndarray # [B, chi_angles]
+    water_rotations: jnp.ndarray # [B, num_waters, 3]
+
+    # aos indexing
+    def __getitem__(self, index):
+        return HijackResult(
+            self.atom_positions[index],
+            self.chi_angles[index],
+            self.water_rotations[index],
+        )
+
+    # aos iteration
+    def __iter__(self):
+        for i in range(len(self)):
+            yield self[i]
+        

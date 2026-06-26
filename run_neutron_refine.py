@@ -20,7 +20,7 @@ from af3_neutron import make_model_config, HostRunner, Hijacker
 from af3_neutron.sfc_adapter import init_neutron_sfc
 
 from jax.experimental.compilation_cache import compilation_cache as cc
-cc.set_cache_dir(os.path.expanduser('./jax_cache'))
+cc.set_cache_dir(os.path.expanduser('./.jax_cache'))
 
 FLAGS = flags.FLAGS
 flags.DEFINE_string(
@@ -83,7 +83,6 @@ def main(argv):
         device=device,
         model_dir=pathlib.Path(FLAGS.model_dir),
     )
-
     # make embeddings and oracle
     embeddings = runner.get_host_embeddings(
         jax.random.split(
@@ -105,13 +104,13 @@ def main(argv):
         jax.random.PRNGKey(0), initial_noise, jnp.array([noise_schedule[0]]), batch, embeddings
     )
 
-    # hijack
-    oracle = Hijacker.build_topology(
+    oracle = Hijacker.build_oracle(
         batch_obj.convert_model_output.flat_output_layout,
         np.array(positions_denoised.reshape((-1, 3))[gather_idxs]),
     )
     sfc = init_neutron_sfc(oracle.atoms, FLAGS.mtz_path) if FLAGS.mtz_path else None
 
+    # hijack
     results = Hijacker.hijack_diffusion(
         runner,
         batch,
@@ -123,17 +122,15 @@ def main(argv):
     )
 
     logging.info("Assembling final atomic coordinates...")
-    final_complex = Hijacker.assemble_complex(
-        results.atom_positions[0],
-        results.chi_angles[0],
-        results.water_rotations[0],
+    # for result in results:
+    #     ??? = Hijacker.assemble_complex(result, gather_idxs, oracle)
+    oracle.atoms.coord = Hijacker.assemble_complex(
+        results[0],
         gather_idxs,
-        oracle.mapping,
-        jnp.array(oracle.atoms.coord, dtype=jnp.float32),
+        oracle,
     )
 
     # irrelevant file writing nonsense nobody cares about
-    oracle.atoms.coord = np.array(final_complex)
     output_path = pathlib.Path(FLAGS.output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 

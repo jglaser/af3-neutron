@@ -6,6 +6,7 @@ import biotite.structure as struc
 import jax
 import jax.numpy as jnp
 import numpy as np
+from SFC_Jax.Fmodel import SFcalculator as SFC
 
 
 from .kinematics import generalized_nerf_layer, so3_water_layer
@@ -17,7 +18,8 @@ from .types import (
     WaterMapping,
     Oracle,
     OracleMapping,
-    SampleResults
+    HijackResult,
+    HijackResults
 )
 
 def build_hijack_topology(
@@ -191,9 +193,9 @@ def run_diffusion_hijack(
     embeddings: HostEmbeddings,
     gather_idxs: jnp.ndarray,
     oracle_mapping: OracleMapping,
-    sfc_instance: Optional[Any] = None,
+    sfc_instance: Optional[SFC] = None,
     sample_key: Optional[jnp.ndarray] = None,
-) -> SampleResults:
+) -> HijackResults:
     """Intercepts and steers Host diffusion trajectories."""
 
     def single_sample_loss_fn(p_single, c_single, w_single):
@@ -216,7 +218,7 @@ def run_diffusion_hijack(
         oracle_mapping.rotor_table.initial_chi,
         oracle_mapping.water_mapping.oxygen_source.shape[0],
     )
-    return SampleResults(
+    return HijackResults(
         sample_results["atom_positions"],
         sample_results["chi_angles"],
         sample_results["water_rotations"],
@@ -274,13 +276,17 @@ def assemble_hijacked_complex(
 
 class Hijacker:
     @staticmethod
-    def build_topology(layout, denoised_vector_field_positions) -> Oracle:
+    def build_oracle(layout, denoised_vector_field_positions) -> Oracle:
         return build_hijack_topology(layout, denoised_vector_field_positions)
 
     @staticmethod
-    def hijack_diffusion(runner, batch, embeddings, gather_idxs, oracle_mapping, sfc, key):
-        return run_diffusion_hijack(runner, batch, embeddings, gather_idxs, oracle_mapping, sfc, key)
+    def hijack_diffusion(runner: HostRunner, batch_dict: dict, embeddings: HostEmbeddings, gather_idxs: jnp.ndarray, oracle_mapping: OracleMapping, sfc: Optional[SFC] = None, key: Optional[jnp.ndarray] = None) -> HijackResults:
+        return run_diffusion_hijack(runner, batch_dict, embeddings, gather_idxs, oracle_mapping, sfc, key)
 
     @staticmethod
-    def assemble_complex(final_denoised_positions, chi_angles, water_rotations, gather_idxs, oracle_mapping, oracle_atom_array) -> jax.Array:
-        return assemble_hijacked_complex(final_denoised_positions, chi_angles, water_rotations, gather_idxs, oracle_mapping, oracle_atom_array)
+    def assemble_complex(hr: HijackResult, gather_idxs, oracle: Oracle) -> jax.Array:
+        oracle_atoms_coord = jnp.array(oracle.atoms.coord, dtype=jnp.float32)
+        complex = assemble_hijacked_complex(hr.atom_positions, hr.chi_angles, hr.water_rotations, gather_idxs, oracle.mapping, oracle_atoms_coord)
+        return np.array(complex)
+
+
