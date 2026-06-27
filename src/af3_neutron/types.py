@@ -53,6 +53,7 @@ class OracleMapping:
     rotor_table: RotorTable
     water_mapping: WaterMapping
 
+    @jax.jit
     def assemble_coordinates(
         self, x_af3_flat: jnp.ndarray, chi_angles: jnp.ndarray, water_rotations: jnp.ndarray
     ) -> jnp.ndarray:
