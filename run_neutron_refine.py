@@ -131,6 +131,10 @@ def main(argv):
         oracle,
     )
 
+    # hydride append hydrogen to array end, sort by chain and res for viz of ss
+    contiguous_indices = np.lexsort((oracle.atoms.res_id, oracle.atoms.chain_id))
+    oracle.atoms = oracle.atoms[contiguous_indices]
+
     # irrelevant file writing nonsense nobody cares about
     output_path = pathlib.Path(FLAGS.output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
