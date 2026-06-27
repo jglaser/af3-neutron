@@ -234,17 +234,21 @@ def _assemble_coordinates_from_conformation(
     """Snaps coordinates back into the crystal's global reference frame via Kabsch alignment."""
     x_af3_flat = conformation.atom_positions.reshape((-1, 3))[gather_idxs]
 
-    p = x_af3_flat[oracle_mapping.source_indices] - jnp.mean(x_af3_flat[oracle_mapping.source_indices], axis=0)
-    q = reference_coords[oracle_mapping.heavy_indices] - jnp.mean(reference_coords[oracle_mapping.heavy_indices], axis=0)
+    x_drift_heavy = x_af3_flat[oracle_mapping.source_indices]
+    x_ref_heavy = oracle_mapping.initial_coordinates[oracle_mapping.heavy_indices]
 
-    U, _, Vt = jnp.linalg.svd(jnp.einsum("ni,nj->ij", p, q))
+    avg_drift = jnp.mean(x_drift_heavy, axis=0)
+    avg_ref = jnp.mean(x_ref_heavy, axis=0)
 
-    thingy = jnp.array([1.0, 1.0, jnp.sign(jnp.linalg.det(U) * jnp.linalg.det(Vt))])
-    R = U @ jnp.diag(thingy) @ Vt
+    p = x_drift_heavy - avg_drift
+    q = x_ref_heavy - avg_ref
 
-    x_af3_aligned = (
-        x_af3_flat - jnp.mean(x_af3_flat[oracle_mapping.source_indices], axis=0)
-    ) @ R + jnp.mean(reference_coords[oracle_mapping.heavy_indices], axis=0)
+    H = jnp.einsum("ni,nj->ij", p, q)
+    U, _, Vt = jnp.linalg.svd(H)
+    d = jnp.sign(jnp.linalg.det(U) * jnp.linalg.det(Vt))
+    R = U @ jnp.diag(jnp.array([1.0, 1.0, d])) @ Vt
+
+    x_af3_aligned = (x_af3_flat - avg_drift) @ R + avg_ref
 
     return oracle_mapping.assemble_coordinates(x_af3_aligned, conformation.chi_angles, conformation.water_rotations)
 
