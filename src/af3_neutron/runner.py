@@ -88,7 +88,7 @@ class _DiffusionHijackWrapper(_HostModule):
         super().__init__(config, name=name)
         self.diffusion_module = diffusion_head.DiffusionHead(self.config.heads.diffusion, self.config.global_config)
 
-    def __call__(self, batch: feat_batch.Batch, embeddings: HostEmbeddings, grad_fn: Callable, sample_key: jnp.ndarray, initial_chis: jnp.ndarray, num_waters: int) -> Dict[str, jnp.ndarray]:
+    def __call__(self, batch: feat_batch.Batch, embeddings: HostEmbeddings, val_and_grad_fn: Callable, sample_key: jnp.ndarray, initial_chis: jnp.ndarray, num_waters: int) -> Dict[str, jnp.ndarray]:
         sample_config = self.config.heads.diffusion.eval
         orig_mask = batch.predicted_structure_info.atom_mask
         num_tokens, orig_A = orig_mask.shape[-2:]
@@ -117,7 +117,7 @@ class _DiffusionHijackWrapper(_HostModule):
                 use_conditioning=True,
             )
 
-            _, (grad_x0, grad_chi, grad_water) = grad_fn(x_0_real, chi, water)
+            _, (grad_x0, grad_chi, grad_water) = val_and_grad_fn(x_0_real, chi, water)
             x_0_guided = x_0_real - (0.05 * jnp.clip(grad_x0, -1.0, 1.0))
 
             if N_extra > 0:
@@ -169,6 +169,6 @@ class HostRunner:
     @functools.cached_property
     def sample_guided_diffusion(self) -> Callable:
         @hk.transform
-        def forward_sample(batch_dict: Dict[str, Any], embeddings: HostEmbeddings, grad_fn: Callable, sample_key: jnp.ndarray, initial_chis: jnp.ndarray, num_waters: int) -> Dict[str, jnp.ndarray]:
-            return _DiffusionHijackWrapper(self._model_config)(feat_batch.Batch.from_data_dict(batch_dict), embeddings, grad_fn, sample_key, initial_chis, num_waters)
+        def forward_sample(batch_dict: Dict[str, Any], embeddings: HostEmbeddings, val_and_grad_fn: Callable, sample_key: jnp.ndarray, initial_chis: jnp.ndarray, num_waters: int) -> Dict[str, jnp.ndarray]:
+            return _DiffusionHijackWrapper(self._model_config)(feat_batch.Batch.from_data_dict(batch_dict), embeddings, val_and_grad_fn, sample_key, initial_chis, num_waters)
         return functools.partial(jax.jit(forward_sample.apply, static_argnums=(4, 7), device=self._device), self.model_params)

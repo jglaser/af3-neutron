@@ -208,12 +208,12 @@ def _hijack_diffusion_with_custom_loss(
             sfc_instance,
         )
 
-    grad_fn = jax.value_and_grad(single_sample_loss_fn, argnums=(0, 1, 2))
+    val_and_grad_fn = jax.value_and_grad(single_sample_loss_fn, argnums=(0, 1, 2))
     sample_results = model_runner.sample_guided_diffusion(
         jax.random.PRNGKey(0),
         batch_dict,
         embeddings,
-        grad_fn,
+        val_and_grad_fn,
         sample_key,
         oracle_mapping.rotor_table.initial_chi,
         oracle_mapping.water_mapping.oxygen_source.shape[0],
