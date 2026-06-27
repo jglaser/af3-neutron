@@ -261,7 +261,7 @@ class Hijacker:
     def assemble_coordinates(conformation: Conformation, gather_idxs: jnp.ndarray, oracle: Oracle) -> np.ndarray:
         "Assemble AtomArray compatible coordinates from conformations and oracle"
         oracle_atoms_coord = jnp.array(oracle.atoms.coord, dtype=jnp.float32)
-        complex = _assemble_coordinates_from_conformation(conformation.atom_positions, conformation.chi_angles, conformation.water_rotations, gather_idxs, oracle.mapping, oracle_atoms_coord)
+        complex = _assemble_coordinates_from_conformation(conformation, gather_idxs, oracle.mapping, oracle_atoms_coord)
         return np.array(complex)
 
 
