@@ -49,6 +49,7 @@ class OracleMapping:
     num_atoms: int
     heavy_indices: Annotated[jax.Array, int]
     source_indices: Annotated[jax.Array, int]
+    initial_coordinates: Annotated[jax.Array, float]
     rotor_table: RotorTable
     water_mapping: WaterMapping
 
@@ -60,7 +61,7 @@ class OracleMapping:
         # local imports break initialization cyclic dependency paths cleanly
         from .kinematics import generalized_nerf_layer, so3_water_layer
 
-        x_full = jnp.zeros((self.num_atoms, 3))
+        x_full = self.initial_coordinates
 
         # heavy atoms tracked natively from the Host layout
         x_full = (x_full

@@ -172,8 +172,9 @@ def _build_oracle_from_baseline_af3_prediction(
             num_atoms=num_oracle_atoms,
             heavy_indices=jnp.array(oracle_heavy_indices, dtype=jnp.int32),
             source_indices=jnp.array(af3_source_indices, dtype=jnp.int32),
+            initial_coordinates=jnp.array(oracle_atoms.coord, dtype=jnp.float32),
             rotor_table = RotorTable(
-                **{ k: jnp.array(v, dtype=jnp.float32 if k in ("ideal", "chi") else jnp.int32)
+                **{ k: jnp.array(v, dtype=jnp.float32 if ("ideal" in k or "chi" in k) else jnp.int32)
                     for k, v in rotor_table.items()
                 }),
             water_mapping=WaterMapping(
