@@ -209,7 +209,7 @@ def _hijack_diffusion_with_custom_loss(
         )
 
     val_and_grad_fn = jax.value_and_grad(single_sample_loss_fn, argnums=(0, 1, 2))
-    sample_results = model_runner.sample_guided_diffusion(
+    conformations = model_runner.sample_guided_diffusion(
         jax.random.PRNGKey(0),
         batch_dict,
         embeddings,
@@ -218,10 +218,23 @@ def _hijack_diffusion_with_custom_loss(
         oracle_mapping.rotor_table.initial_chi,
         oracle_mapping.water_mapping.oxygen_source.shape[0],
     )
+
+    if sfc_instance is None:
+        logging.info("Physics guidance is disabled. Preserving ideal relaxed hydrogen geometries.")
+        num_samples = conformations["atom_positions"].shape[0]
+        clean_chis = jnp.tile(oracle_mapping.rotor_table.initial_chi[None, ...], (num_samples, 1))
+        clean_waters = jnp.zeros((num_samples, oracle_mapping.water_mapping.oxygen_source.shape[0], 3))
+        
+        return Conformations(
+            conformations["atom_positions"],
+            clean_chis,
+            clean_waters,
+        )
+
     return Conformations(
-        sample_results["atom_positions"],
-        sample_results["chi_angles"],
-        sample_results["water_rotations"],
+        conformations["atom_positions"],
+        conformations["chi_angles"],
+        conformations["water_rotations"],
     )
 
 
