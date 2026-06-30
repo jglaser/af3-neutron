@@ -32,6 +32,8 @@ flags.DEFINE_string("model_dir", "../af3_model_parameters/", "Path to weights.")
 flags.DEFINE_integer("gpu_device", 0, "GPU ID.")
 flags.DEFINE_string("mtz_path", "", "Optional data path.")
 flags.DEFINE_string("output_path", "neutron_refined_output.cif", "Output path.")
+flags.DEFINE_integer("num_recycles", 10, "Recycles.", lower_bound=1)
+flags.DEFINE_integer("num_diffusion_samples", 5, "Samples.", lower_bound=1)
 
 
 def main(argv):
@@ -60,9 +62,11 @@ def main(argv):
         remove_nonsymmetric_bonds=False
     )
 
+    MIN_EMBEDDING_SIZE = 128
+    MAX_EMBEDDING_SIZE = 8192
     featurised = featurisation.featurise_input(
         fold_input=fold_input,
-        buckets=list(range(128, 8192 + 1, 128)),
+        buckets=list(range(MIN_EMBEDDING_SIZE, MAX_EMBEDDING_SIZE + 1, 128)),
         ccd=ccd,
         verbose=False,
     )
@@ -123,8 +127,8 @@ def main(argv):
 
     logging.info("Assembling final atomic coordinates...")
     # NOTE(vivek): two approaches: take best result in results or write ensemble of all results into pdb to see all trajectories
-    # for result in results:
-    #     ??? = Hijacker.assemble_complex(result, gather_idxs, oracle)
+    # for conformationein conformations:
+    #     ??? = Hijacker.assemble_coordinates(result, gather_idxs, oracle)
     oracle.atoms.coord = Hijacker.assemble_coordinates(
         conformations[0],
         gather_idxs,
@@ -146,6 +150,4 @@ def main(argv):
 
 
 if __name__ == "__main__":
-    flags.DEFINE_integer("num_recycles", 10, "Recycles.", lower_bound=1)
-    flags.DEFINE_integer("num_diffusion_samples", 5, "Samples.", lower_bound=1)
     app.run(main)
