@@ -23,7 +23,7 @@ build-backend = "uv_build"
 [tool.uv.sources]
 sfcalculator-jax = { git = "https://github.com/Hekstra-Lab/SFcalculator_jax" }
 alphafold3 = { path = "/home/xvg/alphafold3" }
-hydride = { git = "https://github.com/vivek-booshan/hydride-jax" }
+hydride = { git = "https://github.com/jglaser/hydride-jax", rev="differentiate_heavy_atoms" }
 
 [dependency-groups]
 dev = [

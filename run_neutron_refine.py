@@ -79,7 +79,6 @@ def main(argv):
         ).gather_idxs
     )
 
-    # NOTE(vivek): Merge HostRunner into Hijacker?
     # runner
     device = jax.local_devices(backend="gpu")[FLAGS.gpu_device]
     runner = HostRunner(
@@ -114,21 +113,18 @@ def main(argv):
     )
     sfc = init_neutron_sfc(oracle.atoms, FLAGS.mtz_path) if FLAGS.mtz_path else None
 
-    # hijack
+    # hijack loop using the generalized proximal-based implementation
     conformations = Hijacker.hijack_diffusion(
         runner,
         batch,
         embeddings,
         gather_idxs,
-        oracle.mapping,
+        oracle,
         sfc,
         jax.random.PRNGKey(0),
     )
 
     logging.info("Assembling final atomic coordinates...")
-    # NOTE(vivek): two approaches: take best result in results or write ensemble of all results into pdb to see all trajectories
-    # for conformationein conformations:
-    #     ??? = Hijacker.assemble_coordinates(result, gather_idxs, oracle)
     oracle.atoms.coord = Hijacker.assemble_coordinates(
         conformations[0],
         gather_idxs,
@@ -139,7 +135,6 @@ def main(argv):
     contiguous_indices = np.lexsort((oracle.atoms.res_id, oracle.atoms.chain_id))
     oracle.atoms = oracle.atoms[contiguous_indices]
 
-    # irrelevant file writing nonsense nobody cares about
     output_path = pathlib.Path(FLAGS.output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
