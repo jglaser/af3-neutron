@@ -107,7 +107,8 @@ def _hijack_diffusion_with_custom_loss(
     if params is None:
         raise ValueError("No rotatable bonds found in the structure configuration.")
 
-    center_indices, axis_indices, is_free_mask, pairs, elec_param, eps, r_6, r_12, atom_to_bond_idx, box, box_inv = params
+    (center_indices, axis_indices, is_free_mask, pairs, elec_param, eps, r_6, r_12, atom_to_bond_idx,
+        box, box_inv, reduction_indices, reduction_signs, reduction_pair_map) = params
 
     # The proximal function is compiled standalone to run efficiently on the GPU registers
     @jax.jit
@@ -126,7 +127,10 @@ def _hijack_diffusion_with_custom_loss(
 
                 X_relaxed, _, _ = hydride.relax_hydrogen_jit(
                     X, center_indices, axis_indices, is_free_mask,
-                    pairs, elec_param, eps, r_6, r_12, atom_to_bond_idx, box=box, box_inv=box_inv, iterations=40
+                    pairs, elec_param, eps, r_6, r_12, atom_to_bond_idx, box=box, box_inv=box_inv,
+                    reduction_indices=reduction_indices, reduction_signs=reduction_signs,
+                    reduction_pair_map=reduction_pair_map,
+                    iterations=40
                 )
                 
                 X_frozen = jax.lax.stop_gradient(X_relaxed)
@@ -134,7 +138,9 @@ def _hijack_diffusion_with_custom_loss(
 
                 def local_loss_fn(R_heavy):
                     X_local = X_final.at[oracle_mapping.heavy_indices].set(R_heavy)
-                    e_physics = hydride.relax.compute_energy(X_local, pairs, elec_param, eps, r_6, r_12, box=box, box_inv=box_inv)
+                    e_physics = hydride.relax.compute_energy(X_local, pairs, elec_param, eps, r_6, r_12,
+                        box=box, box_inv=box_inv, reduction_indices=reduction_indices,
+                        reduction_signs=reduction_signs, reduction_pair_map=reduction_pair_map)
                     
                     e_exp = 0.0
                     if sfc_instance is not None:
@@ -173,7 +179,8 @@ def _assemble_coordinates_from_conformation(
 ) -> jnp.ndarray:
     """Snaps coordinates back into the crystal's global reference frame via Kabsch alignment."""
     params = hydride.get_relaxation_params(oracle_atoms)
-    center_indices, axis_indices, is_free_mask, pairs, elec_param, eps, r_6, r_12, atom_to_bond_idx, box, box_inv = params
+    (center_indices, axis_indices, is_free_mask, pairs, elec_param, eps, r_6, r_12, atom_to_bond_idx,
+        box, box_inv, reduction_indices, reduction_signs, reduction_pair_map) = params
 
     x_af3_flat = atom_positions.reshape((-1, 3))[gather_idxs]
 
@@ -198,7 +205,11 @@ def _assemble_coordinates_from_conformation(
     
     X_relaxed, _, _ = hydride.relax_hydrogen_jit(
         X_final, center_indices, axis_indices, is_free_mask,
-        pairs, elec_param, eps, r_6, r_12, atom_to_bond_idx, box=box, box_inv=box_inv, iterations=200
+        pairs, elec_param, eps, r_6, r_12, atom_to_bond_idx, box=box, box_inv=box_inv,
+        reduction_indices=reduction_indices,
+        reduction_signs=reduction_signs,
+        reduction_pair_map=reduction_pair_map,
+        iterations=200
     )
     return X_relaxed
 
