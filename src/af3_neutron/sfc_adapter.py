@@ -1,5 +1,6 @@
 import logging
 import os
+import sys
 import tempfile
 from typing import Any
 
@@ -40,19 +41,38 @@ def init_neutron_sfc(oracle_atoms: AtomArray, mtz_path: str) -> SFcalculator:
         neutron scattering.
     """
     logging.info("Initializing SFC_Jax Crystallographic Engine...")
-   
+
     with tempfile.TemporaryDirectory() as tmpdir:
         pdb_path = os.path.join(tmpdir, "oracle.pdb")
         pdb_file = pdb.PDBFile()
 
-        # Sanitize residue names to satisfy the strict 3-character PDB format constraint
-        # This strips any extended internal tokens added by the AF3 data pipeline
+        # 1. Sanitize residue names to satisfy strict PDB 3-character constraints
         oracle_atoms.res_name = np.array([name[:3] for name in oracle_atoms.res_name])
 
         pdb.set_structure(pdb_file, oracle_atoms)
         pdb_file.write(pdb_path)
 
-        # Initialize the calculator with our experimental data
+        # 2. Pull unit cell dimensions and space group parameters directly from the MTZ
+        mtz = gemmi.read_mtz_file(mtz_path)
+        cell = mtz.cell
+        sg_name = mtz.spacegroup_name
+
+        # 3. Format a valid PDB CRYST1 record line
+        cryst1_line = (
+            f"CRYST1{cell.a:9.3f}{cell.b:9.3f}{cell.c:9.3f}"
+            f"{cell.alpha:7.2f}{cell.beta:7.2f}{cell.gamma:7.2f} "
+            f"{sg_name:<11}\n"
+        )
+
+        # 4. Prepend the CRYST1 record line directly into the temporary PDB file
+        with open(pdb_path, "r") as f:
+            pdb_content = f.read()
+        with open(pdb_path, "w") as f:
+            f.write(cryst1_line + pdb_content)
+
+        print(f"Injected Symmetry Header: {cryst1_line.strip()}", file=sys.stderr)
+
+        # 5. Initialize the calculator with our fully-qualified experimental data
         sfc = SFcalculator(
             PDBfile_dir=pdb_path,
             mtzfile_dir=mtz_path,
