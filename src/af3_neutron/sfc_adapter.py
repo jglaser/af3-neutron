@@ -40,20 +40,25 @@ def init_neutron_sfc(oracle_atoms: AtomArray, mtz_path: str) -> SFcalculator:
         neutron scattering.
     """
     logging.info("Initializing SFC_Jax Crystallographic Engine...")
-    
+   
     with tempfile.TemporaryDirectory() as tmpdir:
         pdb_path = os.path.join(tmpdir, "oracle.pdb")
         pdb_file = pdb.PDBFile()
+
+        # Sanitize residue names to satisfy the strict 3-character PDB format constraint
+        # This strips any extended internal tokens added by the AF3 data pipeline
+        oracle_atoms.res_name = np.array([name[:3] for name in oracle_atoms.res_name])
+
         pdb.set_structure(pdb_file, oracle_atoms)
         pdb_file.write(pdb_path)
-        
+
         # Initialize the calculator with our experimental data
         sfc = SFcalculator(
             PDBfile_dir=pdb_path,
             mtzfile_dir=mtz_path,
-            set_experiment=True # Automatically loads Fo and SigF
+            set_experiment=True
         )
-        
+
     logging.info("Querying Gemmi for nuclear scattering lengths...")
     neutron_fullsf = []
     num_hkls = len(sfc.dr2asu_array)
