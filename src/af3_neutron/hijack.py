@@ -111,12 +111,12 @@ def _hijack_diffusion_with_custom_loss(
     (center_indices, axis_indices, is_free_mask, pairs, elec_param, eps, r_6, r_12, atom_to_bond_idx,
         box, box_inv, reduction_indices, reduction_signs, reduction_pair_map) = params
 
-    # Compiling with inline=False decouples the custom loss step from the main transformer loop logic
+    # inline=False decouples the custom loss step from the main transformer loop logic
     @functools.partial(jax.jit, inline=False)
     def proximal_operator_fn(x_0_real: jnp.ndarray, t_hat: jnp.ndarray) -> jnp.ndarray:
-        x_0_flat = x_0_real.reshape((-1, 3))
+        # Flatten AlphaFold 3's structured token array into a uniform 2D atom coordinate matrix
+        x_0_flat = x_0_real.reshape(-1, 3)
         current_eta = eta_init * (t_hat ** 2)
-        jax.debug.print("{t}",t=t_hat)
         
         # Isolate the coordinate arrays from the active batch tracking maps
         x_af3_flat = x_0_flat[gather_idxs]
@@ -156,6 +156,7 @@ def _hijack_diffusion_with_custom_loss(
         R_current = x_0_heavy_mapped
         R_optimized = jax.lax.fori_loop(0, prox_steps, step_body, R_current)
         x_af3_updated = x_af3_flat.at[oracle_mapping.source_indices].set(R_optimized)
+        
         return x_0_flat.at[gather_idxs].set(x_af3_updated).reshape(x_0_real.shape)
 
     rng_key = jax.random.PRNGKey(0) if sample_key is None else sample_key
@@ -167,6 +168,7 @@ def _hijack_diffusion_with_custom_loss(
         proximal_operator_fn
     )
 
+    # Clean return passing only device-resident coordinate tensors
     return Conformations(atom_positions=atom_positions)
 
 

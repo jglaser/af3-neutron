@@ -105,20 +105,9 @@ class Conformation:
 @jax.tree_util.register_dataclass
 @dataclass(frozen=True)
 class Conformations:
-    atom_positions: jnp.ndarray # [B, num_atoms, 3]
-    chi_angles: jnp.ndarray # [B, chi_angles]
-    water_rotations: jnp.ndarray # [B, num_waters, 3]
+    """Carries the final refined Cartesian coordinates from the diffusion trajectory."""
+    atom_positions: jnp.ndarray
 
-    # aos indexing
     def __getitem__(self, index):
-        return Conformation(
-            self.atom_positions[index],
-            self.chi_angles[index],
-            self.water_rotations[index],
-        )
-
-    # aos iteration
-    def __iter__(self):
-        for i in range(len(self)):
-            yield self[i]
-        
+        """Allows direct subscripting (e.g., conformations[0]) to extract specific sample slices."""
+        return self.atom_positions[index]

@@ -79,7 +79,7 @@ class _DiffusionHijackWrapper(_HostModule):
                 use_conditioning=True,
             )
             
-            # 2. Revert to full GPU execution by evaluating proximal_fn natively on the device
+            # 2. Evaluate proximal_fn natively on the device
             return proximal_fn(x_0_real, t_hat)
 
         sample_results = diffusion_head.sample(denoising_step=hijacked_denoising_step, batch=batch, key=sample_key, config=sample_config)
