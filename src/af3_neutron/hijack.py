@@ -98,64 +98,60 @@ def _hijack_diffusion_with_custom_loss(
     sample_key: Optional[jnp.ndarray] = None,
     prox_steps: int = 3,
     prox_lr: float = 5e-3,
+    eta_init: float = 1e-2,
 ) -> Conformations:
     """Intercepts and steers Host diffusion trajectories using an Envelope-Theorem optimized proximal operator."""
     oracle_mapping = oracle.mapping
-
-    # Extract force-field parameters cleanly using the fully-bonded structure
+    
     params = hydride.get_relaxation_params(oracle.atoms)
-
     if params is None:
         raise ValueError("No rotatable bonds found in the structure configuration.")
 
-    center_indices, axis_indices, is_free_mask, pairs, elec_param, eps, r_6, r_12, atom_to_bond_idx, box = params
+    center_indices, axis_indices, is_free_mask, pairs, elec_param, eps, r_6, r_12, atom_to_bond_idx, box, box_inv = params
 
+    # The proximal function is compiled standalone to run efficiently on the GPU registers
+    @jax.jit
     def proximal_operator_fn(x_0_real: jnp.ndarray, t_hat: jnp.ndarray) -> jnp.ndarray:
         x_0_flat = x_0_real.reshape((x_0_real.shape[0], -1, 3))
-        current_eta = 1e-2 * (t_hat ** 2)
-        lambda_exp = 1.0
+        current_eta = eta_init * (t_hat ** 2)
+        jax.debug.print("{t}",t=t_hat)
 
-        def single_sample_prox(x_0_single):
+        def single_sample_prox(x_0_single, eta_local):
             x_af3_flat = x_0_single[gather_idxs]
             x_0_heavy_mapped = x_af3_flat[oracle_mapping.source_indices]
 
-            def joint_objective(R_heavy):
-                # 1. Isolate the forward relaxation coordinates to prune the backprop tape
-                X_static = oracle_mapping.initial_coordinates
-                X_static = X_static.at[oracle_mapping.heavy_indices].set(R_heavy)
-                X_static = jax.lax.stop_gradient(X_static)
+            def step_body(i, r_val):
+                X = oracle_mapping.initial_coordinates
+                X = X.at[oracle_mapping.heavy_indices].set(r_val)
 
-                # 2. Run hydrogen optimization as a pure forward pass (Zero memory footprint)
                 X_relaxed, _, _ = hydride.relax_hydrogen_jit(
-                    X_static, center_indices, axis_indices, is_free_mask,
-                    pairs, elec_param, eps, r_6, r_12, atom_to_bond_idx, box=box, iterations=40
+                    X, center_indices, axis_indices, is_free_mask,
+                    pairs, elec_param, eps, r_6, r_12, atom_to_bond_idx, box=box, box_inv=box_inv, iterations=40
                 )
                 
-                # 3. Disconnect the optimization trajectory entirely 
-                X_final = jax.lax.stop_gradient(X_relaxed)
-                
-                # 4. Graft the active heavy atom tracers back into the system to compute strict partial forces
-                X_final = X_final.at[oracle_mapping.heavy_indices].set(R_heavy)
+                X_frozen = jax.lax.stop_gradient(X_relaxed)
+                X_final = X_frozen.at[oracle_mapping.heavy_indices].set(r_val)
 
-                # 5. Evaluate the active potential fields
-                e_physics = hydride.relax.compute_energy(X_final, pairs, elec_param, eps, r_6, r_12, box=box)
-                e_exp = 0.0
-                if sfc_instance is not None:
-                    e_exp = sfc_instance.compute_loss(X_final)
+                def local_loss_fn(R_heavy):
+                    X_local = X_final.at[oracle_mapping.heavy_indices].set(R_heavy)
+                    e_physics = hydride.relax.compute_energy(X_local, pairs, elec_param, eps, r_6, r_12, box=box, box_inv=box_inv)
+                    
+                    e_exp = 0.0
+                    if sfc_instance is not None:
+                        e_exp = sfc_instance.compute_loss(X_local)
 
-                restraint = (0.5 / current_eta) * jnp.sum((R_heavy - x_0_heavy_mapped) ** 2)
-                return e_physics + (lambda_exp * e_exp) + restraint
+                    restraint = (0.5 / eta_local) * jnp.sum((R_heavy - x_0_heavy_mapped) ** 2)
+                    return e_physics + e_exp + restraint
 
-            R_current = x_0_heavy_mapped
-            def step_body(i, r_val):
-                grads = jax.grad(joint_objective)(r_val)
+                grads = jax.grad(local_loss_fn)(r_val)
                 return r_val - prox_lr * jnp.clip(grads, -1.0, 1.0)
 
+            R_current = x_0_heavy_mapped
             R_optimized = jax.lax.fori_loop(0, prox_steps, step_body, R_current)
             x_af3_updated = x_af3_flat.at[oracle_mapping.source_indices].set(R_optimized)
             return x_0_single.at[gather_idxs].set(x_af3_updated)
 
-        return jax.vmap(single_sample_prox)(x_0_flat).reshape(x_0_real.shape)
+        return jax.vmap(single_sample_prox)(x_0_flat, current_eta).reshape(x_0_real.shape)
 
     rng_key = jax.random.PRNGKey(0) if sample_key is None else sample_key
     atom_positions = model_runner.sample_guided_diffusion(
@@ -177,7 +173,7 @@ def _assemble_coordinates_from_conformation(
 ) -> jnp.ndarray:
     """Snaps coordinates back into the crystal's global reference frame via Kabsch alignment."""
     params = hydride.get_relaxation_params(oracle_atoms)
-    center_indices, axis_indices, is_free_mask, pairs, elec_param, eps, r_6, r_12, atom_to_bond_idx, box = params
+    center_indices, axis_indices, is_free_mask, pairs, elec_param, eps, r_6, r_12, atom_to_bond_idx, box, box_inv = params
 
     x_af3_flat = atom_positions.reshape((-1, 3))[gather_idxs]
 
@@ -202,7 +198,7 @@ def _assemble_coordinates_from_conformation(
     
     X_relaxed, _, _ = hydride.relax_hydrogen_jit(
         X_final, center_indices, axis_indices, is_free_mask,
-        pairs, elec_param, eps, r_6, r_12, atom_to_bond_idx, box=box, iterations=200
+        pairs, elec_param, eps, r_6, r_12, atom_to_bond_idx, box=box, box_inv=box_inv, iterations=200
     )
     return X_relaxed
 

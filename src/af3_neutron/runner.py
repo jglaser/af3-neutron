@@ -63,7 +63,7 @@ class _HostDiffusionWrapper(_HostModule):
         )
 
 class _DiffusionHijackWrapper(_HostModule):
-    """Evaluates the structural refinement trajectory solver loop."""
+    """Evaluates the unguided structural trajectory updates inside the tracking head."""
     def __init__(self, config: model.Model.Config, name: str = "diffuser"):
         super().__init__(config, name=name)
         self.diffusion_module = diffusion_head.DiffusionHead(self.config.heads.diffusion, self.config.global_config)
@@ -72,14 +72,22 @@ class _DiffusionHijackWrapper(_HostModule):
         sample_config = self.config.heads.diffusion.eval
 
         def hijacked_denoising_step(positions_noisy: jnp.ndarray, t_hat: jnp.ndarray) -> jnp.ndarray:
+            # 1. Evaluate native unguided structural prediction target (\hat{x}_0)
             x_0_real = self.diffusion_module(
                 positions_noisy=positions_noisy, noise_level=t_hat, batch=batch,
                 embeddings={"pair": embeddings.pair, "single": embeddings.single, "target_feat": embeddings.target_feat},
                 use_conditioning=True,
             )
-            return proximal_fn(x_0_real, t_hat)
+            
+            # 2. Use a pure callback to hide the refinement graph from XLA loop optimization passes
+            return jax.pure_callback(
+                proximal_fn,
+                x_0_real,     # Expected output shape/dtype template
+                x_0_real,     # Argument 1: Coordinates
+                t_hat,   # Argument 2: Timestep scalar
+                vmap_method="broadcast_all",
+            )
 
-        # Removed hk.remat checkpointing from here to eliminate state tracker leakage leaks
         sample_results = diffusion_head.sample(denoising_step=hijacked_denoising_step, batch=batch, key=sample_key, config=sample_config)
         return sample_results["atom_positions"]
 
@@ -113,3 +121,4 @@ class HostRunner:
         def forward_sample(batch_dict: Dict[str, Any], embeddings: HostEmbeddings, sample_key: jnp.ndarray, proximal_fn: Callable) -> jnp.ndarray:
             return _DiffusionHijackWrapper(self._model_config)(feat_batch.Batch.from_data_dict(batch_dict), embeddings, sample_key, proximal_fn)
         return functools.partial(jax.jit(forward_sample.apply, static_argnums=(5,), device=self._device), self.model_params)
+
