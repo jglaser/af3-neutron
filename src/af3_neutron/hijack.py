@@ -18,11 +18,11 @@ from .types import (
 )
 
 def _build_oracle_from_baseline_af3_prediction(
-    flat_layout: Any, x_af3_flat_baseline: jnp.ndarray
+    flat_layout: Any, x_af3_flat_baseline: jnp.ndarray, ph: float = 7.4
 ) -> Oracle:
     """Builds a full complex topological oracle from an unguided baseline prediction."""
     logging.info(
-        "Building full-complex Hydride Oracle from Host baseline prediction..."
+        f"Building full-complex Hydride Oracle from Host baseline prediction at pH {ph}..."
     )
 
     num_atoms = flat_layout.shape[0]
@@ -39,9 +39,9 @@ def _build_oracle_from_baseline_af3_prediction(
 
     oracle_atoms = atoms[(atoms.element != "H") & (atoms.element != "D")]
     oracle_atoms.bonds = struc.connect_via_residue_names(oracle_atoms)
-    if "charge" not in oracle_atoms.get_annotation_categories():
-        oracle_atoms.add_annotation("charge", dtype=int)
-        oracle_atoms.charge[:] = 0
+    
+    # Calculate pKa-dependent protonation states
+    oracle_atoms.set_annotation("charge", hydride.estimate_amino_acid_charges(oracle_atoms, ph))
 
     oracle_atoms, _ = hydride.add_hydrogen(oracle_atoms)
     oracle_atoms.coord = hydride.relax_hydrogen(oracle_atoms)
@@ -147,7 +147,7 @@ def _hijack_diffusion_with_custom_loss(
         batch_dict,
         embeddings,
         rng_key,
-        proximal_operator_fn
+        proximal_operator_fn,
     )
 
     return Conformations(atom_positions=atom_positions)
@@ -163,6 +163,7 @@ def _assemble_coordinates_from_conformation(
     params = hydride.get_relaxation_params(oracle_atoms)
     (center_indices, axis_indices, is_free_mask, pairs, elec_param, eps, r_6, r_12, atom_to_bond_idx,
         box, box_inv, reduction_indices, reduction_signs, reduction_pair_map) = params
+
 
     x_af3_flat = atom_positions.reshape((-1, 3))[gather_idxs]
 
@@ -198,8 +199,8 @@ def _assemble_coordinates_from_conformation(
 
 class Hijacker:
     @staticmethod
-    def build_oracle(layout, denoised_vector_field_positions) -> Oracle:
-        return _build_oracle_from_baseline_af3_prediction(layout, denoised_vector_field_positions)
+    def build_oracle(layout, denoised_vector_field_positions, ph: float = 7.4) -> Oracle:
+        return _build_oracle_from_baseline_af3_prediction(layout, denoised_vector_field_positions, ph=ph)
 
     @staticmethod
     def hijack_diffusion(

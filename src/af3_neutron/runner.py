@@ -114,4 +114,5 @@ class HostRunner:
         @hk.transform
         def forward_sample(batch_dict: Dict[str, Any], embeddings: HostEmbeddings, sample_key: jnp.ndarray, proximal_fn: Callable) -> jnp.ndarray:
             return _DiffusionHijackWrapper(self._model_config)(feat_batch.Batch.from_data_dict(batch_dict), embeddings, sample_key, proximal_fn)
-        return functools.partial(jax.jit(forward_sample.apply, static_argnums=(5,), device=self._device), self.model_params)
+
+        return functools.partial(jax.jit(forward_sample.apply, static_argnames='proximal_fn', device=self._device), self.model_params)
