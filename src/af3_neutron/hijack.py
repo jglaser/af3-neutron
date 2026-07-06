@@ -1,3 +1,4 @@
+import functools
 import logging
 from typing import Any, Optional
 
@@ -110,54 +111,52 @@ def _hijack_diffusion_with_custom_loss(
     (center_indices, axis_indices, is_free_mask, pairs, elec_param, eps, r_6, r_12, atom_to_bond_idx,
         box, box_inv, reduction_indices, reduction_signs, reduction_pair_map) = params
 
-    # The proximal function is compiled standalone to run efficiently on the GPU registers
-    @jax.jit
+    # Compiling with inline=False decouples the custom loss step from the main transformer loop logic
+    @functools.partial(jax.jit, inline=False)
     def proximal_operator_fn(x_0_real: jnp.ndarray, t_hat: jnp.ndarray) -> jnp.ndarray:
-        x_0_flat = x_0_real.reshape((x_0_real.shape[0], -1, 3))
+        x_0_flat = x_0_real.reshape((-1, 3))
         current_eta = eta_init * (t_hat ** 2)
         jax.debug.print("{t}",t=t_hat)
+        
+        # Isolate the coordinate arrays from the active batch tracking maps
+        x_af3_flat = x_0_flat[gather_idxs]
+        x_0_heavy_mapped = x_af3_flat[oracle_mapping.source_indices]
 
-        def single_sample_prox(x_0_single, eta_local):
-            x_af3_flat = x_0_single[gather_idxs]
-            x_0_heavy_mapped = x_af3_flat[oracle_mapping.source_indices]
+        def step_body(i, r_val):
+            X = oracle_mapping.initial_coordinates
+            X = X.at[oracle_mapping.heavy_indices].set(r_val)
 
-            def step_body(i, r_val):
-                X = oracle_mapping.initial_coordinates
-                X = X.at[oracle_mapping.heavy_indices].set(r_val)
+            X_relaxed, _, _ = hydride.relax_hydrogen_jit(
+                X, center_indices, axis_indices, is_free_mask,
+                pairs, elec_param, eps, r_6, r_12, atom_to_bond_idx, box=box, box_inv=box_inv,
+                reduction_indices=reduction_indices, reduction_signs=reduction_signs,
+                reduction_pair_map=reduction_pair_map,
+                iterations=40
+            )
+            
+            X_frozen = jax.lax.stop_gradient(X_relaxed)
+            X_final = X_frozen.at[oracle_mapping.heavy_indices].set(r_val)
 
-                X_relaxed, _, _ = hydride.relax_hydrogen_jit(
-                    X, center_indices, axis_indices, is_free_mask,
-                    pairs, elec_param, eps, r_6, r_12, atom_to_bond_idx, box=box, box_inv=box_inv,
-                    reduction_indices=reduction_indices, reduction_signs=reduction_signs,
-                    reduction_pair_map=reduction_pair_map,
-                    iterations=40
-                )
+            def local_loss_fn(R_heavy):
+                X_local = X_final.at[oracle_mapping.heavy_indices].set(R_heavy)
+                e_physics = hydride.relax.compute_energy(X_local, pairs, elec_param, eps, r_6, r_12,
+                    box=box, box_inv=box_inv, reduction_indices=reduction_indices,
+                    reduction_signs=reduction_signs, reduction_pair_map=reduction_pair_map)
                 
-                X_frozen = jax.lax.stop_gradient(X_relaxed)
-                X_final = X_frozen.at[oracle_mapping.heavy_indices].set(r_val)
+                e_exp = 0.0
+                if sfc_instance is not None:
+                    e_exp = sfc_instance.compute_loss(X_local)
 
-                def local_loss_fn(R_heavy):
-                    X_local = X_final.at[oracle_mapping.heavy_indices].set(R_heavy)
-                    e_physics = hydride.relax.compute_energy(X_local, pairs, elec_param, eps, r_6, r_12,
-                        box=box, box_inv=box_inv, reduction_indices=reduction_indices,
-                        reduction_signs=reduction_signs, reduction_pair_map=reduction_pair_map)
-                    
-                    e_exp = 0.0
-                    if sfc_instance is not None:
-                        e_exp = sfc_instance.compute_loss(X_local)
+                restraint = (0.5 / current_eta) * jnp.sum((R_heavy - x_0_heavy_mapped) ** 2)
+                return e_physics + e_exp + restraint
 
-                    restraint = (0.5 / eta_local) * jnp.sum((R_heavy - x_0_heavy_mapped) ** 2)
-                    return e_physics + e_exp + restraint
+            grads = jax.grad(local_loss_fn)(r_val)
+            return r_val - prox_lr * jnp.clip(grads, -1.0, 1.0)
 
-                grads = jax.grad(local_loss_fn)(r_val)
-                return r_val - prox_lr * jnp.clip(grads, -1.0, 1.0)
-
-            R_current = x_0_heavy_mapped
-            R_optimized = jax.lax.fori_loop(0, prox_steps, step_body, R_current)
-            x_af3_updated = x_af3_flat.at[oracle_mapping.source_indices].set(R_optimized)
-            return x_0_single.at[gather_idxs].set(x_af3_updated)
-
-        return jax.vmap(single_sample_prox)(x_0_flat, current_eta).reshape(x_0_real.shape)
+        R_current = x_0_heavy_mapped
+        R_optimized = jax.lax.fori_loop(0, prox_steps, step_body, R_current)
+        x_af3_updated = x_af3_flat.at[oracle_mapping.source_indices].set(R_optimized)
+        return x_0_flat.at[gather_idxs].set(x_af3_updated).reshape(x_0_real.shape)
 
     rng_key = jax.random.PRNGKey(0) if sample_key is None else sample_key
     atom_positions = model_runner.sample_guided_diffusion(

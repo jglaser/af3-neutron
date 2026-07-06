@@ -79,14 +79,8 @@ class _DiffusionHijackWrapper(_HostModule):
                 use_conditioning=True,
             )
             
-            # 2. Use a pure callback to hide the refinement graph from XLA loop optimization passes
-            return jax.pure_callback(
-                proximal_fn,
-                x_0_real,     # Expected output shape/dtype template
-                x_0_real,     # Argument 1: Coordinates
-                t_hat,   # Argument 2: Timestep scalar
-                vmap_method="broadcast_all",
-            )
+            # 2. Revert to full GPU execution by evaluating proximal_fn natively on the device
+            return proximal_fn(x_0_real, t_hat)
 
         sample_results = diffusion_head.sample(denoising_step=hijacked_denoising_step, batch=batch, key=sample_key, config=sample_config)
         return sample_results["atom_positions"]
@@ -121,4 +115,3 @@ class HostRunner:
         def forward_sample(batch_dict: Dict[str, Any], embeddings: HostEmbeddings, sample_key: jnp.ndarray, proximal_fn: Callable) -> jnp.ndarray:
             return _DiffusionHijackWrapper(self._model_config)(feat_batch.Batch.from_data_dict(batch_dict), embeddings, sample_key, proximal_fn)
         return functools.partial(jax.jit(forward_sample.apply, static_argnums=(5,), device=self._device), self.model_params)
-
