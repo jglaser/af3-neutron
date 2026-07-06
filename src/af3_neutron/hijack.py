@@ -40,7 +40,7 @@ def _build_oracle_from_baseline_af3_prediction(
     oracle_atoms = atoms[(atoms.element != "H") & (atoms.element != "D")]
     oracle_atoms.bonds = struc.connect_via_residue_names(oracle_atoms)
     
-    # Calculate pKa-dependent protonation states
+    # Clean direct assignment using estimate_amino_acid_charges
     oracle_atoms.set_annotation("charge", hydride.estimate_amino_acid_charges(oracle_atoms, ph))
 
     oracle_atoms, _ = hydride.add_hydrogen(oracle_atoms)
@@ -96,6 +96,26 @@ def _hijack_diffusion_with_custom_loss(
     (center_indices, axis_indices, is_free_mask, pairs, elec_param, eps, r_6, r_12, atom_to_bond_idx,
         box, box_inv, reduction_indices, reduction_signs, reduction_pair_map) = params
 
+    # Host-side compilation of the rigid hydrogen tracking map
+    all_bonds, _ = oracle.atoms.bonds.get_all_bonds()
+    elements = oracle.atoms.element
+    heavy_indices_np = np.array(oracle_mapping.heavy_indices)
+    heavy_to_slot = {int(idx): slot for slot, idx in enumerate(heavy_indices_np)}
+    
+    atom_to_heavy_slot = np.zeros(oracle.atoms.array_length(), dtype=np.int32)
+    for i in range(oracle.atoms.array_length()):
+        if elements[i] != "H":
+            atom_to_heavy_slot[i] = heavy_to_slot[i]
+        else:
+            parent_idx = -1
+            for neighbor in all_bonds[i]:
+                if neighbor != -1 and elements[neighbor] != "H":
+                    parent_idx = neighbor
+                    break
+            atom_to_heavy_slot[i] = heavy_to_slot[parent_idx] if parent_idx != -1 else 0
+            
+    atom_to_heavy_slot_jax = jnp.array(atom_to_heavy_slot, dtype=jnp.int32)
+
     @functools.partial(jax.jit, inline=False)
     def proximal_operator_fn(x_0_real: jnp.ndarray, t_hat: jnp.ndarray) -> jnp.ndarray:
         x_0_flat = x_0_real.reshape(-1, 3)
@@ -105,8 +125,9 @@ def _hijack_diffusion_with_custom_loss(
         x_0_heavy_mapped = x_af3_flat[oracle_mapping.source_indices]
 
         def step_body(i, r_val):
-            X = oracle_mapping.initial_coordinates
-            X = X.at[oracle_mapping.heavy_indices].set(r_val)
+            # Compute rigid delta translation vectors to co-migrate hydrogens alongside heavy parents
+            delta_heavy = r_val - oracle_mapping.initial_coordinates[oracle_mapping.heavy_indices]
+            X = oracle_mapping.initial_coordinates + delta_heavy[atom_to_heavy_slot_jax]
 
             X_relaxed, _, _ = hydride.relax_hydrogen_jit(
                 X, center_indices, axis_indices, is_free_mask,
@@ -117,10 +138,12 @@ def _hijack_diffusion_with_custom_loss(
             )
             
             X_frozen = jax.lax.stop_gradient(X_relaxed)
-            X_final = X_frozen.at[oracle_mapping.heavy_indices].set(r_val)
 
             def local_loss_fn(R_heavy):
-                X_local = X_final.at[oracle_mapping.heavy_indices].set(R_heavy)
+                # Apply virtual perturbation gradients rigidly across the localized proton matrix
+                delta_r = R_heavy - r_val
+                X_local = X_frozen + delta_r[atom_to_heavy_slot_jax]
+
                 e_physics = hydride.relax.compute_energy(X_local, pairs, elec_param, eps, r_6, r_12,
                     box=box, box_inv=box_inv, reduction_indices=reduction_indices,
                     reduction_signs=reduction_signs, reduction_pair_map=reduction_pair_map)
@@ -147,7 +170,7 @@ def _hijack_diffusion_with_custom_loss(
         batch_dict,
         embeddings,
         rng_key,
-        proximal_operator_fn,
+        proximal_operator_fn
     )
 
     return Conformations(atom_positions=atom_positions)
@@ -164,6 +187,24 @@ def _assemble_coordinates_from_conformation(
     (center_indices, axis_indices, is_free_mask, pairs, elec_param, eps, r_6, r_12, atom_to_bond_idx,
         box, box_inv, reduction_indices, reduction_signs, reduction_pair_map) = params
 
+    all_bonds, _ = oracle_atoms.bonds.get_all_bonds()
+    elements = oracle_atoms.element
+    heavy_indices_np = np.array(oracle_mapping.heavy_indices)
+    heavy_to_slot = {int(idx): slot for slot, idx in enumerate(heavy_indices_np)}
+    
+    atom_to_heavy_slot = np.zeros(oracle_atoms.array_length(), dtype=np.int32)
+    for i in range(oracle_atoms.array_length()):
+        if elements[i] != "H":
+            atom_to_heavy_slot[i] = heavy_to_slot[i]
+        else:
+            parent_idx = -1
+            for neighbor in all_bonds[i]:
+                if neighbor != -1 and elements[neighbor] != "H":
+                    parent_idx = neighbor
+                    break
+            atom_to_heavy_slot[i] = heavy_to_slot[parent_idx] if parent_idx != -1 else 0
+            
+    atom_to_heavy_slot_jax = jnp.array(atom_to_heavy_slot, dtype=jnp.int32)
 
     x_af3_flat = atom_positions.reshape((-1, 3))[gather_idxs]
 
@@ -183,8 +224,10 @@ def _assemble_coordinates_from_conformation(
 
     x_af3_aligned = (x_af3_flat - avg_drift) @ R + avg_ref
     
-    X_final = oracle_mapping.initial_coordinates
-    X_final = X_final.at[oracle_mapping.heavy_indices].set(x_af3_aligned[oracle_mapping.source_indices])
+    # Synchronize hydrogen structures during Kabsch final assembly
+    r_val_final = x_af3_aligned[oracle_mapping.source_indices]
+    delta_heavy = r_val_final - oracle_mapping.initial_coordinates[oracle_mapping.heavy_indices]
+    X_final = oracle_mapping.initial_coordinates + delta_heavy[atom_to_heavy_slot_jax]
     
     X_relaxed, _, _ = hydride.relax_hydrogen_jit(
         X_final, center_indices, axis_indices, is_free_mask,
