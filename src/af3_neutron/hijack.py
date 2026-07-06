@@ -12,8 +12,6 @@ from SFC_Jax.Fmodel import SFcalculator as SFC
 from .runner import HostRunner
 from .types import (
     HostEmbeddings,
-    RotorTable,
-    WaterMapping,
     Oracle,
     OracleMapping,
     Conformations
@@ -65,25 +63,12 @@ def _build_oracle_from_baseline_af3_prediction(
             oracle_heavy_indices.append(i)
             af3_source_indices.append(af3_lookup[h_key])
 
-    dummy_rotor = RotorTable(
-        target_idx=jnp.zeros(0, dtype=jnp.int32), parent_idx=jnp.zeros(0, dtype=jnp.int32),
-        grandparent_idx=jnp.zeros(0, dtype=jnp.int32), greatgrand_idx=jnp.zeros(0, dtype=jnp.int32),
-        ideal_r=jnp.zeros(0, dtype=jnp.float32), ideal_theta=jnp.zeros(0, dtype=jnp.float32),
-        initial_chi=jnp.zeros(0, dtype=jnp.float32)
-    )
-    dummy_water = WaterMapping(
-        oxygen_source=jnp.zeros(0, dtype=jnp.int32), h1_target=jnp.zeros(0, dtype=jnp.int32),
-        h2_target=jnp.zeros(0, dtype=jnp.int32)
-    )
-
     return Oracle(
         mapping=OracleMapping(
             num_atoms=num_oracle_atoms,
             heavy_indices=jnp.array(oracle_heavy_indices, dtype=jnp.int32),
             source_indices=jnp.array(af3_source_indices, dtype=jnp.int32),
-            initial_coordinates=jnp.array(oracle_atoms.coord, dtype=jnp.float32),
-            rotor_table=dummy_rotor,
-            water_mapping=dummy_water
+            initial_coordinates=jnp.array(oracle_atoms.coord, dtype=jnp.float32)
         ),
         atoms=oracle_atoms,
     )
@@ -111,14 +96,11 @@ def _hijack_diffusion_with_custom_loss(
     (center_indices, axis_indices, is_free_mask, pairs, elec_param, eps, r_6, r_12, atom_to_bond_idx,
         box, box_inv, reduction_indices, reduction_signs, reduction_pair_map) = params
 
-    # inline=False decouples the custom loss step from the main transformer loop logic
     @functools.partial(jax.jit, inline=False)
     def proximal_operator_fn(x_0_real: jnp.ndarray, t_hat: jnp.ndarray) -> jnp.ndarray:
-        # Flatten AlphaFold 3's structured token array into a uniform 2D atom coordinate matrix
         x_0_flat = x_0_real.reshape(-1, 3)
         current_eta = eta_init * (t_hat ** 2)
         
-        # Isolate the coordinate arrays from the active batch tracking maps
         x_af3_flat = x_0_flat[gather_idxs]
         x_0_heavy_mapped = x_af3_flat[oracle_mapping.source_indices]
 
@@ -168,7 +150,6 @@ def _hijack_diffusion_with_custom_loss(
         proximal_operator_fn
     )
 
-    # Clean return passing only device-resident coordinate tensors
     return Conformations(atom_positions=atom_positions)
 
 
