@@ -22,6 +22,8 @@ from af3_neutron.sfc_adapter import init_neutron_sfc
 from jax.experimental.compilation_cache import compilation_cache as cc
 cc.set_cache_dir(os.path.expanduser('./.jax_cache'))
 
+import json
+
 FLAGS = flags.FLAGS
 flags.DEFINE_string(
     "json_path",
@@ -107,12 +109,25 @@ def main(argv):
         jax.random.PRNGKey(0), initial_noise, jnp.array([noise_schedule[0]]), batch, embeddings
     )
 
+    logging.info("Parsing ligand SMILES definitions from input JSON...")
+    with open(FLAGS.json_path, "r") as f:
+        input_json_data = json.load(f)
+
+    ligand_smiles_dict = {}
+    for seq in input_json_data.get("sequences", []):
+        if "ligand" in seq:
+            l_id = seq["ligand"]["id"][0]
+            l_smiles = seq["ligand"]["smiles"]
+            ligand_smiles_dict[l_id] = l_smiles
+
     oracle = Hijacker.build_oracle(
         batch_obj.convert_model_output.flat_output_layout,
         np.array(positions_denoised.reshape((-1, 3))[gather_idxs]),
+        ligand_smiles_dict=ligand_smiles_dict
     )
+    
     sfc = init_neutron_sfc(oracle.atoms, FLAGS.mtz_path) if FLAGS.mtz_path else None
-
+    
     # hijack loop using the generalized proximal-based implementation
     conformations = Hijacker.hijack_diffusion(
         runner,
@@ -135,6 +150,16 @@ def main(argv):
     contiguous_indices = np.lexsort((oracle.atoms.res_id, oracle.atoms.chain_id))
     oracle.atoms = oracle.atoms[contiguous_indices]
 
+    # Define standard residues locally to differentiate ATOM vs HETATM records
+    STANDARD_AMINO_ACIDS = {
+        "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
+        "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL"
+    }
+    
+    # Identify non-standard entities (ligands like BZB, ions, and waters)
+    is_hetero = np.array([res.strip().upper() not in STANDARD_AMINO_ACIDS for res in oracle.atoms.res_name])
+    oracle.atoms.set_annotation("hetero", is_hetero)
+
     output_path = pathlib.Path(FLAGS.output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -142,7 +167,6 @@ def main(argv):
     pdbx.set_structure(cif_file, oracle.atoms, data_block="neutron_refined")
     cif_file.write(output_path)
     logging.info("Refinement pipeline finished successfully.")
-
 
 if __name__ == "__main__":
     app.run(main)

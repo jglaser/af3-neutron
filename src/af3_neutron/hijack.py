@@ -1,6 +1,7 @@
 import functools
 import logging
-from typing import Any, Optional
+import sys
+from typing import Any, Optional, Dict
 
 import hydride
 import biotite.structure as struc
@@ -8,6 +9,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from SFC_Jax.Fmodel import SFcalculator as SFC
+from rdkit import Chem
 
 from .runner import HostRunner
 from .types import (
@@ -17,8 +19,81 @@ from .types import (
     Conformations
 )
 
+from biotite.structure.info import bonds_in_residue
+
+def build_custom_bond_dict(atoms: struc.AtomArray, ligand_smiles_dict: dict[str, str]) -> dict[str, dict[tuple, Any]]:
+    """Builds a comprehensive bond dictionary by pulling standard residue topologies
+
+    from the CCD and augmenting them with explicit Kekulized ligand bond tracks mapped
+    via element name tracking arrays to eliminate indexing order mismatches.
+    """
+    from biotite.structure import BondType
+    from biotite.structure.info import bonds_in_residue
+
+    custom_bond_dict = {}
+
+    # 1. Pre-populate with standard CCD topologies for ALL unique residues in the system
+    # This ensures protein backbones/sidechains remain perfectly intact[cite: 9]
+    unique_res_names = np.unique(atoms.res_name)
+    for res_name in unique_res_names:
+        standard_bonds = bonds_in_residue(res_name)
+        if standard_bonds is not None:
+            custom_bond_dict[res_name] = dict(standard_bonds)
+        else:
+            custom_bond_dict[res_name] = {}
+
+    # 2. Extract and map ligand topologies safely using element track strings
+    for chain_id, smiles in ligand_smiles_dict.items():
+        chain_mask = (atoms.chain_id == chain_id)
+        res_names = np.unique(atoms.res_name[chain_mask])
+        if len(res_names) == 0:
+            continue
+        res_name = res_names[0]
+
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            continue
+        # Crucial: Must kekulize so hydride can differentiate sp2 vs sp3 centers
+        Chem.Kekulize(mol, clearAromaticFlags=True)
+
+        # Build a deterministic atom name map matching AlphaFold 3's SMILES naming convention
+        element_counters = {}
+        rdkit_atom_names = []
+        for atom in mol.GetAtoms():
+            symbol = atom.GetSymbol().upper()
+            element_counters[symbol] = element_counters.get(symbol, 0) + 1
+            # Reconstructs the exact expected AF3 string token name (e.g., "C1", "C2", "N1")
+            atom_name = f"{symbol}{element_counters[symbol]}"
+            rdkit_atom_names.append(atom_name)
+
+        res_bonds = custom_bond_dict.get(res_name, {})
+        for bond in mol.GetBonds():
+            idx1 = bond.GetBeginAtomIdx()
+            idx2 = bond.GetEndAtomIdx()
+
+            # Map indices safely to the reconstructed string names instead of Biotite row slots
+            name1 = rdkit_atom_names[idx1]
+            name2 = rdkit_atom_names[idx2]
+
+            rdkit_btype = bond.GetBondType()
+            if rdkit_btype == Chem.BondType.SINGLE:
+                btype = BondType.SINGLE
+            elif rdkit_btype == Chem.BondType.DOUBLE:
+                btype = BondType.DOUBLE
+            elif rdkit_btype == Chem.BondType.TRIPLE:
+                btype = BondType.TRIPLE
+            else:
+                btype = BondType.SINGLE
+
+            # Populate topology track using the clean string keys
+            res_bonds[(str(name1), str(name2))] = btype
+
+        custom_bond_dict[str(res_name)] = res_bonds
+
+    return custom_bond_dict
+
 def _build_oracle_from_baseline_af3_prediction(
-    flat_layout: Any, x_af3_flat_baseline: jnp.ndarray, ph: float = 7.4
+    flat_layout: Any, x_af3_flat_baseline: jnp.ndarray, ligand_smiles_dict: Dict[str, str], ph: float = 7.4
 ) -> Oracle:
     """Builds a full complex topological oracle from an unguided baseline prediction."""
     logging.info(
@@ -38,7 +113,10 @@ def _build_oracle_from_baseline_af3_prediction(
     )
 
     oracle_atoms = atoms[(atoms.element != "H") & (atoms.element != "D")]
-    oracle_atoms.bonds = struc.connect_via_residue_names(oracle_atoms)
+    
+    # Generate custom covalent maps directly from the verified SMILES definitions
+    custom_bonds = build_custom_bond_dict(oracle_atoms, ligand_smiles_dict)
+    oracle_atoms.bonds = struc.connect_via_residue_names(oracle_atoms, custom_bond_dict=custom_bonds)
     
     # Clean direct assignment using estimate_amino_acid_charges
     oracle_atoms.set_annotation("charge", hydride.estimate_amino_acid_charges(oracle_atoms, ph))
@@ -96,7 +174,6 @@ def _hijack_diffusion_with_custom_loss(
     (center_indices, axis_indices, is_free_mask, pairs, elec_param, eps, r_6, r_12, atom_to_bond_idx,
         box, box_inv, reduction_indices, reduction_signs, reduction_pair_map) = params
 
-    # Host-side compilation of the rigid hydrogen tracking map
     all_bonds, _ = oracle.atoms.bonds.get_all_bonds()
     elements = oracle.atoms.element
     heavy_indices_np = np.array(oracle_mapping.heavy_indices)
@@ -125,7 +202,6 @@ def _hijack_diffusion_with_custom_loss(
         x_0_heavy_mapped = x_af3_flat[oracle_mapping.source_indices]
 
         def step_body(i, r_val):
-            # Compute rigid delta translation vectors to co-migrate hydrogens alongside heavy parents
             delta_heavy = r_val - oracle_mapping.initial_coordinates[oracle_mapping.heavy_indices]
             X = oracle_mapping.initial_coordinates + delta_heavy[atom_to_heavy_slot_jax]
 
@@ -140,7 +216,6 @@ def _hijack_diffusion_with_custom_loss(
             X_frozen = jax.lax.stop_gradient(X_relaxed)
 
             def local_loss_fn(R_heavy):
-                # Apply virtual perturbation gradients rigidly across the localized proton matrix
                 delta_r = R_heavy - r_val
                 X_local = X_frozen + delta_r[atom_to_heavy_slot_jax]
 
@@ -224,7 +299,6 @@ def _assemble_coordinates_from_conformation(
 
     x_af3_aligned = (x_af3_flat - avg_drift) @ R + avg_ref
     
-    # Synchronize hydrogen structures during Kabsch final assembly
     r_val_final = x_af3_aligned[oracle_mapping.source_indices]
     delta_heavy = r_val_final - oracle_mapping.initial_coordinates[oracle_mapping.heavy_indices]
     X_final = oracle_mapping.initial_coordinates + delta_heavy[atom_to_heavy_slot_jax]
@@ -242,8 +316,8 @@ def _assemble_coordinates_from_conformation(
 
 class Hijacker:
     @staticmethod
-    def build_oracle(layout, denoised_vector_field_positions, ph: float = 7.4) -> Oracle:
-        return _build_oracle_from_baseline_af3_prediction(layout, denoised_vector_field_positions, ph=ph)
+    def build_oracle(layout, denoised_vector_field_positions, ligand_smiles_dict: Dict[str, str], ph: float = 7.4) -> Oracle:
+        return _build_oracle_from_baseline_af3_prediction(layout, denoised_vector_field_positions, ligand_smiles_dict, ph=ph)
 
     @staticmethod
     def hijack_diffusion(
