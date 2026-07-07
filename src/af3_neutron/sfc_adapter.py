@@ -23,29 +23,27 @@ class NeutronSFCalculator(SFcalculator):
     """Subclass of SFcalculator that implements a clean, JAX-differentiable 
     structure factor amplitude loss directly on global Cartesian coordinates.
     """
-    def compute_loss(self, xyz, t_hat=None):
+    def compute_loss(self, xyz):
         # xyz shape: (N, 3) - global Cartesian coordinates from diffusion step
         
         # Execute the forward in-place calculation method
-        res = self.Calc_Fprotein(xyz)
+        self.Calc_Fprotein(xyz)
         
-        # Extract the unique ASU reflection tracer first to match Fo dimensions
-        f_calc_complex = getattr(self, "Fprotein_asu", None)
+        # Use Fprotein_HKL to match the exact shape of the experimental Fo array (37877)
+        f_calc_complex = getattr(self, "Fprotein_HKL", None)
         if f_calc_complex is None:
-            f_calc_complex = getattr(self, "Fprotein_HKL", None)
-        if f_calc_complex is None:
-            f_calc_complex = res
+            f_calc_complex = getattr(self, "Fprotein_asu", None)
             
         if f_calc_complex is None:
             available_attrs = [a for a in dir(self) if not a.startswith("__")]
             raise AttributeError(
-                f"Calc_Fprotein returned None and no populated structure factor attribute "
-                f"('Fprotein_asu' or 'Fprotein_HKL') was found. Available attributes: {available_attrs}"
+                f"Calc_Fprotein did not populate a valid structure factor attribute "
+                f"('Fprotein_HKL' or 'Fprotein_asu'). Available attributes: {available_attrs}"
             )
             
         f_calc_mag = jnp.abs(f_calc_complex)
         
-        # Safely extract experimental amplitudes using explicit 'is not None' checks
+        # Safely extract experimental amplitudes (Fo / Fobs / fo)
         f_obs_attr = getattr(self, "Fo", None)
         if f_obs_attr is None:
             f_obs_attr = getattr(self, "Fobs", None)
@@ -56,20 +54,21 @@ class NeutronSFCalculator(SFcalculator):
             raise AttributeError("Could not locate experimental amplitude array (Fo/Fobs) on the calculator instance.")
         f_obs = jnp.array(f_obs_attr)
         
-        # Calculate an analytical scale factor k to align calculated and observed intensities
-        scale_factor = jnp.sum(f_obs * f_calc_mag) / (jnp.sum(f_calc_mag ** 2) + 1e-8)
+        # Mask out reflections that do not exist or are missing in the experimental data (<= 0 or NaN)
+        mask = (f_obs > 0.0) & (~jnp.isnan(f_obs))
         
-        # Evaluate scale-invariant least-squares crystallographic residuals
-        residuals_sq = (f_obs - scale_factor * f_calc_mag) ** 2
+        # Conditionally zero out unobserved reflections to ensure pure, safe broadcasting
+        f_obs = jnp.where(mask, f_obs, 0.0)
+        f_calc_mag = jnp.where(mask, f_calc_mag, 0.0)
         
-        # Apply continuous adaptive resolution shielding if t_hat is passed from the outer loop
-        if t_hat is not None:
-            # self.dHKL maps the explicit resolution d-spacing (in Angstroms) per reflection
-            d_hkl = jnp.array(self.dHKL)
-            # Damps high-frequency phases under heavy noise (t_hat -> 1), filters down cleanly as t_hat -> 0
-            weight = jnp.exp(-50.0 * t_hat * (1.0 / (d_hkl ** 2)))
-            residuals_sq = residuals_sq * weight
-            
+        # Calculate the analytical scale factor using only the valid masked reflections
+        num = jnp.sum(f_obs * f_calc_mag)
+        den = jnp.sum(jnp.where(mask, f_calc_mag ** 2, 0.0)) + 1e-8
+        scale_factor = num / den
+        
+        # Compute the scale-invariant least-squares residual loss exclusively on the masked grid
+        residuals_sq = jnp.where(mask, (f_obs - scale_factor * f_calc_mag) ** 2, 0.0)
+        
         return jnp.sum(residuals_sq)
 
 def init_neutron_sfc(oracle_atoms, mtz_path):
