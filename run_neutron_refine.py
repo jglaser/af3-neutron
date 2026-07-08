@@ -125,7 +125,7 @@ def main(argv):
         np.array(positions_denoised.reshape((-1, 3))[gather_idxs]),
         ligand_smiles_dict=ligand_smiles_dict
     )
-    
+
     sfc = init_neutron_sfc(oracle.atoms, FLAGS.mtz_path) if FLAGS.mtz_path else None
     
     # hijack loop using the generalized proximal-based implementation
@@ -149,16 +149,6 @@ def main(argv):
     # hydride append hydrogen to array end, sort by chain and res for viz of ss
     contiguous_indices = np.lexsort((oracle.atoms.res_id, oracle.atoms.chain_id))
     oracle.atoms = oracle.atoms[contiguous_indices]
-
-    # Define standard residues locally to differentiate ATOM vs HETATM records
-    STANDARD_AMINO_ACIDS = {
-        "ALA", "ARG", "ASN", "ASP", "CYS", "GLN", "GLU", "GLY", "HIS", "ILE",
-        "LEU", "LYS", "MET", "PHE", "PRO", "SER", "THR", "TRP", "TYR", "VAL"
-    }
-    
-    # Identify non-standard entities (ligands like BZB, ions, and waters)
-    is_hetero = np.array([res.strip().upper() not in STANDARD_AMINO_ACIDS for res in oracle.atoms.res_name])
-    oracle.atoms.set_annotation("hetero", is_hetero)
 
     output_path = pathlib.Path(FLAGS.output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
