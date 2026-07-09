@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import gemmi  
 from biotite.structure.io import pdb
-from SFC_Jax.Fmodel import SFcalculator
+from SFC_Jax.Fmodel import SFcalculator, F_protein # <-- IMPORT PURE TENSOR FUNCTION
 
 # ==============================================================================
 # MONKEYPATCH FOR GEMMI VERSION CONFLICT (v0.7.0+)
@@ -19,23 +19,34 @@ if not hasattr(gemmi.UnitCell, "orthogonalization_matrix"):
 
 class NeutronSFCalculator(SFcalculator):
     """Subclass of SFcalculator that implements a clean, scale-invariant, 
-    JAX-differentiable structure factor amplitude loss, utilizing the native
-    Calc_Ftotal pipeline and precomputed bulk solvent masks.
+    JAX-differentiable structure factor amplitude loss, utilizing a pure
+    functional pipeline to guarantee gradient tracking inside XLA loops.
     """
     def compute_loss(self, xyz, t_hat=None):
-        # 1. Update the internal Fprotein_HKL using the current diffusion coordinates
-        self.Calc_Fprotein(atoms_position_tensor=xyz)
+        # 1. PURE JAX COMPUTATION: Completely bypass self.Calc_Fprotein 
+        # to prevent state-mutation bugs inside JAX fori_loops.
+        atom_pos_frac = jnp.tensordot(xyz, self.orth2frac_tensor.T, 1)
         
-        # 2. Use the library's native total structure factor calculation.
-        # CRITICAL: We must explicitly pass kaniso=jnp.zeros(6). If omitted, 
-        # SFC_Jax injects random noise (jax.random.normal) for Aniso-B initialization!
-        f_calc_complex = self.Calc_Ftotal(
-            kall=jnp.array(1.0),
-            kaniso=jnp.zeros(6), 
-            ksol=jnp.array(0.35), 
-            bsol=jnp.array(50.0)
+        f_calc_protein_asu = F_protein(
+            self.Hasu_array, 
+            self.dr2asu_array,
+            self.fullsf_tensor,
+            self.reciprocal_cell_paras,
+            self.R_G_tensor_stack, 
+            self.T_G_tensor_stack,
+            atom_pos_frac,
+            self.atom_b_iso, 
+            self.atom_b_aniso, 
+            self.atom_occ
         )
         
+        f_calc_protein = f_calc_protein_asu[self.asu2HKL_index]
+        
+        # 2. Apply Bulk Solvent Correction (Pure)
+        dr2_tensor = jnp.array(self.dr2HKL_array)
+        scaled_fmask = 0.35 * self.Fmask_HKL * jnp.exp(-50.0 * dr2_tensor / 4.0)
+        
+        f_calc_complex = f_calc_protein + scaled_fmask
         f_calc_mag = jnp.abs(f_calc_complex)
         
         # 3. Safely extract experimental amplitudes
@@ -45,9 +56,6 @@ class NeutronSFCalculator(SFcalculator):
         if f_obs_attr is None:
             f_obs_attr = getattr(self, "fo", None)
             
-        if f_obs_attr is None:
-            raise AttributeError("Could not locate experimental amplitude array on the calculator instance.")
-        
         f_obs = jnp.array(f_obs_attr)
         
         # 4. Enforce Cross-Validation Partitions
@@ -58,7 +66,7 @@ class NeutronSFCalculator(SFcalculator):
         f_obs = jnp.where(mask_valid, f_obs, 0.0)
         f_calc_mag = jnp.where(mask_valid, f_calc_mag, 0.0)
         
-        # 5. Dynamic Linear Scaling (Evaluated strictly on the Working Set)
+        # 5. Dynamic Linear Scaling
         num = jnp.sum(jnp.where(mask_work, f_obs * f_calc_mag, 0.0))
         den = jnp.sum(jnp.where(mask_work, f_calc_mag ** 2, 0.0)) + 1e-8
         scale_factor = num / den
@@ -75,10 +83,15 @@ class NeutronSFCalculator(SFcalculator):
         
         return normalized_loss, (r_work, r_free)
 
+
 def init_neutron_sfc(oracle_atoms, mtz_path):
     with tempfile.TemporaryDirectory() as tmpdir:
         pdb_path = os.path.join(tmpdir, "oracle.pdb")
         pdb_file = pdb.PDBFile()
+        
+        # Enforce realistic B-factors to prevent high-resolution noise amplification
+        b_factors = np.full(oracle_atoms.array_length(), 30.0, dtype=np.float32)
+        oracle_atoms.set_annotation("b_factor", b_factors)
         
         oracle_atoms.res_name = np.array([name[:3] for name in oracle_atoms.res_name])
         pdb.set_structure(pdb_file, oracle_atoms)
