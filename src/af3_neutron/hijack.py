@@ -20,16 +20,11 @@ from .types import (
 )
 
 def build_custom_bond_dict(atoms: struc.AtomArray, ligand_smiles_dict: Dict[str, str]) -> Dict[str, Dict[tuple, Any]]:
-    """Builds a comprehensive bond dictionary by pulling standard residue topologies 
-    from the CCD and augmenting them with explicit Kekulized ligand bond tracks mapped 
-    via element name tracking arrays to eliminate indexing order mismatches.
-    """
     from biotite.structure import BondType
     from biotite.structure.info import bonds_in_residue
     
     custom_bond_dict = {}
     
-    # Pre-populate with standard CCD topologies for ALL unique residues in the system
     unique_res_names = np.unique(atoms.res_name)
     for res_name in unique_res_names:
         standard_bonds = bonds_in_residue(res_name)
@@ -38,7 +33,6 @@ def build_custom_bond_dict(atoms: struc.AtomArray, ligand_smiles_dict: Dict[str,
         else:
             custom_bond_dict[res_name] = {}
 
-    # Extract and map ligand topologies safely using element track strings
     for chain_id, smiles in ligand_smiles_dict.items():
         chain_mask = (atoms.chain_id == chain_id)
         res_names = np.unique(atoms.res_name[chain_mask])
@@ -87,7 +81,6 @@ def build_custom_bond_dict(atoms: struc.AtomArray, ligand_smiles_dict: Dict[str,
 def _build_oracle_from_baseline_af3_prediction(
     flat_layout: Any, x_af3_flat_baseline: jnp.ndarray, ligand_smiles_dict: Dict[str, str], ph: float = 7.4
 ) -> Oracle:
-    """Builds a full complex topological oracle from an unguided baseline prediction."""
     logging.info(
         f"Building full-complex Hydride Oracle from Host baseline prediction at pH {ph}..."
     )
@@ -106,13 +99,10 @@ def _build_oracle_from_baseline_af3_prediction(
 
     oracle_atoms = atoms[(atoms.element != "H") & (atoms.element != "D")]
     
-    # Generate the unified bond dictionary containing both protein and ligand topologies
     custom_bonds = build_custom_bond_dict(oracle_atoms, ligand_smiles_dict)
     
-    # Connect natively via residue names to preserve standard CCD templates alongside the custom bonds
     oracle_atoms.bonds = struc.connect_via_residue_names(oracle_atoms, inter_residue=True, custom_bond_dict=custom_bonds)
 
-    # Allocate partial charges
     charges_array = hydride.estimate_amino_acid_charges(oracle_atoms, ph)
     for chain_id, smiles in ligand_smiles_dict.items():
         mol = Chem.MolFromSmiles(smiles)
@@ -137,7 +127,6 @@ def _build_oracle_from_baseline_af3_prediction(
                 
     oracle_atoms.set_annotation("charge", charges_array)
 
-    # Finalize hydrogen append and coordinate relaxations
     oracle_atoms, _ = hydride.add_hydrogen(oracle_atoms)
     oracle_atoms.coord = hydride.relax_hydrogen(oracle_atoms)
     num_oracle_atoms = oracle_atoms.array_length()
@@ -181,17 +170,8 @@ def _hijack_diffusion_with_custom_loss(
     prox_lr: float = 5e-3,
     eta_init: float = 1e-2,
 ) -> Conformations:
-    """Intercepts and steers Host diffusion trajectories using pure implicit hydrogen tracking."""
     oracle_mapping = oracle.mapping
-    
     params = hydride.get_relaxation_params(oracle.atoms)
-    if params is None:
-        raise ValueError("No rotatable bonds found in the structure configuration.")
-
-    # Extract energy parameters for the final loss evaluation
-    pairs, elec_param, eps, r_6, r_12 = params[3], params[4], params[5], params[6], params[7]
-    box, box_inv = params[9], params[10]
-    reduction_indices, reduction_signs, reduction_pair_map = params[11], params[12], params[13]
 
     @functools.partial(jax.jit, inline=False)
     def proximal_operator_fn(x_0_real: jnp.ndarray, t_hat: jnp.ndarray) -> jnp.ndarray:
@@ -203,31 +183,17 @@ def _hijack_diffusion_with_custom_loss(
 
         def step_body(i, r_val):
             def local_loss_fn(R_heavy):
-                # 1. Update the heavy atom coordinates in the full complex array.
-                # The hydrogen coordinates here are irrelevant as they will be 
-                # completely overwritten by the implicit placement kinematics in relax_hydrogen_jit.
                 X_base = oracle_mapping.initial_coordinates.at[oracle_mapping.heavy_indices].set(R_heavy)
 
-                # 2. Run the JIT-compiled steric torsion relaxation loop.
-                # JAX will automatically backpropagate through the NeRF placement 
-                # and torsional iterations directly into R_heavy.
-                X_relaxed, _, _ = hydride.relax_hydrogen_jit(
-                    X_base, *params, iterations=50
-                )
-
-                # 3. Evaluate total potential energies on the fully updated, clash-free complex
-                e_physics = hydride.relax.compute_energy(X_relaxed, pairs, elec_param, eps, r_6, r_12,
-                    box=box, box_inv=box_inv, reduction_indices=reduction_indices,
-                    reduction_signs=reduction_signs, reduction_pair_map=reduction_pair_map)
+                X_relaxed, _, _ = hydride.relax_hydrogen_jit(X_base, *params, iterations=5)
                 
                 e_exp = 0.0
                 if sfc_instance is not None:
-                    e_exp = sfc_instance.compute_loss(X_relaxed)
+                    e_exp = sfc_instance.compute_loss(X_relaxed, t_hat=t_hat)
 
                 restraint = (0.5 / current_eta) * jnp.sum((R_heavy - x_0_heavy_mapped) ** 2)
-                return e_physics + e_exp + restraint
+                return e_exp + restraint
 
-            # Gradient flows back through the placement and relaxation steps directly to r_val
             grads = jax.grad(local_loss_fn)(r_val)
             return r_val - prox_lr * jnp.clip(grads, -1.0, 1.0)
 
@@ -253,9 +219,9 @@ def _assemble_coordinates_from_conformation(
     atom_positions: jnp.ndarray,
     gather_idxs: jnp.ndarray,
     oracle_mapping: OracleMapping,
-    oracle_atoms: Any
+    oracle_atoms: Any,
+    sfc_instance: Optional[SFC] = None
 ) -> jnp.ndarray:
-    """Snaps coordinates back into the crystal's global reference frame via Kabsch alignment."""
     params = hydride.get_relaxation_params(oracle_atoms)
 
     x_af3_flat = atom_positions.reshape((-1, 3))[gather_idxs]
@@ -276,13 +242,50 @@ def _assemble_coordinates_from_conformation(
 
     x_af3_aligned = (x_af3_flat - avg_drift) @ R + avg_ref
     
-    # Build the final assembled Cartesian matrix. 
     X_final = oracle_mapping.initial_coordinates.at[oracle_mapping.heavy_indices].set(x_af3_aligned[oracle_mapping.source_indices])
     
-    # Hydrogen positions are completely reconstructed organically based on the final heavy atom alignment.
-    X_relaxed, _, _ = hydride.relax_hydrogen_jit(
-        X_final, *params, iterations=200
+    if sfc_instance is None:
+        X_relaxed, _, _ = hydride.relax_hydrogen_jit(X_final, *params, iterations=200)
+        return X_relaxed
+
+    pairs, elec_param, eps, r_6, r_12 = params[3], params[4], params[5], params[6], params[7]
+    box, box_inv = params[9], params[10]
+    reduction_indices, reduction_signs, reduction_pair_map = params[11], params[12], params[13]
+
+    @jax.jit
+    def final_refinement_step(carry, i):
+        R_heavy, m, v = carry
+        
+        def loss_fn(R):
+            X_complex = oracle_mapping.initial_coordinates.at[oracle_mapping.heavy_indices].set(R)
+            X_rel, _, _ = hydride.relax_hydrogen_jit(X_complex, *params, iterations=10)
+            
+            e_phys = hydride.relax.compute_energy(X_rel, pairs, elec_param, eps, r_6, r_12, box, box_inv, reduction_indices, reduction_signs, reduction_pair_map)
+            e_exp = sfc_instance.compute_loss(X_rel, t_hat=jnp.array(0.0))
+            
+            return e_exp + 0.05 * e_phys
+            
+        grads = jax.grad(loss_fn)(R_heavy)
+        grads = jnp.clip(grads, -1.0, 1.0)
+        
+        m_next = 0.9 * m + 0.1 * grads
+        v_next = 0.999 * v + 0.001 * (grads ** 2)
+        
+        m_hat = m_next / (1.0 - 0.9 ** (i + 1))
+        v_hat = v_next / (1.0 - 0.999 ** (i + 1))
+        
+        R_next = R_heavy - 5e-3 * m_hat / (jnp.sqrt(v_hat) + 1e-8)
+        return (R_next, m_next, v_next), None
+
+    R_init = X_final[oracle_mapping.heavy_indices]
+    (R_opt, _, _), _ = jax.lax.scan(
+        final_refinement_step, 
+        (R_init, jnp.zeros_like(R_init), jnp.zeros_like(R_init)), 
+        jnp.arange(150)
     )
+    
+    X_refined = oracle_mapping.initial_coordinates.at[oracle_mapping.heavy_indices].set(R_opt)
+    X_relaxed, _, _ = hydride.relax_hydrogen_jit(X_refined, *params, iterations=200)
     return X_relaxed
 
 
@@ -304,6 +307,6 @@ class Hijacker:
         return _hijack_diffusion_with_custom_loss(runner, batch_dict, embeddings, gather_idxs, oracle, sfc, key)
 
     @staticmethod
-    def assemble_coordinates(atom_positions: jnp.ndarray, gather_idxs: jnp.ndarray, oracle: Oracle) -> np.ndarray:
-        complex_coords = _assemble_coordinates_from_conformation(atom_positions, gather_idxs, oracle.mapping, oracle.atoms)
+    def assemble_coordinates(atom_positions: jnp.ndarray, gather_idxs: jnp.ndarray, oracle: Oracle, sfc: Optional[SFC] = None) -> np.ndarray:
+        complex_coords = _assemble_coordinates_from_conformation(atom_positions, gather_idxs, oracle.mapping, oracle.atoms, sfc)
         return np.array(complex_coords)
