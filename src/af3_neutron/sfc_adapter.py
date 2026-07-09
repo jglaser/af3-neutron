@@ -19,24 +19,26 @@ if not hasattr(gemmi.UnitCell, "orthogonalization_matrix"):
 
 class NeutronSFCalculator(SFcalculator):
     """Subclass of SFcalculator that implements a clean, scale-invariant, 
-    JAX-differentiable structure factor amplitude loss.
+    JAX-differentiable structure factor amplitude loss, utilizing the native
+    Calc_Ftotal pipeline and precomputed bulk solvent masks.
     """
-    def compute_loss(self, xyz):
-        self.Calc_Fprotein(xyz)
+    def compute_loss(self, xyz, t_hat=None):
+        # 1. Update the internal Fprotein_HKL using the current diffusion coordinates
+        self.Calc_Fprotein(atoms_position_tensor=xyz)
         
-        f_calc_complex = getattr(self, "Fprotein_HKL", None)
-        if f_calc_complex is None:
-            f_calc_complex = getattr(self, "Fprotein_asu", None)
-            
-        if f_calc_complex is None:
-            available_attrs = [a for a in dir(self) if not a.startswith("__")]
-            raise AttributeError(
-                f"Calc_Fprotein did not populate a valid structure factor attribute. "
-                f"Available attributes: {available_attrs}"
-            )
-            
+        # 2. Use the library's native total structure factor calculation.
+        # CRITICAL: We must explicitly pass kaniso=jnp.zeros(6). If omitted, 
+        # SFC_Jax injects random noise (jax.random.normal) for Aniso-B initialization!
+        f_calc_complex = self.Calc_Ftotal(
+            kall=jnp.array(1.0),
+            kaniso=jnp.zeros(6), 
+            ksol=jnp.array(0.35), 
+            bsol=jnp.array(50.0)
+        )
+        
         f_calc_mag = jnp.abs(f_calc_complex)
         
+        # 3. Safely extract experimental amplitudes
         f_obs_attr = getattr(self, "Fo", None)
         if f_obs_attr is None:
             f_obs_attr = getattr(self, "Fobs", None)
@@ -48,6 +50,7 @@ class NeutronSFCalculator(SFcalculator):
         
         f_obs = jnp.array(f_obs_attr)
         
+        # 4. Enforce Cross-Validation Partitions
         mask_valid = (f_obs > 0.0) & (~jnp.isnan(f_obs))
         mask_free = mask_valid & (self.freer_flags == 0)
         mask_work = mask_valid & (self.freer_flags != 0)
@@ -55,22 +58,22 @@ class NeutronSFCalculator(SFcalculator):
         f_obs = jnp.where(mask_valid, f_obs, 0.0)
         f_calc_mag = jnp.where(mask_valid, f_calc_mag, 0.0)
         
+        # 5. Dynamic Linear Scaling (Evaluated strictly on the Working Set)
         num = jnp.sum(jnp.where(mask_work, f_obs * f_calc_mag, 0.0))
         den = jnp.sum(jnp.where(mask_work, f_calc_mag ** 2, 0.0)) + 1e-8
         scale_factor = num / den
         
+        # 6. Monitor R-Factors
         diff = jnp.abs(f_obs - scale_factor * f_calc_mag)
         r_work = jnp.sum(jnp.where(mask_work, diff, 0.0)) / (jnp.sum(jnp.where(mask_work, f_obs, 0.0)) + 1e-8)
         r_free = jnp.sum(jnp.where(mask_free, diff, 0.0)) / (jnp.sum(jnp.where(mask_free, f_obs, 0.0)) + 1e-8)
         
+        # 7. Normalize Loss to prevent gradient clipping saturation
         residuals_sq = jnp.where(mask_work, (f_obs - scale_factor * f_calc_mag) ** 2, 0.0)
-        
-        # CRITICAL FIX: Normalize loss so gradients don't saturate the clip boundary
         normalization = jnp.sum(jnp.where(mask_work, f_obs ** 2, 0.0)) + 1e-8
         normalized_loss = jnp.sum(residuals_sq) / normalization
         
         return normalized_loss, (r_work, r_free)
-
 
 def init_neutron_sfc(oracle_atoms, mtz_path):
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -121,10 +124,22 @@ def init_neutron_sfc(oracle_atoms, mtz_path):
             mtzfile_dir=working_mtz_path,
             dmin=dmin_val,
             set_experiment=True,
-            mode="neutron",
+            mode="neutron"
         )
+
+        # ==============================================================================
+        # BASELINE SOLVENT INITIALIZATION
+        # Precompute the bulk solvent mask Fmask_HKL once using the unrefined template 
+        # coords so we don't have to rebuild grids during JAX diffusion.
+        # ==============================================================================
+        print("Initializing Baseline Bulk Solvent Mask...", file=sys.stderr)
+        sfc.inspect_data()
+        sfc.Calc_Fprotein(jnp.array(oracle_atoms.coord))
+        sfc.Calc_Fsolvent()
         
-        # Use exact array lookups based on updated SFC_Jax & Gemmi mappings
+        # ==============================================================================
+        # FLAG ALIGNMENT
+        # ==============================================================================
         hk_col = np.array(mtz.column_with_label("H").array, dtype=int)
         kk_col = np.array(mtz.column_with_label("K").array, dtype=int)
         ll_col = np.array(mtz.column_with_label("L").array, dtype=int)
