@@ -2,6 +2,7 @@ import os
 import sys  
 import tempfile
 import numpy as np
+import jax
 import jax.numpy as jnp
 import gemmi  
 from biotite.structure.io import pdb
@@ -9,9 +10,6 @@ from SFC_Jax.Fmodel import SFcalculator
 
 # ==============================================================================
 # MONKEYPATCH FOR GEMMI VERSION CONFLICT (v0.7.0+)
-# SFC_Jax relies on legacy 'fractionalization_matrix' attributes that were 
-# completely removed in recent Gemmi releases. We dynamically inject properties 
-# to route those legacy lookups to the modern 'frac.mat' and 'orth.mat' objects.
 # ==============================================================================
 if not hasattr(gemmi.UnitCell, "fractionalization_matrix"):
     gemmi.UnitCell.fractionalization_matrix = property(lambda self: self.frac.mat)
@@ -20,16 +18,12 @@ if not hasattr(gemmi.UnitCell, "orthogonalization_matrix"):
 # ==============================================================================
 
 class NeutronSFCalculator(SFcalculator):
-    """Subclass of SFcalculator that implements a clean, JAX-differentiable 
-    structure factor amplitude loss directly on global Cartesian coordinates.
+    """Subclass of SFcalculator that implements a clean, scale-invariant, 
+    JAX-differentiable structure factor amplitude loss.
     """
     def compute_loss(self, xyz):
-        # xyz shape: (N, 3) - global Cartesian coordinates from diffusion step
-        
-        # Execute the forward in-place calculation method
         self.Calc_Fprotein(xyz)
         
-        # Use Fprotein_HKL to match the exact shape of the experimental Fo array (37877)
         f_calc_complex = getattr(self, "Fprotein_HKL", None)
         if f_calc_complex is None:
             f_calc_complex = getattr(self, "Fprotein_asu", None)
@@ -37,13 +31,12 @@ class NeutronSFCalculator(SFcalculator):
         if f_calc_complex is None:
             available_attrs = [a for a in dir(self) if not a.startswith("__")]
             raise AttributeError(
-                f"Calc_Fprotein did not populate a valid structure factor attribute "
-                f"('Fprotein_HKL' or 'Fprotein_asu'). Available attributes: {available_attrs}"
+                f"Calc_Fprotein did not populate a valid structure factor attribute. "
+                f"Available attributes: {available_attrs}"
             )
             
         f_calc_mag = jnp.abs(f_calc_complex)
         
-        # Safely extract experimental amplitudes (Fo / Fobs / fo)
         f_obs_attr = getattr(self, "Fo", None)
         if f_obs_attr is None:
             f_obs_attr = getattr(self, "Fobs", None)
@@ -51,51 +44,71 @@ class NeutronSFCalculator(SFcalculator):
             f_obs_attr = getattr(self, "fo", None)
             
         if f_obs_attr is None:
-            raise AttributeError("Could not locate experimental amplitude array (Fo/Fobs) on the calculator instance.")
+            raise AttributeError("Could not locate experimental amplitude array on the calculator instance.")
+        
         f_obs = jnp.array(f_obs_attr)
         
-        # Mask out reflections that do not exist or are missing in the experimental data (<= 0 or NaN)
-        mask = (f_obs > 0.0) & (~jnp.isnan(f_obs))
+        mask_valid = (f_obs > 0.0) & (~jnp.isnan(f_obs))
+        mask_free = mask_valid & (self.freer_flags == 0)
+        mask_work = mask_valid & (self.freer_flags != 0)
         
-        # Conditionally zero out unobserved reflections to ensure pure, safe broadcasting
-        f_obs = jnp.where(mask, f_obs, 0.0)
-        f_calc_mag = jnp.where(mask, f_calc_mag, 0.0)
+        f_obs = jnp.where(mask_valid, f_obs, 0.0)
+        f_calc_mag = jnp.where(mask_valid, f_calc_mag, 0.0)
         
-        # Calculate the analytical scale factor using only the valid masked reflections
-        num = jnp.sum(f_obs * f_calc_mag)
-        den = jnp.sum(jnp.where(mask, f_calc_mag ** 2, 0.0)) + 1e-8
+        num = jnp.sum(jnp.where(mask_work, f_obs * f_calc_mag, 0.0))
+        den = jnp.sum(jnp.where(mask_work, f_calc_mag ** 2, 0.0)) + 1e-8
         scale_factor = num / den
         
-        # Compute the scale-invariant least-squares residual loss exclusively on the masked grid
-        residuals_sq = jnp.where(mask, (f_obs - scale_factor * f_calc_mag) ** 2, 0.0)
+        diff = jnp.abs(f_obs - scale_factor * f_calc_mag)
+        r_work = jnp.sum(jnp.where(mask_work, diff, 0.0)) / (jnp.sum(jnp.where(mask_work, f_obs, 0.0)) + 1e-8)
+        r_free = jnp.sum(jnp.where(mask_free, diff, 0.0)) / (jnp.sum(jnp.where(mask_free, f_obs, 0.0)) + 1e-8)
         
-        return jnp.sum(residuals_sq)
+        residuals_sq = jnp.where(mask_work, (f_obs - scale_factor * f_calc_mag) ** 2, 0.0)
+        
+        # CRITICAL FIX: Normalize loss so gradients don't saturate the clip boundary
+        normalization = jnp.sum(jnp.where(mask_work, f_obs ** 2, 0.0)) + 1e-8
+        normalized_loss = jnp.sum(residuals_sq) / normalization
+        
+        return normalized_loss, (r_work, r_free)
+
 
 def init_neutron_sfc(oracle_atoms, mtz_path):
     with tempfile.TemporaryDirectory() as tmpdir:
         pdb_path = os.path.join(tmpdir, "oracle.pdb")
         pdb_file = pdb.PDBFile()
         
-        # Sanitize residue names to satisfy strict PDB 3-character constraints
         oracle_atoms.res_name = np.array([name[:3] for name in oracle_atoms.res_name])
-        
         pdb.set_structure(pdb_file, oracle_atoms)
         pdb_file.write(pdb_path)
         
-        # Pull unit cell dimensions and space group parameters directly from the MTZ
         mtz = gemmi.read_mtz_file(mtz_path)
+        
+        free_r_col = None
+        for col in mtz.columns:
+            if col.type == 'I' and 'free' in col.label.lower():
+                free_r_col = col.label
+                break
+                
+        working_mtz_path = mtz_path
+        if free_r_col is None:
+            print("No Free-R flags found! Injecting 5% holdout set...", file=sys.stderr)
+            mtz.add_free_r_flags(fraction=0.05)
+            free_r_col = "FreeR_flag"
+            working_mtz_path = os.path.join(tmpdir, "working_data.mtz")
+            mtz.write_to_file(working_mtz_path)
+        else:
+            print(f"Detected existing Free-R flags in column: {free_r_col}", file=sys.stderr)
+        
         cell = mtz.cell
         sg_name = mtz.spacegroup_name
         dmin_val = mtz.resolution_high()
         
-        # Format a valid PDB CRYST1 record line
         cryst1_line = (
             f"CRYST1{cell.a:9.3f}{cell.b:9.3f}{cell.c:9.3f}"
             f"{cell.alpha:7.2f}{cell.beta:7.2f}{cell.gamma:7.2f} "
             f"{sg_name:<11}\n"
         )
         
-        # Prepend the CRYST1 record line into the scratch file
         with open(pdb_path, "r") as f:
             pdb_content = f.read()
         with open(pdb_path, "w") as f:
@@ -103,11 +116,35 @@ def init_neutron_sfc(oracle_atoms, mtz_path):
             
         print(f"Injected Symmetry Header: {cryst1_line.strip()} | Dmin Limit: {dmin_val}A", file=sys.stderr)
             
-        # Initialize our custom wrapped structural calculator enforcing full experimental limits
         sfc = NeutronSFCalculator(
             PDBfile_dir=pdb_path,
-            mtzfile_dir=mtz_path,
+            mtzfile_dir=working_mtz_path,
             dmin=dmin_val,
-            set_experiment=True
+            set_experiment=True,
+            mode="neutron",
         )
+        
+        # Use exact array lookups based on updated SFC_Jax & Gemmi mappings
+        hk_col = np.array(mtz.column_with_label("H").array, dtype=int)
+        kk_col = np.array(mtz.column_with_label("K").array, dtype=int)
+        ll_col = np.array(mtz.column_with_label("L").array, dtype=int)
+        flag_col = np.array(mtz.column_with_label(free_r_col).array, dtype=int)
+        
+        flag_dict = {(h, k, l): f for h, k, l, f in zip(hk_col, kk_col, ll_col, flag_col)}
+        
+        sfc_hkl = getattr(sfc, "HKL_array", None)
+        if sfc_hkl is None:
+            sfc_hkl = getattr(sfc, "Hasu_array", None)
+            
+        aligned_flags = np.zeros(len(sfc_hkl), dtype=int)
+        for i, hkl in enumerate(sfc_hkl):
+            h, k, l = int(hkl[0]), int(hkl[1]), int(hkl[2])
+            aligned_flags[i] = flag_dict.get((h, k, l), 1)
+            
+        sfc.freer_flags = jnp.array(aligned_flags)
+        
+        num_free = np.sum(aligned_flags == 0)
+        num_work = np.sum(aligned_flags != 0)
+        print(f"Cross-Validation Split | Work: {num_work} reflections | Free: {num_free} reflections", file=sys.stderr)
+        
         return sfc

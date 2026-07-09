@@ -22,7 +22,7 @@ requires = ["uv_build<0.12"]
 build-backend = "uv_build"
 
 [tool.uv.sources]
-sfcalculator-jax = { git = "https://github.com/Hekstra-Lab/SFcalculator_jax" }
+sfcalculator-jax = { git = "https://github.com/jglaser/SFcalculator_jax", rev="scattering_table" }
 alphafold3 = { path = "/home/xvg/alphafold3" }
 hydride = { git = "https://github.com/jglaser/hydride-jax", rev="differentiate_heavy_atoms" }
 

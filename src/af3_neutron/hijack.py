@@ -169,6 +169,7 @@ def _hijack_diffusion_with_custom_loss(
     prox_steps: int = 3,
     prox_lr: float = 5e-3,
     eta_init: float = 1e-2,
+    sfc_weight: float = 1000.0,
 ) -> Conformations:
     oracle_mapping = oracle.mapping
     params = hydride.get_relaxation_params(oracle.atoms)
@@ -184,23 +185,30 @@ def _hijack_diffusion_with_custom_loss(
         def step_body(i, r_val):
             def local_loss_fn(R_heavy):
                 X_base = oracle_mapping.initial_coordinates.at[oracle_mapping.heavy_indices].set(R_heavy)
-
                 X_relaxed, _, _ = hydride.relax_hydrogen_jit(X_base, *params, iterations=5)
                 
                 e_exp = 0.0
                 if sfc_instance is not None:
-                    e_exp = sfc_instance.compute_loss(X_relaxed, t_hat=t_hat)
+                    # Ignore the r-factor aux return during gradient computation
+                    e_exp, _ = sfc_instance.compute_loss(X_relaxed)
 
                 restraint = (0.5 / current_eta) * jnp.sum((R_heavy - x_0_heavy_mapped) ** 2)
-                return e_exp + restraint
+                return (sfc_weight * e_exp) + restraint
 
             grads = jax.grad(local_loss_fn)(r_val)
             return r_val - prox_lr * jnp.clip(grads, -1.0, 1.0)
 
         R_current = x_0_heavy_mapped
         R_optimized = jax.lax.fori_loop(0, prox_steps, step_body, R_current)
-        x_af3_updated = x_af3_flat.at[oracle_mapping.source_indices].set(R_optimized)
         
+        # Log final metrics once per timestep outside the gradient loop
+        if sfc_instance is not None:
+            X_final = oracle_mapping.initial_coordinates.at[oracle_mapping.heavy_indices].set(R_optimized)
+            X_rel, _, _ = hydride.relax_hydrogen_jit(X_final, *params, iterations=5)
+            _, (rw, rf) = sfc_instance.compute_loss(X_rel)
+            jax.debug.print("t_hat: {t:.3f} | R_work: {rw:.4f} | R_free: {rf:.4f}", t=t_hat, rw=rw, rf=rf)
+
+        x_af3_updated = x_af3_flat.at[oracle_mapping.source_indices].set(R_optimized)
         return x_0_flat.at[gather_idxs].set(x_af3_updated).reshape(x_0_real.shape)
 
     rng_key = jax.random.PRNGKey(0) if sample_key is None else sample_key
@@ -220,7 +228,8 @@ def _assemble_coordinates_from_conformation(
     gather_idxs: jnp.ndarray,
     oracle_mapping: OracleMapping,
     oracle_atoms: Any,
-    sfc_instance: Optional[SFC] = None
+    sfc_instance: Optional[SFC] = None,
+    sfc_weight: float = 1000.0
 ) -> jnp.ndarray:
     params = hydride.get_relaxation_params(oracle_atoms)
 
@@ -261,9 +270,9 @@ def _assemble_coordinates_from_conformation(
             X_rel, _, _ = hydride.relax_hydrogen_jit(X_complex, *params, iterations=10)
             
             e_phys = hydride.relax.compute_energy(X_rel, pairs, elec_param, eps, r_6, r_12, box, box_inv, reduction_indices, reduction_signs, reduction_pair_map)
-            e_exp = sfc_instance.compute_loss(X_rel, t_hat=jnp.array(0.0))
+            e_exp, _ = sfc_instance.compute_loss(X_rel)
             
-            return e_exp + 0.05 * e_phys
+            return (sfc_weight * e_exp) + (0.05 * e_phys)
             
         grads = jax.grad(loss_fn)(R_heavy)
         grads = jnp.clip(grads, -1.0, 1.0)
@@ -286,6 +295,10 @@ def _assemble_coordinates_from_conformation(
     
     X_refined = oracle_mapping.initial_coordinates.at[oracle_mapping.heavy_indices].set(R_opt)
     X_relaxed, _, _ = hydride.relax_hydrogen_jit(X_refined, *params, iterations=200)
+    
+    _, (rw, rf) = sfc_instance.compute_loss(X_relaxed)
+    jax.debug.print("Final Assembly | R_work: {rw:.4f} | R_free: {rf:.4f}", rw=rw, rf=rf)
+    
     return X_relaxed
 
 
@@ -302,11 +315,12 @@ class Hijacker:
         gather_idxs: jnp.ndarray, 
         oracle: Oracle, 
         sfc: Optional[SFC] = None, 
-        key: Optional[jnp.ndarray] = None
+        key: Optional[jnp.ndarray] = None,
+        sfc_weight: float = 1000.0
     ) -> jnp.ndarray:
-        return _hijack_diffusion_with_custom_loss(runner, batch_dict, embeddings, gather_idxs, oracle, sfc, key)
+        return _hijack_diffusion_with_custom_loss(runner, batch_dict, embeddings, gather_idxs, oracle, sfc, key, sfc_weight=sfc_weight)
 
     @staticmethod
-    def assemble_coordinates(atom_positions: jnp.ndarray, gather_idxs: jnp.ndarray, oracle: Oracle, sfc: Optional[SFC] = None) -> np.ndarray:
-        complex_coords = _assemble_coordinates_from_conformation(atom_positions, gather_idxs, oracle.mapping, oracle.atoms, sfc)
+    def assemble_coordinates(atom_positions: jnp.ndarray, gather_idxs: jnp.ndarray, oracle: Oracle, sfc: Optional[SFC] = None, sfc_weight: float = 1000.0) -> np.ndarray:
+        complex_coords = _assemble_coordinates_from_conformation(atom_positions, gather_idxs, oracle.mapping, oracle.atoms, sfc, sfc_weight)
         return np.array(complex_coords)
