@@ -86,6 +86,7 @@ class NeutronSFCalculator(SFcalculator):
         normalization = jnp.sum(jnp.where(mask_work, f_obs ** 2, 0.0)) + 1e-8
         normalized_loss = jnp.sum(residuals_sq) / normalization
         
+        jax.debug.print("SF mean: {m}", m=jnp.mean(self.fullsf_tensor))
         return normalized_loss, (r_work, r_free)
 
 def align_oracle_to_template_from_json(oracle, json_path):
@@ -188,7 +189,6 @@ def init_neutron_sfc(oracle_atoms, mtz_path, deuterate=False):
             for i in np.where(h_mask)[0]:
                 bonded_indices = sfc_atoms.bonds.get_bonds(i)[0]
                 for neighbor in bonded_indices:
-                    # If bonded to Nitrogen, Oxygen, or Sulfur, it exchanges with D2O
                     if sfc_atoms.element[neighbor] in ["N", "O", "S"]:
                         sfc_atoms.element[i] = "D"
                         sfc_atoms.atom_name[i] = "D" + sfc_atoms.atom_name[i][1:]
@@ -198,27 +198,26 @@ def init_neutron_sfc(oracle_atoms, mtz_path, deuterate=False):
         pdb.set_structure(pdb_file, sfc_atoms)
         pdb_file.write(pdb_path)
         
-        mtz = gemmi.read_mtz_file(mtz_path)
+        # ==============================================================================
+        # FORCE ROBUST FLAGS USING RECIPROCALSPACESHIP
+        # ==============================================================================
+        mtz_rs = rs.read_mtz(mtz_path)
         
-        free_r_col = None
-        for col in mtz.columns:
-            if col.type == 'I' and 'free' in col.label.lower():
-                free_r_col = col.label
-                break
-                
-        working_mtz_path = mtz_path
-        if free_r_col is None:
-            print("No Free-R flags found! Injecting 5% holdout set...", file=sys.stderr)
-            mtz.add_free_r_flags(fraction=0.05)
-            free_r_col = "FreeR_flag"
-            working_mtz_path = os.path.join(tmpdir, "working_data.mtz")
-            mtz.write_to_file(working_mtz_path)
-        else:
-            print(f"Detected existing Free-R flags in column: {free_r_col}", file=sys.stderr)
-            
-        cell = mtz.cell
-        sg_name = mtz.spacegroup_name
-        dmin_val = mtz.resolution_high()
+        print("Forcing robust 5% Free-R holdout set...", file=sys.stderr)
+        
+        # Generate reproducible random flags: 0 for Free (5%), 1 for Work (95%)
+        np.random.seed(42)
+        fresh_flags = np.random.choice([0, 1], size=len(mtz_rs), p=[0.05, 0.95])
+        mtz_rs["FreeR_flag"] = rs.DataSeries(fresh_flags, dtype="I")
+        
+        working_mtz_path = os.path.join(tmpdir, "working_data.mtz")
+        mtz_rs.write_mtz(working_mtz_path)
+        
+        # Read headers safely via Gemmi for the PDB CRYST1 line
+        mtz_gemmi = gemmi.read_mtz_file(mtz_path)
+        cell = mtz_gemmi.cell
+        sg_name = mtz_gemmi.spacegroup_name
+        dmin_val = mtz_gemmi.resolution_high()
         
         cryst1_line = (
             f"CRYST1{cell.a:9.3f}{cell.b:9.3f}{cell.c:9.3f}"
@@ -231,62 +230,31 @@ def init_neutron_sfc(oracle_atoms, mtz_path, deuterate=False):
         with open(pdb_path, "w") as f:
             f.write(cryst1_line + pdb_content)
             
-        print(f"Injected Symmetry Header: {cryst1_line.strip()} | Dmin Limit: {dmin_val}A", file=sys.stderr)
+        print(f"Injected Symmetry Header: {cryst1_line.strip()} | Dmin Limit: {dmin_val:.3f}A", file=sys.stderr)
             
         sfc = NeutronSFCalculator(
             PDBfile_dir=pdb_path,
             mtzfile_dir=working_mtz_path,
             dmin=dmin_val,
             set_experiment=True,
+            freeflag="FreeR_flag",
             mode="neutron"
         )
+        
+        # EXPLICITLY OVERRIDE EXPERIMENTAL DATA
+        sfc.Fo = jnp.array(mtz_rs["FP"].to_numpy(), dtype=jnp.float32)
+        sfc.SigF = jnp.array(mtz_rs["SIGFP"].to_numpy(), dtype=jnp.float32)
+        sfc.freer_mask = jnp.array(fresh_flags == 0, dtype=bool)
 
         print("Initializing Baseline Bulk Solvent Mask...", file=sys.stderr)
         sfc.inspect_data()
         sfc.Calc_Fprotein(jnp.array(sfc_atoms.coord))
-        sfc.Calc_Fsolvent()
         
-        # ==============================================================================
-        # ROBUST FLAG ALIGNMENT (Bypassing SFC_Jax's broken internal parser)
-        # ==============================================================================
-        mtz_rs = rs.read_mtz(working_mtz_path)
+        # CRITICAL: Force Fmask to zero to avoid X-ray solvent artifacts
+        sfc.Fmask_HKL = jnp.zeros_like(sfc.Fprotein_HKL)
         
-        if free_r_col not in mtz_rs.columns:
-            raise ValueError(f"Free-R column '{free_r_col}' not found in MTZ!")
-            
-        rfree_series = mtz_rs[free_r_col]
-        
-        # Safely identify the minority class (Free set) using pandas to handle pd.NA
-        valid_data = rfree_series.dropna().to_numpy()
-        
-        if len(valid_data) > 0:
-            unique, counts = np.unique(valid_data, return_counts=True)
-            free_val = unique[np.argmin(counts)]
-            work_val = unique[np.argmax(counts)]
-        else:
-            free_val, work_val = 0, 1
-            
-        # Fill missing flags (pd.NA) with the working set value, then cast safely
-        flag_array = rfree_series.fillna(work_val).to_numpy()
-        hkls = mtz_rs.get_hkls()
-        
-        flag_dict = {}
-        for h, k, l, f in zip(hkls[:,0], hkls[:,1], hkls[:,2], flag_array):
-            flag_dict[(h, k, l)] = (f == free_val)
-            
-        sfc_hkl = getattr(sfc, "HKL_array", None)
-        if sfc_hkl is None:
-            sfc_hkl = getattr(sfc, "Hasu_array", None)
-            
-        aligned_masks = np.zeros(len(sfc_hkl), dtype=bool)
-        for i, hkl in enumerate(sfc_hkl):
-            h, k, l = int(hkl[0]), int(hkl[1]), int(hkl[2])
-            aligned_masks[i] = flag_dict.get((h, k, l), False)
-            
-        sfc.freer_mask = jnp.array(aligned_masks)
-        
-        num_free = np.sum(aligned_masks)
-        num_work = len(aligned_masks) - num_free
-        print(f"Cross-Validation Split | Work: {num_work} reflections | Free: {num_free} reflections", file=sys.stderr)
+        num_free = int(np.sum(fresh_flags == 0))
+        num_work = len(fresh_flags) - num_free
+        print(f"Cross-Validation Split | Work: {num_work} | Free: {num_free}", file=sys.stderr)
         
         return sfc
