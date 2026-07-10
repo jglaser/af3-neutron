@@ -8,11 +8,11 @@ import gemmi
 import reciprocalspaceship as rs
 from biotite.structure.io import pdb
 from SFC_Jax.Fmodel import SFcalculator, F_protein
-
-import json
 import numpy as np
 import biotite.structure.io.pdbx as pdbx
 import biotite.structure as struc
+
+import json
 
 # ==============================================================================
 # MONKEYPATCH FOR GEMMI VERSION CONFLICT (v0.7.0+)
@@ -239,6 +239,31 @@ def init_neutron_sfc(oracle_atoms, mtz_path):
         for h, k, l, f in zip(hkls[:,0], hkls[:,1], hkls[:,2], flag_array):
             flag_dict[(h, k, l)] = (f == free_val)
             
+        #=======
+        # ROBUST FLAG ALIGNMENT
+        # ==============================================================================
+        hk_col = np.array(mtz.column_with_label("H").array, dtype=int)
+        kk_col = np.array(mtz.column_with_label("K").array, dtype=int)
+        ll_col = np.array(mtz.column_with_label("L").array, dtype=int)
+        
+        # Safely extract and filter NaN flags
+        flag_array = np.array(mtz.column_with_label(free_r_col).array)
+        valid_flags = flag_array[~np.isnan(flag_array)]
+        
+        # Dynamically determine the Free partition value (assumes minority class)
+        if len(valid_flags) > 0:
+            unique, counts = np.unique(valid_flags, return_counts=True)
+            free_val = unique[np.argmin(counts)] 
+        else:
+            free_val = 0
+            
+        flag_dict = {}
+        for h, k, l, f in zip(hk_col, kk_col, ll_col, flag_array):
+            if np.isnan(f):
+                flag_dict[(h, k, l)] = False # Default missing flags to working set
+            else:
+                flag_dict[(h, k, l)] = (f == free_val)
+                
         sfc_hkl = getattr(sfc, "HKL_array", None)
         if sfc_hkl is None:
             sfc_hkl = getattr(sfc, "Hasu_array", None)

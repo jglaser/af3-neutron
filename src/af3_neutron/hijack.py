@@ -184,14 +184,36 @@ def _hijack_diffusion_with_custom_loss(
 
         def step_body(i, r_val):
             def local_loss_fn(R_heavy):
-                X_base = oracle_mapping.initial_coordinates.at[oracle_mapping.heavy_indices].set(R_heavy)
+                # 1. JAX-Differentiable Kabsch Alignment
+                # Maps the moving AF3 coordinates (R_heavy) into the static 
+                # crystal lattice frame so structure factors are evaluated correctly.
+                R_ref = oracle_mapping.initial_coordinates[oracle_mapping.heavy_indices]
+                
+                avg_heavy = jnp.mean(R_heavy, axis=0)
+                avg_ref = jnp.mean(R_ref, axis=0)
+                
+                p = R_heavy - avg_heavy
+                q = R_ref - avg_ref
+                
+                H = jnp.einsum("ni,nj->ij", p, q)
+                U, _, Vt = jnp.linalg.svd(H, full_matrices=False)
+                d = jnp.sign(jnp.linalg.det(U) * jnp.linalg.det(Vt))
+                diag_val = jnp.array([1.0, 1.0, d])
+                R_mat = U @ jnp.diag(diag_val) @ Vt
+                
+                R_aligned = (R_heavy - avg_heavy) @ R_mat + avg_ref
+                
+                # 2. Build the complex using the crystal-aligned heavy atoms
+                X_base = oracle_mapping.initial_coordinates.at[oracle_mapping.heavy_indices].set(R_aligned)
                 X_relaxed, _, _ = hydride.relax_hydrogen_jit(X_base, *params, iterations=5)
                 
                 e_exp = 0.0
                 if sfc_instance is not None:
-                    # Ignore the r-factor aux return during gradient computation
+                    # e_exp gradients will flow backward through X_relaxed, through R_aligned,
+                    # through the Kabsch rotation matrix, and directly into R_heavy.
                     e_exp, _ = sfc_instance.compute_loss(X_relaxed)
 
+                # 3. Restraint is computed in the raw, unaligned AF3 spatial frame
                 restraint = (0.5 / current_eta) * jnp.sum((R_heavy - x_0_heavy_mapped) ** 2)
                 return (sfc_weight * e_exp) + restraint
 
@@ -203,8 +225,20 @@ def _hijack_diffusion_with_custom_loss(
         
         # Log final metrics once per timestep outside the gradient loop
         if sfc_instance is not None:
-            X_final = oracle_mapping.initial_coordinates.at[oracle_mapping.heavy_indices].set(R_optimized)
+            # We must re-align R_optimized one last time purely for accurate terminal logging
+            R_ref = oracle_mapping.initial_coordinates[oracle_mapping.heavy_indices]
+            avg_opt = jnp.mean(R_optimized, axis=0)
+            avg_ref = jnp.mean(R_ref, axis=0)
+            p = R_optimized - avg_opt
+            q = R_ref - avg_ref
+            H = jnp.einsum("ni,nj->ij", p, q)
+            U, _, Vt = jnp.linalg.svd(H, full_matrices=False)
+            R_mat = U @ jnp.diag(jnp.array([1.0, 1.0, jnp.sign(jnp.linalg.det(U) * jnp.linalg.det(Vt))])) @ Vt
+            R_log_aligned = (R_optimized - avg_opt) @ R_mat + avg_ref
+
+            X_final = oracle_mapping.initial_coordinates.at[oracle_mapping.heavy_indices].set(R_log_aligned)
             X_rel, _, _ = hydride.relax_hydrogen_jit(X_final, *params, iterations=5)
+            
             _, (rw, rf) = sfc_instance.compute_loss(X_rel)
             jax.debug.print("t_hat: {t:.3f} | R_work: {rw:.4f} | R_free: {rf:.4f}", t=t_hat, rw=rw, rf=rf)
 
@@ -221,7 +255,6 @@ def _hijack_diffusion_with_custom_loss(
     )
 
     return Conformations(atom_positions=atom_positions)
-
 
 def _assemble_coordinates_from_conformation(
     atom_positions: jnp.ndarray,
