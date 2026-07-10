@@ -11,7 +11,7 @@ class HostEmbeddings:
     single: jnp.ndarray
     target_feat: jnp.ndarray
 
-@dataclasses.dataclass(frozen=True)
+@dataclasses.dataclass
 class OracleMapping:
     """Defines the structural translation coordinates mapping AlphaFold 3 to the physical oracle."""
     num_atoms: int

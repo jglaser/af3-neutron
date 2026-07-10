@@ -17,7 +17,7 @@ from alphafold3.model import feat_batch
 from alphafold3.model.atom_layout import atom_layout
 
 from af3_neutron import make_model_config, HostRunner, Hijacker
-from af3_neutron.sfc_adapter import init_neutron_sfc
+from af3_neutron.sfc_adapter import init_neutron_sfc, align_oracle_to_template_from_json
 
 from jax.experimental.compilation_cache import compilation_cache as cc
 cc.set_cache_dir(os.path.expanduser('./.jax_cache'))
@@ -125,6 +125,8 @@ def main(argv):
         np.array(positions_denoised.reshape((-1, 3))[gather_idxs]),
         ligand_smiles_dict=ligand_smiles_dict
     )
+
+    oracle = align_oracle_to_template_from_json(oracle, FLAGS.json_path)
 
     sfc = init_neutron_sfc(oracle.atoms, FLAGS.mtz_path) if FLAGS.mtz_path else None
     
