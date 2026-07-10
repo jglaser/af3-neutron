@@ -24,7 +24,6 @@ cc.set_cache_dir(os.path.expanduser('./.jax_cache'))
 
 import json
 
-FLAGS = flags.FLAGS
 flags.DEFINE_string(
     "json_path",
     "../forward_model/betalac_tetramer_refinement_input.json",
@@ -36,7 +35,9 @@ flags.DEFINE_string("mtz_path", "", "Optional data path.")
 flags.DEFINE_string("output_path", "neutron_refined_output.cif", "Output path.")
 flags.DEFINE_integer("num_recycles", 10, "Recycles.", lower_bound=1)
 flags.DEFINE_integer("num_diffusion_samples", 5, "Samples.", lower_bound=1)
+flags.DEFINE_bool("deuterate", False, "Simulate H/D exchange (swap H for D on N, O, S) for neutron scattering.")
 
+FLAGS = flags.FLAGS
 
 def main(argv):
     del argv
@@ -123,12 +124,13 @@ def main(argv):
     oracle = Hijacker.build_oracle(
         batch_obj.convert_model_output.flat_output_layout,
         np.array(positions_denoised.reshape((-1, 3))[gather_idxs]),
-        ligand_smiles_dict=ligand_smiles_dict
+        ligand_smiles_dict=ligand_smiles_dict,
+        ph=7.4,
     )
 
     oracle = align_oracle_to_template_from_json(oracle, FLAGS.json_path)
 
-    sfc = init_neutron_sfc(oracle.atoms, FLAGS.mtz_path) if FLAGS.mtz_path else None
+    sfc = init_neutron_sfc(oracle.atoms, FLAGS.mtz_path, deuterate=FLAGS.deuterate) if FLAGS.mtz_path else None
     
     # hijack loop using the generalized proximal-based implementation
     conformations = Hijacker.hijack_diffusion(
@@ -151,6 +153,16 @@ def main(argv):
     # hydride append hydrogen to array end, sort by chain and res for viz of ss
     contiguous_indices = np.lexsort((oracle.atoms.res_id, oracle.atoms.chain_id))
     oracle.atoms = oracle.atoms[contiguous_indices]
+
+    if FLAGS.deuterate:
+        h_mask = (oracle.atoms.element == "H")
+        for i in np.where(h_mask)[0]:
+            bonded_indices = oracle.atoms.bonds.get_bonds(i)[0]
+            for neighbor in bonded_indices:
+                if oracle.atoms.element[neighbor] in ["N", "O", "S"]:
+                    oracle.atoms.element[i] = "D"
+                    oracle.atoms.atom_name[i] = "D" + oracle.atoms.atom_name[i][1:]
+                    break
 
     output_path = pathlib.Path(FLAGS.output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)

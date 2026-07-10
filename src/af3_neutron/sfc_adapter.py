@@ -1,18 +1,17 @@
 import os
 import sys  
+import json
 import tempfile
+import dataclasses
 import numpy as np
 import jax
 import jax.numpy as jnp
 import gemmi  
 import reciprocalspaceship as rs
 from biotite.structure.io import pdb
-from SFC_Jax.Fmodel import SFcalculator, F_protein
-import numpy as np
 import biotite.structure.io.pdbx as pdbx
 import biotite.structure as struc
-
-import json
+from SFC_Jax.Fmodel import SFcalculator, F_protein
 
 # ==============================================================================
 # MONKEYPATCH FOR GEMMI VERSION CONFLICT (v0.7.0+)
@@ -23,66 +22,6 @@ if not hasattr(gemmi.UnitCell, "orthogonalization_matrix"):
     gemmi.UnitCell.orthogonalization_matrix = property(lambda self: self.orth.mat)
 # ==============================================================================
 
-def align_oracle_to_template_from_json(oracle, json_path):
-    """
-    Parses the AF3 input JSON, extracts the template mmCIF path, and aligns
-    the unanchored AF3 oracle coordinates to the absolute crystal lattice frame.
-    """
-    with open(json_path, 'r') as f:
-        af3_input = json.load(f)
-
-    template_cif_path = None
-
-    # Traverse the AF3 JSON schema to locate the first available template
-    for seq in af3_input.get("sequences", []):
-        if "protein" in seq and "templates" in seq["protein"]:
-            templates = seq["protein"]["templates"]
-            if templates and "mmcifPath" in templates[0]:
-                template_cif_path = templates[0]["mmcifPath"]
-                break
-
-    if template_cif_path is None:
-        print("WARNING: No template mmcifPath found in JSON. Skipping lattice alignment.", file=sys.stderr)
-        return oracle
-
-    # Resolve the template path relative to the JSON file's directory
-    json_dir = os.path.dirname(os.path.abspath(json_path))
-    full_template_path = os.path.join(json_dir, template_cif_path)
-
-    if not os.path.exists(full_template_path):
-        print(f"WARNING: Template file '{full_template_path}' not found. Skipping lattice alignment.", file=sys.stderr)
-        return oracle
-
-    print(f"Aligning Oracle coordinates to crystal template: {template_cif_path}", file=sys.stderr)
-    template_file = pdbx.CIFFile.read(full_template_path)
-    template_atoms = pdbx.get_structure(template_file, model=1)
-
-    # Filter for CA atoms to establish the rigid body rotation matrix
-    temp_ca = template_atoms[template_atoms.atom_name == "CA"]
-    oracle_ca = oracle.atoms[oracle.atoms.atom_name == "CA"]
-
-    # Ensure sizes match by intersecting residue IDs
-    # (Safely handles missing terminal residues in the template)
-    common_res = np.intersect1d(temp_ca.res_id, oracle_ca.res_id)
-    temp_ca_common = temp_ca[np.isin(temp_ca.res_id, common_res)]
-    oracle_ca_common = oracle_ca[np.isin(oracle_ca.res_id, common_res)]
-
-    if len(common_res) < 3:
-        print("WARNING: Not enough common CA atoms for Kabsch alignment. Skipping.", file=sys.stderr)
-        return oracle
-
-    # Biotite's superimpose returns the fitted coordinates and the AffineTransformation object
-    _, transform = struc.superimpose(temp_ca_common.coord, oracle_ca_common.coord)
-
-    # Apply the AffineTransformation object directly to the coordinates
-    aligned_coords = transform.apply(oracle.atoms.coord)
-    oracle.atoms.coord = aligned_coords
-
-    # CRITICAL: Update the JAX mapping coordinates so the diffusion target is aligned
-    oracle.mapping.initial_coordinates = jnp.array(aligned_coords, dtype=jnp.float32)
-
-    return oracle
-
 class NeutronSFCalculator(SFcalculator):
     """Subclass of SFcalculator that implements a clean, scale-invariant, 
     JAX-differentiable structure factor amplitude loss, utilizing a pure
@@ -90,7 +29,7 @@ class NeutronSFCalculator(SFcalculator):
     """
     def compute_loss(self, xyz, t_hat=None):
         # 1. PURE JAX COMPUTATION: Completely bypass self.Calc_Fprotein 
-        # to prevent state-mutation bugs inside JAX fori_loops[cite: 4].
+        # to prevent state-mutation bugs inside JAX fori_loops.
         atom_pos_frac = jnp.tensordot(xyz, self.orth2frac_tensor.T, 1)
         
         f_calc_protein_asu = F_protein(
@@ -149,18 +88,114 @@ class NeutronSFCalculator(SFcalculator):
         
         return normalized_loss, (r_work, r_free)
 
+def align_oracle_to_template_from_json(oracle, json_path):
+    """
+    Parses the AF3 input JSON, extracts the template mmCIF path, and aligns
+    the unanchored AF3 oracle coordinates to the absolute crystal lattice frame.
+    """
+    with open(json_path, 'r') as f:
+        af3_input = json.load(f)
 
-def init_neutron_sfc(oracle_atoms, mtz_path):
+    template_cif_path = None
+
+    # Traverse the AF3 JSON schema to locate the first available template
+    for seq in af3_input.get("sequences", []):
+        if "protein" in seq and "templates" in seq["protein"]:
+            templates = seq["protein"]["templates"]
+            if templates and "mmcifPath" in templates[0]:
+                template_cif_path = templates[0]["mmcifPath"]
+                break
+
+    if template_cif_path is None:
+        print("WARNING: No template mmcifPath found in JSON. Skipping lattice alignment.", file=sys.stderr)
+        return oracle
+
+    # Resolve the template path relative to the JSON file's directory
+    json_dir = os.path.dirname(os.path.abspath(json_path))
+    full_template_path = os.path.join(json_dir, template_cif_path)
+
+    if not os.path.exists(full_template_path):
+        print(f"WARNING: Template file '{full_template_path}' not found. Skipping lattice alignment.", file=sys.stderr)
+        return oracle
+
+    template_file = pdbx.CIFFile.read(full_template_path)
+
+    # Safely attempt to parse altloc_id if the CIF file contains it
+    try:
+        template_atoms = pdbx.get_structure(template_file, model=1, extra_fields=["altloc_id"])
+        has_altloc = True
+    except KeyError:
+        template_atoms = pdbx.get_structure(template_file, model=1)
+        has_altloc = False
+
+    # Filter for CA atoms
+    ca_mask = (template_atoms.atom_name == "CA")
+
+    # Safely avoid alternate locations if the template file specifies them
+    if has_altloc and "altloc_id" in template_atoms.get_annotation_categories():
+        altloc_mask = (template_atoms.altloc_id == "") | (template_atoms.altloc_id == ".") | (template_atoms.altloc_id == "A")
+        ca_mask = ca_mask & altloc_mask
+
+    temp_ca = template_atoms[ca_mask]
+    oracle_ca = oracle.atoms[oracle.atoms.atom_name == "CA"]
+
+    # Because PDB residue IDs often do not match AF3 1-indexed IDs,
+    # we pair the CA atoms sequentially.
+    min_len = min(len(temp_ca), len(oracle_ca))
+
+    if min_len < 10:
+        print("WARNING: Not enough CA atoms for Kabsch alignment. Skipping.", file=sys.stderr)
+        return oracle
+
+    matched_temp = temp_ca.coord[:min_len]
+    matched_oracle = oracle_ca.coord[:min_len]
+
+    # Biotite's superimpose returns the fitted coordinates and the AffineTransformation object
+    fitted_coords, transform = struc.superimpose(matched_temp, matched_oracle)
+    rmsd = struc.rmsd(matched_temp, fitted_coords)
+
+    # Apply the AffineTransformation directly to the mobile Oracle coordinates
+    aligned_coords = transform.apply(oracle.atoms.coord)
+    oracle.atoms.coord = aligned_coords
+
+    # Safely replace the frozen dataclass field so the JAX diffusion target is updated
+    oracle.mapping = dataclasses.replace(
+        oracle.mapping,
+        initial_coordinates=jnp.array(aligned_coords, dtype=jnp.float32)
+    )
+
+    print(f"Aligned Oracle to crystal template: {template_cif_path} (CA RMSD: {rmsd:.3f}A)", file=sys.stderr)
+    return oracle
+
+def init_neutron_sfc(oracle_atoms, mtz_path, deuterate=False):
     with tempfile.TemporaryDirectory() as tmpdir:
         pdb_path = os.path.join(tmpdir, "oracle.pdb")
         pdb_file = pdb.PDBFile()
         
-        # Enforce realistic B-factors to prevent high-resolution noise amplification
-        b_factors = np.full(oracle_atoms.array_length(), 30.0, dtype=np.float32)
-        oracle_atoms.set_annotation("b_factor", b_factors)
+        # Clone oracle atoms so Hydride's internal "H" reliance isn't broken
+        sfc_atoms = oracle_atoms.copy()
         
-        oracle_atoms.res_name = np.array([name[:3] for name in oracle_atoms.res_name])
-        pdb.set_structure(pdb_file, oracle_atoms)
+        # Enforce realistic B-factors to prevent high-resolution noise amplification
+        b_factors = np.full(sfc_atoms.array_length(), 30.0, dtype=np.float32)
+        sfc_atoms.set_annotation("b_factor", b_factors)
+        
+        # ==============================================================================
+        # SIMULATE H/D EXCHANGE STRICTLY FOR SFC MAP EVALUATION
+        # ==============================================================================
+        if deuterate:
+            print("Simulating D2O H/D exchange for structure factor evaluation...", file=sys.stderr)
+            h_mask = (sfc_atoms.element == "H")
+            for i in np.where(h_mask)[0]:
+                bonded_indices = sfc_atoms.bonds.get_bonds(i)[0]
+                for neighbor in bonded_indices:
+                    # If bonded to Nitrogen, Oxygen, or Sulfur, it exchanges with D2O
+                    if sfc_atoms.element[neighbor] in ["N", "O", "S"]:
+                        sfc_atoms.element[i] = "D"
+                        sfc_atoms.atom_name[i] = "D" + sfc_atoms.atom_name[i][1:]
+                        break
+        
+        sfc_atoms.res_name = np.array([name[:3] for name in sfc_atoms.res_name])
+        pdb.set_structure(pdb_file, sfc_atoms)
         pdb_file.write(pdb_path)
         
         mtz = gemmi.read_mtz_file(mtz_path)
@@ -208,7 +243,7 @@ def init_neutron_sfc(oracle_atoms, mtz_path):
 
         print("Initializing Baseline Bulk Solvent Mask...", file=sys.stderr)
         sfc.inspect_data()
-        sfc.Calc_Fprotein(jnp.array(oracle_atoms.coord))
+        sfc.Calc_Fprotein(jnp.array(sfc_atoms.coord))
         sfc.Calc_Fsolvent()
         
         # ==============================================================================
@@ -239,31 +274,6 @@ def init_neutron_sfc(oracle_atoms, mtz_path):
         for h, k, l, f in zip(hkls[:,0], hkls[:,1], hkls[:,2], flag_array):
             flag_dict[(h, k, l)] = (f == free_val)
             
-        #=======
-        # ROBUST FLAG ALIGNMENT
-        # ==============================================================================
-        hk_col = np.array(mtz.column_with_label("H").array, dtype=int)
-        kk_col = np.array(mtz.column_with_label("K").array, dtype=int)
-        ll_col = np.array(mtz.column_with_label("L").array, dtype=int)
-        
-        # Safely extract and filter NaN flags
-        flag_array = np.array(mtz.column_with_label(free_r_col).array)
-        valid_flags = flag_array[~np.isnan(flag_array)]
-        
-        # Dynamically determine the Free partition value (assumes minority class)
-        if len(valid_flags) > 0:
-            unique, counts = np.unique(valid_flags, return_counts=True)
-            free_val = unique[np.argmin(counts)] 
-        else:
-            free_val = 0
-            
-        flag_dict = {}
-        for h, k, l, f in zip(hk_col, kk_col, ll_col, flag_array):
-            if np.isnan(f):
-                flag_dict[(h, k, l)] = False # Default missing flags to working set
-            else:
-                flag_dict[(h, k, l)] = (f == free_val)
-                
         sfc_hkl = getattr(sfc, "HKL_array", None)
         if sfc_hkl is None:
             sfc_hkl = getattr(sfc, "Hasu_array", None)
