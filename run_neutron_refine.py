@@ -17,7 +17,7 @@ from alphafold3.model import feat_batch
 from alphafold3.model.atom_layout import atom_layout
 
 from af3_neutron import make_model_config, HostRunner, Hijacker
-from af3_neutron.sfc_adapter import init_neutron_sfc, align_oracle_to_template_from_json
+from af3_neutron.sfc_adapter import init_neutron_sfc, align_oracle_to_reference
 
 from jax.experimental.compilation_cache import compilation_cache as cc
 cc.set_cache_dir(os.path.expanduser('./.jax_cache'))
@@ -36,6 +36,7 @@ flags.DEFINE_string("output_path", "neutron_refined_output.cif", "Output path.")
 flags.DEFINE_integer("num_recycles", 10, "Recycles.", lower_bound=1)
 flags.DEFINE_integer("num_diffusion_samples", 5, "Samples.", lower_bound=1)
 flags.DEFINE_bool("deuterate", False, "Simulate H/D exchange (swap H for D on N, O, S) for neutron scattering.")
+flags.DEFINE_string("reference_cif", None, "Path to the explicit crystal structure (e.g., 4BD1.cif) to align the AF3 model into the correct unit cell frame.")
 
 FLAGS = flags.FLAGS
 
@@ -128,7 +129,11 @@ def main(argv):
         ph=7.4,
     )
 
-    oracle = align_oracle_to_template_from_json(oracle, FLAGS.json_path)
+    # Use explicit reference alignment if provided
+    if FLAGS.reference_cif:
+        oracle = align_oracle_to_reference(oracle, FLAGS.reference_cif)
+    else:
+        logging.warning("No --reference_cif provided. The model will remain at the AF3 origin, which may cause high R-factors.")
 
     sfc = init_neutron_sfc(oracle.atoms, FLAGS.mtz_path, deuterate=FLAGS.deuterate) if FLAGS.mtz_path else None
     

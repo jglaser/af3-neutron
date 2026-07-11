@@ -28,8 +28,7 @@ class NeutronSFCalculator(SFcalculator):
     functional pipeline to guarantee gradient tracking inside XLA loops.
     """
     def compute_loss(self, xyz, t_hat=None):
-        # 1. PURE JAX COMPUTATION: Completely bypass self.Calc_Fprotein 
-        # to prevent state-mutation bugs inside JAX fori_loops.
+        # 1. PURE JAX COMPUTATION
         atom_pos_frac = jnp.tensordot(xyz, self.orth2frac_tensor.T, 1)
         
         f_calc_protein_asu = F_protein(
@@ -47,10 +46,9 @@ class NeutronSFCalculator(SFcalculator):
         
         f_calc_protein = f_calc_protein_asu[self.asu2HKL_index]
         
-        # 2. Add Bulk Solvent Mask
-        dr2_tensor = jnp.array(self.dr2HKL_array)
-        scaled_fmask = 0.35 * self.Fmask_HKL * jnp.exp(-50.0 * dr2_tensor / 4.0)
-        
+        # 2. Disable Bulk Solvent Mask
+        # We zero this out because unrefined D2O envelopes corrupt the gradients.
+        scaled_fmask = 0.0
         f_calc_complex = f_calc_protein + scaled_fmask
         f_calc_mag = jnp.abs(f_calc_complex)
         
@@ -63,15 +61,22 @@ class NeutronSFCalculator(SFcalculator):
             
         f_obs = jnp.array(f_obs_attr)
         
-        # 4. Enforce Cross-Validation Partitions safely via precomputed mask
-        mask_valid = (f_obs > 0.0) & (~jnp.isnan(f_obs))
+        # 4. Enforce Cross-Validation & Resolution Partitions
+        dr2_tensor = jnp.array(self.dr2HKL_array)
+        
+        # CRITICAL: Exclude low-res reflections (d > 5.0 A) which are dominated by 
+        # the missing D2O solvent. (1 / 5.0^2 = 0.04)
+        high_res_mask = (dr2_tensor > 0.04)
+        
+        mask_valid = (f_obs > 0.0) & (~jnp.isnan(f_obs)) & high_res_mask
+        
         mask_free = mask_valid & self.freer_mask
         mask_work = mask_valid & (~self.freer_mask)
         
         f_obs = jnp.where(mask_valid, f_obs, 0.0)
         f_calc_mag = jnp.where(mask_valid, f_calc_mag, 0.0)
         
-        # 5. Dynamic Linear Scaling (Evaluated strictly on the Working Set)
+        # 5. Dynamic Linear Scaling
         num = jnp.sum(jnp.where(mask_work, f_obs * f_calc_mag, 0.0))
         den = jnp.sum(jnp.where(mask_work, f_calc_mag ** 2, 0.0)) + 1e-8
         scale_factor = num / den
@@ -81,92 +86,76 @@ class NeutronSFCalculator(SFcalculator):
         r_work = jnp.sum(jnp.where(mask_work, diff, 0.0)) / (jnp.sum(jnp.where(mask_work, f_obs, 0.0)) + 1e-8)
         r_free = jnp.sum(jnp.where(mask_free, diff, 0.0)) / (jnp.sum(jnp.where(mask_free, f_obs, 0.0)) + 1e-8)
         
-        # 7. Normalize Loss to prevent gradient clipping saturation
+        # 7. Normalize Loss
         residuals_sq = jnp.where(mask_work, (f_obs - scale_factor * f_calc_mag) ** 2, 0.0)
         normalization = jnp.sum(jnp.where(mask_work, f_obs ** 2, 0.0)) + 1e-8
         normalized_loss = jnp.sum(residuals_sq) / normalization
         
-        jax.debug.print("SF mean: {m}", m=jnp.mean(self.fullsf_tensor))
         return normalized_loss, (r_work, r_free)
 
-def align_oracle_to_template_from_json(oracle, json_path):
+def align_oracle_to_reference(oracle, reference_path):
     """
-    Parses the AF3 input JSON, extracts the template mmCIF path, and aligns
-    the unanchored AF3 oracle coordinates to the absolute crystal lattice frame.
+    Aligns the unanchored AF3 oracle coordinates to an explicit absolute crystal 
+    lattice frame (e.g., the exact deposited neutron structure) rather than the AF3 template.
     """
-    with open(json_path, 'r') as f:
-        af3_input = json.load(f)
-
-    template_cif_path = None
-
-    # Traverse the AF3 JSON schema to locate the first available template
-    for seq in af3_input.get("sequences", []):
-        if "protein" in seq and "templates" in seq["protein"]:
-            templates = seq["protein"]["templates"]
-            if templates and "mmcifPath" in templates[0]:
-                template_cif_path = templates[0]["mmcifPath"]
-                break
-
-    if template_cif_path is None:
-        print("WARNING: No template mmcifPath found in JSON. Skipping lattice alignment.", file=sys.stderr)
+    if not os.path.exists(reference_path):
+        print(f"WARNING: Reference file '{reference_path}' not found. Skipping lattice alignment.", file=sys.stderr)
         return oracle
 
-    # Resolve the template path relative to the JSON file's directory
-    json_dir = os.path.dirname(os.path.abspath(json_path))
-    full_template_path = os.path.join(json_dir, template_cif_path)
-
-    if not os.path.exists(full_template_path):
-        print(f"WARNING: Template file '{full_template_path}' not found. Skipping lattice alignment.", file=sys.stderr)
-        return oracle
-
-    template_file = pdbx.CIFFile.read(full_template_path)
-
-    # Safely attempt to parse altloc_id if the CIF file contains it
-    try:
-        template_atoms = pdbx.get_structure(template_file, model=1, extra_fields=["altloc_id"])
-        has_altloc = True
-    except KeyError:
-        template_atoms = pdbx.get_structure(template_file, model=1)
-        has_altloc = False
+    print(f"Aligning Oracle coordinates to explicit crystal reference: {reference_path}", file=sys.stderr)
+    
+    # Handle both CIF and PDB reference files
+    if reference_path.endswith('.cif') or reference_path.endswith('.mmcif'):
+        ref_file = pdbx.CIFFile.read(reference_path)
+        try:
+            ref_atoms = pdbx.get_structure(ref_file, model=1, extra_fields=["altloc_id"])
+            has_altloc = True
+        except KeyError:
+            ref_atoms = pdbx.get_structure(ref_file, model=1)
+            has_altloc = False
+    else:
+        ref_file = pdb.PDBFile.read(reference_path)
+        ref_atoms = pdb.get_structure(ref_file, model=1)
+        has_altloc = "altloc_id" in ref_atoms.get_annotation_categories()
 
     # Filter for CA atoms
-    ca_mask = (template_atoms.atom_name == "CA")
-
-    # Safely avoid alternate locations if the template file specifies them
-    if has_altloc and "altloc_id" in template_atoms.get_annotation_categories():
-        altloc_mask = (template_atoms.altloc_id == "") | (template_atoms.altloc_id == ".") | (template_atoms.altloc_id == "A")
+    ca_mask = (ref_atoms.atom_name == "CA")
+    
+    # Safely avoid alternate locations if present
+    if has_altloc:
+        altloc_mask = (ref_atoms.altloc_id == "") | (ref_atoms.altloc_id == ".") | (ref_atoms.altloc_id == "A")
         ca_mask = ca_mask & altloc_mask
-
-    temp_ca = template_atoms[ca_mask]
+        
+    ref_ca = ref_atoms[ca_mask]
     oracle_ca = oracle.atoms[oracle.atoms.atom_name == "CA"]
-
-    # Because PDB residue IDs often do not match AF3 1-indexed IDs,
-    # we pair the CA atoms sequentially.
-    min_len = min(len(temp_ca), len(oracle_ca))
-
+    
+    # Pair CA atoms sequentially (ignores mismatched residue numbering)
+    min_len = min(len(ref_ca), len(oracle_ca))
+    
     if min_len < 10:
         print("WARNING: Not enough CA atoms for Kabsch alignment. Skipping.", file=sys.stderr)
         return oracle
-
-    matched_temp = temp_ca.coord[:min_len]
+        
+    matched_ref = ref_ca.coord[:min_len]
     matched_oracle = oracle_ca.coord[:min_len]
-
+    
     # Biotite's superimpose returns the fitted coordinates and the AffineTransformation object
-    fitted_coords, transform = struc.superimpose(matched_temp, matched_oracle)
-    rmsd = struc.rmsd(matched_temp, fitted_coords)
-
+    fitted_coords, transform = struc.superimpose(matched_ref, matched_oracle)
+    rmsd = struc.rmsd(matched_ref, fitted_coords)
+    
     # Apply the AffineTransformation directly to the mobile Oracle coordinates
     aligned_coords = transform.apply(oracle.atoms.coord)
     oracle.atoms.coord = aligned_coords
-
-    # Safely replace the frozen dataclass field so the JAX diffusion target is updated
+    
+    # Update the JAX mapping coordinates so the diffusion target is aligned
     oracle.mapping = dataclasses.replace(
-        oracle.mapping,
+        oracle.mapping, 
         initial_coordinates=jnp.array(aligned_coords, dtype=jnp.float32)
     )
-
-    print(f"Aligned Oracle to crystal template: {template_cif_path} (CA RMSD: {rmsd:.3f}A)", file=sys.stderr)
+    
+    print(f"Successfully aligned Oracle to reference. (CA RMSD: {rmsd:.3f}A)", file=sys.stderr)
     return oracle
+
 
 def init_neutron_sfc(oracle_atoms, mtz_path, deuterate=False):
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -250,8 +239,9 @@ def init_neutron_sfc(oracle_atoms, mtz_path, deuterate=False):
         sfc.inspect_data()
         sfc.Calc_Fprotein(jnp.array(sfc_atoms.coord))
         
-        # CRITICAL: Force Fmask to zero to avoid X-ray solvent artifacts
-        sfc.Fmask_HKL = jnp.zeros_like(sfc.Fprotein_HKL)
+        # Generate the solvent mask grid dynamically
+        sfc.Calc_Fsolvent()
+        sfc.deuterated_solvent = deuterate
         
         num_free = int(np.sum(fresh_flags == 0))
         num_work = len(fresh_flags) - num_free
