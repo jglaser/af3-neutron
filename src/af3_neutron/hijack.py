@@ -169,7 +169,7 @@ def _hijack_diffusion_with_custom_loss(
     prox_steps: int = 3,
     prox_lr: float = 5e-3,
     eta_init: float = 1e-2,
-    sfc_weight: float = 1000.0,
+    sfc_weight: float = 500.0,
 ) -> Conformations:
     oracle_mapping = oracle.mapping
     params = hydride.get_relaxation_params(oracle.atoms)
@@ -182,7 +182,7 @@ def _hijack_diffusion_with_custom_loss(
         x_af3_flat = x_0_flat[gather_idxs]
         x_0_heavy_mapped = x_af3_flat[oracle_mapping.source_indices]
 
-        def step_body(i, r_val):
+        def step_body(i, r_current):
             def local_loss_fn(R_heavy):
                 # 1. JAX-Differentiable Kabsch Alignment
                 # Maps the moving AF3 coordinates (R_heavy) into the static 
@@ -217,8 +217,32 @@ def _hijack_diffusion_with_custom_loss(
                 restraint = (0.5 / current_eta) * jnp.sum((R_heavy - x_0_heavy_mapped) ** 2)
                 return (sfc_weight * e_exp) + restraint
 
-            grads = jax.grad(local_loss_fn)(r_val)
-            return r_val - prox_lr * jnp.clip(grads, -1.0, 1.0)
+            # 1. Calculate raw gradients
+            grads = jax.grad(local_loss_fn)(r_current)
+            
+            # 2. Scale-Invariant Gradients
+            N_atoms = r_current.shape[0]
+            scaled_grads = grads * N_atoms
+            
+            # 3. Natural Learning Rate
+            lr = sfc_weight * jnp.sqrt(t_hat) * 0.01
+            raw_step = scaled_grads * lr
+            
+            # 4. ATOM-WISE SPEED LIMIT
+            max_allowed_step = 0.05
+            
+            # Calculate the norm for EACH atom independently (keepdims=True is critical for broadcasting)
+            atom_step_norms = jnp.linalg.norm(raw_step, axis=-1, keepdims=True) + 1e-8
+            
+            # If an atom wants to move > 0.05, slow IT down. If it wants to move < 0.05, leave IT alone.
+            clip_factor = jnp.where(atom_step_norms > max_allowed_step, 
+                                    max_allowed_step / atom_step_norms, 
+                                    1.0)
+            
+            # 5. Apply the safe, organic step
+            r_next = r_current - (raw_step * clip_factor)
+            
+            return r_next
 
         R_current = x_0_heavy_mapped
         R_optimized = jax.lax.fori_loop(0, prox_steps, step_body, R_current)
