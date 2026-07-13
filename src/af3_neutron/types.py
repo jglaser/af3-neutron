@@ -18,6 +18,7 @@ class OracleMapping:
     heavy_indices: jnp.ndarray
     source_indices: jnp.ndarray
     initial_coordinates: jnp.ndarray
+    hydrogen_to_heavy_map: jnp.ndarray
 
 @dataclasses.dataclass
 class Oracle:

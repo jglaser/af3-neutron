@@ -131,6 +131,18 @@ def _build_oracle_from_baseline_af3_prediction(
     oracle_atoms.coord = hydride.relax_hydrogen(oracle_atoms)
     num_oracle_atoms = oracle_atoms.array_length()
 
+    is_heavy = (oracle_atoms.element != "H") & (oracle_atoms.element != "D")
+    parent_map = np.arange(num_oracle_atoms)
+    bonds = oracle_atoms.bonds.as_array()
+
+    for i in range(bonds.shape[0]):
+        a1, a2, _ = bonds[i]
+        # Map H to Heavy
+        if not is_heavy[a1] and is_heavy[a2]:
+            parent_map[a1] = a2
+        elif not is_heavy[a2] and is_heavy[a1]:
+            parent_map[a2] = a1
+
     af3_lookup = {
         (flat_layout.chain_id[i], flat_layout.res_id[i], flat_layout.atom_name[i]): i
         for i in range(num_atoms)
@@ -152,7 +164,8 @@ def _build_oracle_from_baseline_af3_prediction(
             num_atoms=num_oracle_atoms,
             heavy_indices=jnp.array(oracle_heavy_indices, dtype=jnp.int32),
             source_indices=jnp.array(af3_source_indices, dtype=jnp.int32),
-            initial_coordinates=jnp.array(oracle_atoms.coord, dtype=jnp.float32)
+            initial_coordinates=jnp.array(oracle_atoms.coord, dtype=jnp.float32),
+            hydrogen_to_heavy_map=jnp.array(parent_map, dtype=jnp.int32)
         ),
         atoms=oracle_atoms,
     )

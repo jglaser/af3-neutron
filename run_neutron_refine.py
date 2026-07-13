@@ -124,7 +124,7 @@ def main(argv):
         arr=confidence_dict['predicted_lddt'],
         layout_axes=(-2, -1),  # Mapping residue dim to atom dim
     )
-    plddt_gathered = np.array(plddt_per_atom.reshape(-1))
+    plddt_heavy_only = np.array(plddt_per_atom.reshape(-1))
     # ==============================================================================
 
     logging.info("Parsing ligand SMILES definitions from input JSON...")
@@ -156,10 +156,13 @@ def main(argv):
 
     # Inject the gathered pLDDT values into the heavy atom indices
     # oracle.mapping.heavy_indices holds the correct indices for heavy atoms
-    full_b_factors[oracle.mapping.heavy_indices] = plddt_gathered
+    full_b_factors[oracle.mapping.heavy_indices] = plddt_heavy_only
+
+    # Use the precomputed map to broadcast B-factors to Hydrogens
+    final_b_factors = full_b_factors[np.array(oracle.mapping.hydrogen_to_heavy_map)]
 
     #  Apply to the oracle
-    oracle.atoms.set_annotation("b_factor", full_b_factors)
+    oracle.atoms.set_annotation("b_factor", final_b_factors)
 
     # Use explicit reference alignment if provided
     if FLAGS.reference_cif:
