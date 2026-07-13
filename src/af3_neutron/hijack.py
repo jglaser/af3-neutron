@@ -183,10 +183,11 @@ def _hijack_diffusion_with_custom_loss(
         x_0_heavy_mapped = x_af3_flat[oracle_mapping.source_indices]
 
         def step_body(i, r_current):
+            # Extract pLDDT from the oracle's raw B-factor column
+            plddt_heavy = jnp.array(oracle.atoms.b_factor[oracle_mapping.heavy_indices], dtype=jnp.float32)
+
             def local_loss_fn(R_heavy):
                 # 1. JAX-Differentiable Kabsch Alignment
-                # Maps the moving AF3 coordinates (R_heavy) into the static 
-                # crystal lattice frame so structure factors are evaluated correctly.
                 R_ref = oracle_mapping.initial_coordinates[oracle_mapping.heavy_indices]
                 
                 avg_heavy = jnp.mean(R_heavy, axis=0)
@@ -198,24 +199,35 @@ def _hijack_diffusion_with_custom_loss(
                 H = jnp.einsum("ni,nj->ij", p, q)
                 U, _, Vt = jnp.linalg.svd(H, full_matrices=False)
                 d = jnp.sign(jnp.linalg.det(U) * jnp.linalg.det(Vt))
-                diag_val = jnp.array([1.0, 1.0, d])
-                R_mat = U @ jnp.diag(diag_val) @ Vt
+                R_mat = U @ jnp.diag(jnp.array([1.0, 1.0, d])) @ Vt
                 
                 R_aligned = (R_heavy - avg_heavy) @ R_mat + avg_ref
                 
-                # 2. Build the complex using the crystal-aligned heavy atoms
+                # 2. Evaluate Structure Factors on the density-aligned coordinates
                 X_base = oracle_mapping.initial_coordinates.at[oracle_mapping.heavy_indices].set(R_aligned)
                 X_relaxed, _, _ = hydride.relax_hydrogen_jit(X_base, *params, iterations=5)
                 
                 e_exp = 0.0
                 if sfc_instance is not None:
-                    # e_exp gradients will flow backward through X_relaxed, through R_aligned,
-                    # through the Kabsch rotation matrix, and directly into R_heavy.
                     e_exp, _ = sfc_instance.compute_loss(X_relaxed)
 
-                # 3. Restraint is computed in the raw, unaligned AF3 spatial frame
-                restraint = (0.5 / current_eta) * jnp.sum((R_heavy - x_0_heavy_mapped) ** 2)
-                return (sfc_weight * e_exp) + restraint
+                # 3. BAYESIAN GAUSSIAN NLL RESTRAINT
+                sq_diff = jnp.sum((R_heavy - x_0_heavy_mapped) ** 2, axis=-1)
+                
+                # Configurable exponential scaling parameters
+                variance_base = 0.1   # Minimum variance floor for perfect predictions
+                variance_scale = 0.05 # Scaling multiplier
+                variance_decay = 10.0 # How fast the variance explodes as pLDDT drops
+                
+                # Map pLDDT to Positional Variance (sigma^2)
+                # Low pLDDT inflates the denominator, dynamically dropping the penalty to near-zero
+                sigma_sq = variance_base + variance_scale * jnp.exp((100.0 - plddt_heavy) / variance_decay)
+                
+                # NLL = (x - mu)^2 / (2 * sigma^2)
+                # Current_eta scales the overall influence based on the diffusion timestep.
+                bayesian_restraint = (0.5 / current_eta) * jnp.sum(sq_diff / sigma_sq)
+                
+                return (sfc_weight * e_exp) + bayesian_restraint  
 
             # 1. Calculate raw gradients
             grads = jax.grad(local_loss_fn)(r_current)

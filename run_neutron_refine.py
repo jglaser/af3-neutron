@@ -76,12 +76,12 @@ def main(argv):
     )
     batch_obj = feat_batch.Batch.from_data_dict(featurised[0])
     batch = jax.tree.map(jnp.asarray, utils.remove_invalidly_typed_feats(featurised[0]))
-    gather_idxs = jnp.array(
-        atom_layout.compute_gather_idxs(
+    model_output_to_flat = atom_layout.compute_gather_idxs(
             source_layout=batch_obj.convert_model_output.token_atoms_layout,
             target_layout=batch_obj.convert_model_output.flat_output_layout,
-        ).gather_idxs
     )
+
+    gather_idxs = jnp.array(model_output_to_flat.gather_idxs)
 
     # runner
     device = jax.local_devices(backend="gpu")[FLAGS.gpu_device]
@@ -111,6 +111,22 @@ def main(argv):
         jax.random.PRNGKey(0), initial_noise, jnp.array([noise_schedule[0]]), batch, embeddings
     )
 
+    # ==============================================================================
+    # EVALUATE CONFIDENCE HEAD
+    # ==============================================================================
+    logging.info("Running Confidence Head to extract pLDDT...")
+    confidence_dict = runner.predict_confidence(
+        jax.random.PRNGKey(0), batch, embeddings, positions_denoised
+    )
+
+    plddt_per_atom = atom_layout.convert(
+        gather_info=model_output_to_flat,
+        arr=confidence_dict['predicted_lddt'],
+        layout_axes=(-2, -1),  # Mapping residue dim to atom dim
+    )
+    plddt_gathered = np.array(plddt_per_atom.reshape(-1))
+    # ==============================================================================
+
     logging.info("Parsing ligand SMILES definitions from input JSON...")
     with open(FLAGS.json_path, "r") as f:
         input_json_data = json.load(f)
@@ -128,6 +144,22 @@ def main(argv):
         ligand_smiles_dict=ligand_smiles_dict,
         ph=7.4,
     )
+
+    # 3. Apply annotations to heavy atoms
+
+    # Get the total number of atoms (Heavy + Hydrogens)
+    num_oracle_atoms = oracle.atoms.array_length()
+
+    # Create a full-size array initialized to 0.0
+    # (or a reasonable default, like the mean pLDDT)
+    full_b_factors = np.zeros(num_oracle_atoms)
+
+    # Inject the gathered pLDDT values into the heavy atom indices
+    # oracle.mapping.heavy_indices holds the correct indices for heavy atoms
+    full_b_factors[oracle.mapping.heavy_indices] = plddt_gathered
+
+    #  Apply to the oracle
+    oracle.atoms.set_annotation("b_factor", full_b_factors)
 
     # Use explicit reference alignment if provided
     if FLAGS.reference_cif:

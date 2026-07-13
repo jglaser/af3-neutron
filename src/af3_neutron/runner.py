@@ -9,6 +9,8 @@ import jax.numpy as jnp
 from alphafold3.model import model, params, feat_batch
 from alphafold3.model.network import evoformer as evoformer_network
 from alphafold3.model.network import diffusion_head
+from alphafold3.model.network import confidence_head
+from alphafold3.model import feat_batch
 
 from .types import HostEmbeddings
 
@@ -116,3 +118,59 @@ class HostRunner:
             return _DiffusionHijackWrapper(self._model_config)(feat_batch.Batch.from_data_dict(batch_dict), embeddings, sample_key, proximal_fn)
 
         return functools.partial(jax.jit(forward_sample.apply, static_argnames='proximal_fn', device=self._device), self.model_params)
+
+    def predict_confidence(self, sample_key, batch_dict, embeddings, positions_denoised):
+        """
+        Evaluates the AF3 Confidence Head using the denoised positions to extract pLDDT.
+        """
+        # The true positional signature for AF3 ConfidenceHead:
+        def forward_confidence(pos, emb, seq_mask_arr, token_to_pseudo, asym_id_arr):
+            head = confidence_head.ConfidenceHead(
+                self._model_config.heads.confidence,
+                self._model_config.global_config
+            )
+                
+            # Convert HostEmbeddings dataclass to a subscriptable dict
+            if not isinstance(emb, dict):
+                emb = {
+                    "pair": emb.pair,
+                    "single": emb.single,
+                    "target_feat": emb.target_feat
+                }
+                
+            # Call positionally in the EXACT order AF3 expects
+            return head(pos, emb, seq_mask_arr, token_to_pseudo, asym_id_arr)
+
+        confidence_fn = hk.transform(forward_confidence)
+        
+        # Rebuild the Batch object outside to safely extract required topology arrays
+        batch_obj = feat_batch.Batch.from_data_dict(batch_dict)
+        
+        # Extract the specific tensors needed by the network
+        token_to_pseudo = batch_obj.pseudo_beta_info.token_atoms_to_pseudo_beta
+        asym_id = batch_obj.token_features.asym_id
+        seq_mask = batch_obj.token_features.mask
+
+        # DYNAMIC HAIKU RE-SCOPING
+        confidence_params = {}
+        for mod_name, param_dict in self.model_params.items():
+            if "confidence_head" in mod_name:
+                idx = mod_name.find("confidence_head")
+                new_mod_name = mod_name[idx:]
+                confidence_params[new_mod_name] = param_dict
+
+        if not confidence_params:
+            raise ValueError("Could not locate 'confidence_head' weights in model_params.")
+
+        # Evaluate the confidence head using the properly scoped params
+        confidence_dict = confidence_fn.apply(
+            confidence_params, 
+            sample_key, 
+            positions_denoised,  # 1st: pred_positions
+            embeddings,          # 2nd: embeddings
+            seq_mask,            # 3rd: seq_mask array
+            token_to_pseudo,     # 4th: token_atoms_to_pseudo_beta
+            asym_id              # 5th: asym_id
+        )
+        
+        return confidence_dict
