@@ -18,6 +18,7 @@ from alphafold3.model.atom_layout import atom_layout
 
 from af3_neutron import make_model_config, HostRunner, Hijacker
 from af3_neutron.sfc_adapter import init_neutron_sfc, align_oracle_to_reference
+from af3_neutron.hijack import optimize_solvent_grid
 
 from jax.experimental.compilation_cache import compilation_cache as cc
 cc.set_cache_dir(os.path.expanduser('./.jax_cache'))
@@ -154,12 +155,22 @@ def main(argv):
     # (or a reasonable default, like the mean pLDDT)
     full_b_factors = np.zeros(num_oracle_atoms)
 
+    # Configurable exponential scaling parameters
+    variance_base = 0.1   # Minimum variance floor for perfect predictions
+    variance_scale = 0.05 # Scaling multiplier
+    variance_decay = 10.0 # How fast the variance explodes as pLDDT drops
+
+    # Map pLDDT to Positional Variance (sigma^2)
+    # Low pLDDT inflates the denominator, dynamically dropping the penalty to near-zero
+    sigma_sq = variance_base + variance_scale * jnp.exp((100.0 - plddt_heavy_only) / variance_decay)
+
     # Inject the gathered pLDDT values into the heavy atom indices
     # oracle.mapping.heavy_indices holds the correct indices for heavy atoms
-    full_b_factors[oracle.mapping.heavy_indices] = plddt_heavy_only
+    full_b_factors[oracle.mapping.heavy_indices] = sigma_sq
 
     # Use the precomputed map to broadcast B-factors to Hydrogens
-    final_b_factors = full_b_factors[np.array(oracle.mapping.hydrogen_to_heavy_map)]
+    final_b_factors = 26.3 * full_b_factors[np.array(oracle.mapping.hydrogen_to_heavy_map)]
+    print(f"B-factor stats: min={final_b_factors.min()}, max={final_b_factors.max()}, mean={final_b_factors.mean()}")
 
     #  Apply to the oracle
     oracle.atoms.set_annotation("b_factor", final_b_factors)
@@ -171,7 +182,18 @@ def main(argv):
         logging.warning("No --reference_cif provided. The model will remain at the AF3 origin, which may cause high R-factors.")
 
     sfc = init_neutron_sfc(oracle.atoms, FLAGS.mtz_path, deuterate=FLAGS.deuterate) if FLAGS.mtz_path else None
-    
+
+    # Get baseline coordinates
+    xyz_baseline = oracle.mapping.initial_coordinates
+
+    # Run the grid search to find the perfect neutron solvent parameters
+    best_k_sol, best_b_sol = optimize_solvent_grid(sfc, xyz_baseline)
+    print(f"Optimal Solvent Found -> k_sol: {best_k_sol:.3f}, b_sol: {best_b_sol:.1f}")
+
+    # Lock them in for the diffusion loop
+    sfc.k_sol = best_k_sol
+    sfc.b_sol = best_b_sol
+
     # hijack loop using the generalized proximal-based implementation
     conformations = Hijacker.hijack_diffusion(
         runner,

@@ -78,6 +78,42 @@ def build_custom_bond_dict(atoms: struc.AtomArray, ligand_smiles_dict: Dict[str,
     return custom_bond_dict
 
 
+def optimize_solvent_grid(sfc_instance, xyz_baseline):
+    """
+    Mimics cctbx grid search to find optimal k_sol and b_sol for neutrons.
+    """
+    # 1. Define the grid (allow negative k_sol for neutrons!)
+    k_sols = jnp.linspace(-0.5, 0.8, 20)
+    b_sols = jnp.linspace(10.0, 300.0, 20)
+
+    # Create a 2D meshgrid
+    K, B = jnp.meshgrid(k_sols, b_sols)
+    K_flat, B_flat = K.flatten(), B.flatten()
+
+    # 2. Define a pure function to compute R_work for a given (k_sol, b_sol)
+    def test_solvent(k, b):
+        # Temporarily override the parameters in the SFC instance
+        # (Assuming your SFC_Jax compute_loss can accept these, or you
+        # temporarily inject them into the object)
+        sfc_instance.k_sol = k
+        sfc_instance.b_sol = b
+
+        # Calculate loss using the baseline unrefined coordinates
+        _, (r_work, _) = sfc_instance.compute_loss(xyz_baseline)
+        return r_work
+
+    # 3. Vectorize the search across the grid
+    # (In practice, you might need to adapt this depending on how
+    # SFC_Jax manages state, perhaps using a loop if vmap complains about objects)
+    r_works = jax.vmap(test_solvent)(K_flat, B_flat)
+
+    # 4. Find the minimum
+    best_idx = jnp.argmin(r_works)
+    best_k = K_flat[best_idx]
+    best_b = B_flat[best_idx]
+
+    return best_k, best_b
+
 def _build_oracle_from_baseline_af3_prediction(
     flat_layout: Any, x_af3_flat_baseline: jnp.ndarray, ligand_smiles_dict: Dict[str, str], ph: float = 7.4
 ) -> Oracle:
@@ -180,9 +216,8 @@ def _hijack_diffusion_with_custom_loss(
     sfc_instance: Optional[SFC] = None,
     sample_key: Optional[jnp.ndarray] = None,
     prox_steps: int = 3,
-    prox_lr: float = 5e-3,
     eta_init: float = 1e-2,
-    sfc_weight: float = 500.0,
+    sfc_weight: float = 50.0,
 ) -> Conformations:
     oracle_mapping = oracle.mapping
     params = hydride.get_relaxation_params(oracle.atoms)
@@ -190,14 +225,18 @@ def _hijack_diffusion_with_custom_loss(
     @functools.partial(jax.jit, inline=False)
     def proximal_operator_fn(x_0_real: jnp.ndarray, t_hat: jnp.ndarray) -> jnp.ndarray:
         x_0_flat = x_0_real.reshape(-1, 3)
-        current_eta = eta_init * (t_hat ** 2)
+
+        # CLAMP t_hat so the restraint does not become infinitely stiff.
+        # This ensures current_eta never drops below a reasonable threshold.
+        safe_t = jnp.maximum(t_hat, 5.0)
+        current_eta = eta_init * (safe_t ** 2)
         
         x_af3_flat = x_0_flat[gather_idxs]
         x_0_heavy_mapped = x_af3_flat[oracle_mapping.source_indices]
 
         def step_body(i, r_current):
             # Extract pLDDT from the oracle's raw B-factor column
-            plddt_heavy = jnp.array(oracle.atoms.b_factor[oracle_mapping.heavy_indices], dtype=jnp.float32)
+            b_factors = jnp.array(oracle.atoms.b_factor[oracle_mapping.heavy_indices], dtype=jnp.float32)
 
             def local_loss_fn(R_heavy):
                 # 1. JAX-Differentiable Kabsch Alignment
@@ -227,18 +266,9 @@ def _hijack_diffusion_with_custom_loss(
                 # 3. BAYESIAN GAUSSIAN NLL RESTRAINT
                 sq_diff = jnp.sum((R_heavy - x_0_heavy_mapped) ** 2, axis=-1)
                 
-                # Configurable exponential scaling parameters
-                variance_base = 0.1   # Minimum variance floor for perfect predictions
-                variance_scale = 0.05 # Scaling multiplier
-                variance_decay = 10.0 # How fast the variance explodes as pLDDT drops
-                
-                # Map pLDDT to Positional Variance (sigma^2)
-                # Low pLDDT inflates the denominator, dynamically dropping the penalty to near-zero
-                sigma_sq = variance_base + variance_scale * jnp.exp((100.0 - plddt_heavy) / variance_decay)
-                
                 # NLL = (x - mu)^2 / (2 * sigma^2)
                 # Current_eta scales the overall influence based on the diffusion timestep.
-                bayesian_restraint = (0.5 / current_eta) * jnp.sum(sq_diff / sigma_sq)
+                bayesian_restraint = (0.5 / current_eta) * jnp.sum(sq_diff / b_factors)
                 
                 return (sfc_weight * e_exp) + bayesian_restraint  
 

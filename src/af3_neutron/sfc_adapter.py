@@ -45,10 +45,15 @@ class NeutronSFCalculator(SFcalculator):
         )
         
         f_calc_protein = f_calc_protein_asu[self.asu2HKL_index]
+        dr2_tensor = jnp.array(self.dr2HKL_array)
         
-        # 2. Disable Bulk Solvent Mask
-        # We zero this out because unrefined D2O envelopes corrupt the gradients.
-        scaled_fmask = 0.0
+        # 2. Reactivate Bulk Solvent Mask
+        # Fetch SFC_Jax solvent parameters (with underscores), using safe defaults
+        k_sol = getattr(self, "k_sol", 0.35)
+        b_sol = getattr(self, "b_sol", 50.0)
+        Fmask_HKL = getattr(self, "Fmask_HKL")
+        scaled_fmask = k_sol * jnp.exp(-b_sol * dr2_tensor / 4.0) * Fmask_HKL
+        
         f_calc_complex = f_calc_protein + scaled_fmask
         f_calc_mag = jnp.abs(f_calc_complex)
         
@@ -61,14 +66,10 @@ class NeutronSFCalculator(SFcalculator):
             
         f_obs = jnp.array(f_obs_attr)
         
-        # 4. Enforce Cross-Validation & Resolution Partitions
-        dr2_tensor = jnp.array(self.dr2HKL_array)
-        
-        # CRITICAL: Exclude low-res reflections (d > 5.0 A) which are dominated by 
-        # the missing D2O solvent. (1 / 5.0^2 = 0.04)
-        high_res_mask = (dr2_tensor > 0.04)
-        
-        mask_valid = (f_obs > 0.0) & (~jnp.isnan(f_obs)) & high_res_mask
+        # 4. Enforce Cross-Validation
+        # NOTE: The low-resolution cutoff has been removed so the model 
+        # can fit the newly activated solvent envelope at low angles.
+        mask_valid = (f_obs > 0.0) & (~jnp.isnan(f_obs))
         
         mask_free = mask_valid & self.freer_mask
         mask_work = mask_valid & (~self.freer_mask)
