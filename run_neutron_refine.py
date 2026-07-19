@@ -186,15 +186,17 @@ def main(argv):
     # Get baseline coordinates
     xyz_baseline = oracle.mapping.initial_coordinates
 
-    # Run the grid search to find the perfect neutron solvent parameters
-    best_k_sol, best_b_sol = optimize_solvent_grid(sfc, xyz_baseline)
-    print(f"Optimal Solvent Found -> k_sol: {best_k_sol:.3f}, b_sol: {best_b_sol:.1f}")
+    if sfc:
+        # Run the grid search to find the perfect neutron solvent parameters
+        best_k_sol, best_b_sol = optimize_solvent_grid(sfc, xyz_baseline)
+        print(f"Optimal Solvent Found -> k_sol: {best_k_sol:.3f}, b_sol: {best_b_sol:.1f}")
 
-    # Lock them in for the diffusion loop
-    sfc.k_sol = best_k_sol
-    sfc.b_sol = best_b_sol
+        # Lock them in for the diffusion loop
+        sfc.k_sol = best_k_sol
+        sfc.b_sol = best_b_sol
 
     # hijack loop using the generalized proximal-based implementation
+    sfc_weight=5.0
     conformations = Hijacker.hijack_diffusion(
         runner,
         batch,
@@ -203,6 +205,8 @@ def main(argv):
         oracle,
         sfc,
         jax.random.PRNGKey(0),
+        steps=2000,
+        sfc_weight=sfc_weight
     )
 
     logging.info("Assembling final atomic coordinates...")
@@ -210,6 +214,7 @@ def main(argv):
         conformations[0],
         gather_idxs,
         oracle,
+        sfc_weight=sfc_weight
     )
 
     # hydride append hydrogen to array end, sort by chain and res for viz of ss

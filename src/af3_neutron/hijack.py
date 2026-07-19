@@ -218,6 +218,7 @@ def _hijack_diffusion_with_custom_loss(
     prox_steps: int = 3,
     eta_init: float = 1e-2,
     sfc_weight: float = 50.0,
+    steps: int = 200,
 ) -> Conformations:
     oracle_mapping = oracle.mapping
     params = hydride.get_relaxation_params(oracle.atoms)
@@ -226,10 +227,7 @@ def _hijack_diffusion_with_custom_loss(
     def proximal_operator_fn(x_0_real: jnp.ndarray, t_hat: jnp.ndarray) -> jnp.ndarray:
         x_0_flat = x_0_real.reshape(-1, 3)
 
-        # CLAMP t_hat so the restraint does not become infinitely stiff.
-        # This ensures current_eta never drops below a reasonable threshold.
-        safe_t = jnp.maximum(t_hat, 5.0)
-        current_eta = eta_init * (safe_t ** 2)
+        current_eta = eta_init * (t_hat ** 2)
         
         x_af3_flat = x_0_flat[gather_idxs]
         x_0_heavy_mapped = x_af3_flat[oracle_mapping.source_indices]
@@ -330,7 +328,8 @@ def _hijack_diffusion_with_custom_loss(
         batch_dict,
         embeddings,
         rng_key,
-        proximal_operator_fn
+        proximal_operator_fn,
+        steps,
     )
 
     return Conformations(atom_positions=atom_positions)
@@ -428,9 +427,11 @@ class Hijacker:
         oracle: Oracle, 
         sfc: Optional[SFC] = None, 
         key: Optional[jnp.ndarray] = None,
-        sfc_weight: float = 1000.0
+        sfc_weight: float = 1000.0,
+        steps: int = None,
     ) -> jnp.ndarray:
-        return _hijack_diffusion_with_custom_loss(runner, batch_dict, embeddings, gather_idxs, oracle, sfc, key, sfc_weight=sfc_weight)
+        return _hijack_diffusion_with_custom_loss(runner, batch_dict, embeddings, gather_idxs, oracle, sfc, key, sfc_weight=sfc_weight,
+                                                  steps=steps)
 
     @staticmethod
     def assemble_coordinates(atom_positions: jnp.ndarray, gather_idxs: jnp.ndarray, oracle: Oracle, sfc: Optional[SFC] = None, sfc_weight: float = 1000.0) -> np.ndarray:

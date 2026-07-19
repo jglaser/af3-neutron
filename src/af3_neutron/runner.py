@@ -70,8 +70,13 @@ class _DiffusionHijackWrapper(_HostModule):
         super().__init__(config, name=name)
         self.diffusion_module = diffusion_head.DiffusionHead(self.config.heads.diffusion, self.config.global_config)
 
-    def __call__(self, batch: feat_batch.Batch, embeddings: HostEmbeddings, sample_key: jnp.ndarray, proximal_fn: Callable) -> jnp.ndarray:
+    def __call__(self, batch: feat_batch.Batch, embeddings: HostEmbeddings, sample_key: jnp.ndarray, proximal_fn: Callable,
+                 steps: int = None) -> jnp.ndarray:
         sample_config = self.config.heads.diffusion.eval
+
+        if steps is not None:
+            # override default number of steps
+            sample_config.steps = steps
 
         def hijacked_denoising_step(positions_noisy: jnp.ndarray, t_hat: jnp.ndarray) -> jnp.ndarray:
             # 1. Evaluate native unguided structural prediction target (\hat{x}_0)
@@ -114,10 +119,10 @@ class HostRunner:
     @functools.cached_property
     def sample_guided_diffusion(self) -> Callable:
         @hk.transform
-        def forward_sample(batch_dict: Dict[str, Any], embeddings: HostEmbeddings, sample_key: jnp.ndarray, proximal_fn: Callable) -> jnp.ndarray:
-            return _DiffusionHijackWrapper(self._model_config)(feat_batch.Batch.from_data_dict(batch_dict), embeddings, sample_key, proximal_fn)
+        def forward_sample(batch_dict: Dict[str, Any], embeddings: HostEmbeddings, sample_key: jnp.ndarray, proximal_fn: Callable, steps=200) -> jnp.ndarray:
+            return _DiffusionHijackWrapper(self._model_config)(feat_batch.Batch.from_data_dict(batch_dict), embeddings, sample_key, proximal_fn, steps)
 
-        return functools.partial(jax.jit(forward_sample.apply, static_argnames='proximal_fn', device=self._device), self.model_params)
+        return functools.partial(jax.jit(forward_sample.apply, static_argnames=['proximal_fn', 'steps'], device=self._device), self.model_params)
 
     def predict_confidence(self, sample_key, batch_dict, embeddings, positions_denoised):
         """
