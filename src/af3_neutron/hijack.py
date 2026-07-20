@@ -215,9 +215,10 @@ def _hijack_diffusion_with_custom_loss(
     oracle: Oracle,
     sfc_instance: Optional[SFC] = None,
     sample_key: Optional[jnp.ndarray] = None,
-    prox_steps: int = 3,
+    prox_steps: int = 20,
     eta_init: float = 1e-2,
     sfc_weight: float = 50.0,
+    lr: int = 0.01,
     steps: int = 200,
 ) -> Conformations:
     oracle_mapping = oracle.mapping
@@ -227,100 +228,101 @@ def _hijack_diffusion_with_custom_loss(
     def proximal_operator_fn(x_0_real: jnp.ndarray, t_hat: jnp.ndarray) -> jnp.ndarray:
         x_0_flat = x_0_real.reshape(-1, 3)
 
-        current_eta = eta_init * (t_hat ** 2)
+        # (Assuming you are keeping the safe_t clamp to prevent the restraint from freezing at t=0)
+        safe_t = jnp.maximum(t_hat, 5.0)
+        current_eta = eta_init * (safe_t ** 2)
         
         x_af3_flat = x_0_flat[gather_idxs]
         x_0_heavy_mapped = x_af3_flat[oracle_mapping.source_indices]
 
         def step_body(i, r_current):
-            # Extract pLDDT from the oracle's raw B-factor column
-            b_factors = jnp.array(oracle.atoms.b_factor[oracle_mapping.heavy_indices], dtype=jnp.float32)
+            # --- 1. FORWARD PASS ALIGNMENT (C-alpha ONLY) ---
+            R_ref = oracle_mapping.initial_coordinates[oracle_mapping.heavy_indices]
+            
+            # Extract only the C-alpha coordinates for calculating the transform
+            r_curr_ca = r_current[ca_mask_heavy]
+            R_ref_ca = R_ref[ca_mask_heavy]
+            
+            # Compute centroids using ONLY C-alphas
+            avg_ca_curr = jnp.mean(r_curr_ca, axis=0)
+            avg_ca_ref = jnp.mean(R_ref_ca, axis=0)
+            
+            p_ca = r_curr_ca - avg_ca_curr
+            q_ca = R_ref_ca - avg_ca_ref
 
-            def local_loss_fn(R_heavy):
-                # 1. JAX-Differentiable Kabsch Alignment
-                R_ref = oracle_mapping.initial_coordinates[oracle_mapping.heavy_indices]
-                
-                avg_heavy = jnp.mean(R_heavy, axis=0)
-                avg_ref = jnp.mean(R_ref, axis=0)
-                
-                p = R_heavy - avg_heavy
-                q = R_ref - avg_ref
-                
-                H = jnp.einsum("ni,nj->ij", p, q)
-                U, _, Vt = jnp.linalg.svd(H, full_matrices=False)
-                d = jnp.sign(jnp.linalg.det(U) * jnp.linalg.det(Vt))
-                R_mat = U @ jnp.diag(jnp.array([1.0, 1.0, d])) @ Vt
-                
-                R_aligned = (R_heavy - avg_heavy) @ R_mat + avg_ref
-                
-                # 2. Evaluate Structure Factors on the density-aligned coordinates
-                X_base = oracle_mapping.initial_coordinates.at[oracle_mapping.heavy_indices].set(R_aligned)
-                X_relaxed, _, _ = hydride.relax_hydrogen_jit(X_base, *params, iterations=5)
-                
-                e_exp = 0.0
-                if sfc_instance is not None:
-                    e_exp, _ = sfc_instance.compute_loss(X_relaxed)
+            # SVD on the C-alpha covariance matrix
+            H = jnp.einsum("ni,nj->ij", p_ca, q_ca)
+            U, _, Vt = jnp.linalg.svd(H, full_matrices=False)
+            d = jnp.sign(jnp.linalg.det(U) * jnp.linalg.det(Vt))
+            R_mat = U @ jnp.diag(jnp.array([1.0, 1.0, d])) @ Vt
+            
+            # Apply the CA-derived transformation to ALL heavy atoms
+            R_aligned = (r_current - avg_ca_curr) @ R_mat + avg_ca_ref
+            
+            X_base = oracle_mapping.initial_coordinates.at[oracle_mapping.heavy_indices].set(R_aligned)
+            X_relaxed, _, _ = hydride.relax_hydrogen_jit(X_base, *params, iterations=5)
+            
+            # --- 2. COMPUTE EXPERIMENTAL LOSS GRADIENTS ---
+            # Gradients are taken strictly with respect to the 3D crystal coordinates.
+            # This completely bypasses the unstable SVD and iterative relaxation Autodiff graphs!
+            def sfc_loss_fn(X_eval):
+                e_exp, _ = sfc_instance.compute_loss(X_eval)
+                return sfc_weight * e_exp
 
-                # 3. BAYESIAN GAUSSIAN NLL RESTRAINT
-                sq_diff = jnp.sum((R_heavy - x_0_heavy_mapped) ** 2, axis=-1)
-                
-                # NLL = (x - mu)^2 / (2 * sigma^2)
-                # Current_eta scales the overall influence based on the diffusion timestep.
-                bayesian_restraint = (0.5 / current_eta) * jnp.sum(sq_diff / b_factors)
-                
-                return (sfc_weight * e_exp) + bayesian_restraint  
+            if sfc_instance is not None:
+                grads_X = jax.grad(sfc_loss_fn)(X_relaxed)
+            else:
+                grads_X = jnp.zeros_like(X_relaxed)
 
-            # 1. Calculate raw gradients
-            grads = jax.grad(local_loss_fn)(r_current)
-            
-            # 2. Scale-Invariant Gradients
-            N_atoms = r_current.shape[0]
-            scaled_grads = grads * N_atoms
-            
-            # 3. Natural Learning Rate
-            lr = sfc_weight * jnp.sqrt(t_hat) * 0.01
-            raw_step = scaled_grads * lr
-            
-            # 4. ATOM-WISE SPEED LIMIT
-            max_allowed_step = 0.05
-            
-            # Calculate the norm for EACH atom independently (keepdims=True is critical for broadcasting)
-            atom_step_norms = jnp.linalg.norm(raw_step, axis=-1, keepdims=True) + 1e-8
-            
-            # If an atom wants to move > 0.05, slow IT down. If it wants to move < 0.05, leave IT alone.
-            clip_factor = jnp.where(atom_step_norms > max_allowed_step, 
-                                    max_allowed_step / atom_step_norms, 
-                                    1.0)
-            
-            # 5. Apply the safe, organic step
-            r_next = r_current - (raw_step * clip_factor)
-            
+            # --- 3. UPDATE RELAXED POSITIONS ---
+            # (Assuming 'lr' is defined in your outer scope as before)
+            X_updated = X_relaxed - lr * grads_X
+
+            # --- 4. MAP BACK FOR THE DIFFUSION HEAD ---
+            # Extract the updated heavy atoms
+            R_aligned_updated = X_updated[oracle_mapping.heavy_indices]
+
+            # Reverse the Kabsch rotation to project the updated coordinates back into the unaligned AF3 frame
+            r_next = (R_aligned_updated - avg_ca_ref) @ R_mat.T + avg_ca_curr
+
             return r_next
 
         R_current = x_0_heavy_mapped
         R_optimized = jax.lax.fori_loop(0, prox_steps, step_body, R_current)
-        
-        # Log final metrics once per timestep outside the gradient loop
+
+        # --- TERMINAL LOGGING BLOCK (Also updated for CA alignment) ---
         if sfc_instance is not None:
-            # We must re-align R_optimized one last time purely for accurate terminal logging
             R_ref = oracle_mapping.initial_coordinates[oracle_mapping.heavy_indices]
-            avg_opt = jnp.mean(R_optimized, axis=0)
-            avg_ref = jnp.mean(R_ref, axis=0)
-            p = R_optimized - avg_opt
-            q = R_ref - avg_ref
-            H = jnp.einsum("ni,nj->ij", p, q)
+            
+            r_opt_ca = R_optimized[ca_mask_heavy]
+            R_ref_ca = R_ref[ca_mask_heavy]
+            
+            avg_ca_opt = jnp.mean(r_opt_ca, axis=0)
+            avg_ca_ref = jnp.mean(R_ref_ca, axis=0)
+            
+            p_ca = r_opt_ca - avg_ca_opt
+            q_ca = R_ref_ca - avg_ca_ref
+            
+            H = jnp.einsum("ni,nj->ij", p_ca, q_ca)
             U, _, Vt = jnp.linalg.svd(H, full_matrices=False)
-            R_mat = U @ jnp.diag(jnp.array([1.0, 1.0, jnp.sign(jnp.linalg.det(U) * jnp.linalg.det(Vt))])) @ Vt
-            R_log_aligned = (R_optimized - avg_opt) @ R_mat + avg_ref
+            d = jnp.sign(jnp.linalg.det(U) * jnp.linalg.det(Vt))
+            R_mat = U @ jnp.diag(jnp.array([1.0, 1.0, d])) @ Vt
+            
+            # Rotate all optimized heavy atoms using the CA transform
+            R_log_aligned = (R_optimized - avg_ca_opt) @ R_mat + avg_ca_ref
 
             X_final = oracle_mapping.initial_coordinates.at[oracle_mapping.heavy_indices].set(R_log_aligned)
             X_rel, _, _ = hydride.relax_hydrogen_jit(X_final, *params, iterations=5)
-            
+
             _, (rw, rf) = sfc_instance.compute_loss(X_rel)
             jax.debug.print("t_hat: {t:.3f} | R_work: {rw:.4f} | R_free: {rf:.4f}", t=t_hat, rw=rw, rf=rf)
 
         x_af3_updated = x_af3_flat.at[oracle_mapping.source_indices].set(R_optimized)
         return x_0_flat.at[gather_idxs].set(x_af3_updated).reshape(x_0_real.shape)
+
+    # Create a boolean array indicating which heavy atoms are C-alphas
+    heavy_atom_names = oracle.atoms.atom_name[oracle_mapping.heavy_indices]
+    ca_mask_heavy = jnp.array(heavy_atom_names == "CA")
 
     rng_key = jax.random.PRNGKey(0) if sample_key is None else sample_key
     atom_positions = model_runner.sample_guided_diffusion(

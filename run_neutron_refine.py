@@ -1,10 +1,13 @@
 import logging
 import pathlib
 import os
+import json
 import numpy as np
 import jax
 import jax.numpy as jnp
 import biotite.structure.io.pdbx as pdbx
+import gemmi
+from scipy.interpolate import RegularGridInterpolator
 from absl import app, flags
 
 from alphafold3.common import folding_input
@@ -20,10 +23,60 @@ from af3_neutron import make_model_config, HostRunner, Hijacker
 from af3_neutron.sfc_adapter import init_neutron_sfc, align_oracle_to_reference
 from af3_neutron.hijack import optimize_solvent_grid
 
+import jax
+import jax.numpy as jnp
+import haiku as hk
+import logging
+from alphafold3.model.network.evoformer import Evoformer
+from alphafold3.model.scoring import scoring
+
+# Import your custom modules
+from af3_neutron.diffraction_embedding import compute_debye_features, sample_patterson_map, DiffractionPairAdapter
+from af3_neutron.patterson import extract_patterson_grid_from_mtz
+
+# Save the original AF3 method
+_original_embed_template_pair = Evoformer._embed_template_pair
+
+print(_original_embed_template_pair)
+CUSTOM_DIFFRACTION_DATA = {}
+
+def patched_embed_template_pair(self, batch, pair_activations, pair_mask, key):
+    updated_pair, next_key = _original_embed_template_pair(self, batch, pair_activations, pair_mask, key)
+
+    # Check global registry for Patterson data
+    if batch.templates.aatype.shape[0] > 0 and "patterson_grid" in CUSTOM_DIFFRACTION_DATA:
+        cb_positions, _ = scoring.pseudo_beta_fn(
+            batch.templates.aatype[0],
+            batch.templates.atom_positions[0],
+            batch.templates.atom_mask[0]
+        )
+
+        q_bins = jnp.linspace(0.05, 0.5, 16)
+        
+        # Pass pair_mask to enforce valid atom bounds
+        debye_feats = compute_debye_features(cb_positions, q_bins, pair_mask)
+
+        patterson_feats = sample_patterson_map(
+            cb_positions,
+            CUSTOM_DIFFRACTION_DATA["patterson_grid"],
+            CUSTOM_DIFFRACTION_DATA["grid_origin"],
+            CUSTOM_DIFFRACTION_DATA["grid_spacing"],
+            pair_mask
+        )
+
+        adapter = DiffractionPairAdapter(out_channels=pair_activations.shape[-1])
+        delta_z = adapter(debye_feats, patterson_feats, pair_mask)
+
+        updated_pair = updated_pair + delta_z
+
+    return updated_pair, next_key
+
+# Apply the patch to the AF3 source class
+_original_embed_template_pair = Evoformer._embed_template_pair
+Evoformer._embed_template_pair = patched_embed_template_pair
+
 from jax.experimental.compilation_cache import compilation_cache as cc
 cc.set_cache_dir(os.path.expanduser('./.jax_cache'))
-
-import json
 
 flags.DEFINE_string(
     "json_path",
@@ -40,6 +93,30 @@ flags.DEFINE_bool("deuterate", False, "Simulate H/D exchange (swap H for D on N,
 flags.DEFINE_string("reference_cif", None, "Path to the explicit crystal structure (e.g., 4BD1.cif) to align the AF3 model into the correct unit cell frame.")
 
 FLAGS = flags.FLAGS
+
+import pickle
+
+def inject_adapter_weights(af3_params: hk.Params, filepath: str = "diffraction_adapter_weights.pkl") -> hk.Params:
+    """Injects saved adapter weights into AF3's parameter tree at the expected scope path."""
+    with open(filepath, "rb") as f:
+        loaded_dict = pickle.load(f)
+
+    # Convert to mutable dictionary
+    merged_params = dict(af3_params)
+
+    # Exact module scope path expected by Haiku inside Evoformer
+    target_prefix = "diffuser/evoformer/diffraction_pair_adapter"
+
+    for loaded_name, module_dict in loaded_dict.items():
+        # Extract submodule suffix (e.g., 'adapter_mlp_1', 'adapter_mlp_2')
+        suffix = loaded_name.split("diffraction_pair_adapter/")[-1]
+        target_key = f"{target_prefix}/{suffix}"
+
+        # Inject converted JAX array weights directly into the param tree
+        merged_params[target_key] = jax.tree_util.tree_map(jnp.array, module_dict)
+        logging.info(f"Adapter weights successfully injected into: {target_key}")
+
+    return merged_params
 
 def main(argv):
     del argv
@@ -77,6 +154,7 @@ def main(argv):
     )
     batch_obj = feat_batch.Batch.from_data_dict(featurised[0])
     batch = jax.tree.map(jnp.asarray, utils.remove_invalidly_typed_feats(featurised[0]))
+
     model_output_to_flat = atom_layout.compute_gather_idxs(
             source_layout=batch_obj.convert_model_output.token_atoms_layout,
             target_layout=batch_obj.convert_model_output.flat_output_layout,
@@ -92,10 +170,31 @@ def main(argv):
         model_dir=pathlib.Path(FLAGS.model_dir),
     )
     # make embeddings and oracle
+    rng = jax.random.split(
+        jax.random.PRNGKey(fold_input.rng_seeds[0] if fold_input.rng_seeds else 1)
+    )[0]
+
+    # 1. First: Extract Patterson map and load adapter weights into runner
+    if FLAGS.mtz_path and os.path.exists(FLAGS.mtz_path):
+        logging.info(f"Extracting Patterson grid directly from {FLAGS.mtz_path}...")
+        p_grid, origin, spacing = extract_patterson_grid_from_mtz(
+            FLAGS.mtz_path, 
+            fobs_col="FP"
+        )
+        
+        # Populate registry BEFORE running host embeddings
+        CUSTOM_DIFFRACTION_DATA["patterson_grid"] = jnp.array(p_grid)
+        CUSTOM_DIFFRACTION_DATA["grid_origin"] = jnp.array(origin)
+        CUSTOM_DIFFRACTION_DATA["grid_spacing"] = jnp.array(spacing)
+
+        # Inject trained adapter weights into AF3 model parameters
+        runner.model_params = inject_adapter_weights(runner.model_params, "diffraction_adapter_weights.pkl")
+
+    # 2. Second: Run host embeddings WITH active diffraction patching
+    rng, rng_emb = jax.random.split(rng)
+    logging.info("Computing diffraction-informed host embeddings...")
     embeddings = runner.get_host_embeddings(
-        jax.random.split(
-            jax.random.PRNGKey(fold_input.rng_seeds[0] if fold_input.rng_seeds else 1)
-        )[0],
+        rng_emb,
         batch,
     )
     n_steps = getattr(runner._model_config.heads.diffusion.eval, "steps", 200)
@@ -186,8 +285,8 @@ def main(argv):
     # Get baseline coordinates
     xyz_baseline = oracle.mapping.initial_coordinates
 
-    if sfc:
-        # Run the grid search to find the perfect neutron solvent parameters
+    # Run the grid search to find the perfect neutron solvent parameters
+    if sfc is not None:
         best_k_sol, best_b_sol = optimize_solvent_grid(sfc, xyz_baseline)
         print(f"Optimal Solvent Found -> k_sol: {best_k_sol:.3f}, b_sol: {best_b_sol:.1f}")
 
@@ -196,7 +295,6 @@ def main(argv):
         sfc.b_sol = best_b_sol
 
     # hijack loop using the generalized proximal-based implementation
-    sfc_weight=5.0
     conformations = Hijacker.hijack_diffusion(
         runner,
         batch,
@@ -205,8 +303,6 @@ def main(argv):
         oracle,
         sfc,
         jax.random.PRNGKey(0),
-        steps=2000,
-        sfc_weight=sfc_weight
     )
 
     logging.info("Assembling final atomic coordinates...")
@@ -214,7 +310,6 @@ def main(argv):
         conformations[0],
         gather_idxs,
         oracle,
-        sfc_weight=sfc_weight
     )
 
     # hydride append hydrogen to array end, sort by chain and res for viz of ss
