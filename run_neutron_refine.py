@@ -31,7 +31,7 @@ from alphafold3.model.network.evoformer import Evoformer
 from alphafold3.model.scoring import scoring
 
 # Import your custom modules
-from af3_neutron.diffraction_embedding import compute_debye_features, sample_patterson_map, DiffractionPairAdapter
+from af3_neutron.diffraction_embedding import compute_debye_features, sample_patterson_map, compute_diffraction_delta_z
 from af3_neutron.patterson import extract_patterson_grid_from_mtz
 
 # Save the original AF3 method
@@ -43,29 +43,45 @@ CUSTOM_DIFFRACTION_DATA = {}
 def patched_embed_template_pair(self, batch, pair_activations, pair_mask, key):
     updated_pair, next_key = _original_embed_template_pair(self, batch, pair_activations, pair_mask, key)
 
-    # Check global registry for Patterson data
     if batch.templates.aatype.shape[0] > 0 and "patterson_grid" in CUSTOM_DIFFRACTION_DATA:
-        cb_positions, _ = scoring.pseudo_beta_fn(
-            batch.templates.aatype[0],
-            batch.templates.atom_positions[0],
-            batch.templates.atom_mask[0]
+        # 1. Fetch true 1D protein token mask from AF3's top-level batch features
+        is_protein = batch.token_features.is_protein
+        is_protein_1d = (jnp.asarray(is_protein, dtype=jnp.float32) > 0.5)  # [N_tokens]
+
+        # Diagnostic output to verify ligand token exclusion
+        num_protein_tokens = jnp.sum(is_protein_1d)
+        total_tokens = is_protein_1d.shape[0]
+        jax.debug.print(
+            "[Diffraction Patch Mask] Valid Protein Tokens: {p}/{t}",
+            p=num_protein_tokens,
+            t=total_tokens,
         )
 
-        q_bins = jnp.linspace(0.05, 0.5, 16)
-        
-        # Pass pair_mask to enforce valid atom bounds
-        debye_feats = compute_debye_features(cb_positions, q_bins, pair_mask)
+        # 2. Construct 2D Protein-Protein Pair Mask [N_tokens, N_tokens]
+        # Evaluates to 1.0 ONLY for (Protein, Protein) pairs; 0.0 if either token is ligand
+        protein_pair_mask = is_protein_1d[:, None] * is_protein_1d[None, :]
 
-        patterson_feats = sample_patterson_map(
-            cb_positions,
-            CUSTOM_DIFFRACTION_DATA["patterson_grid"],
-            CUSTOM_DIFFRACTION_DATA["grid_origin"],
-            CUSTOM_DIFFRACTION_DATA["grid_spacing"],
-            pair_mask
+        # 3. Combine with AF3 spatial pair_mask
+        effective_mask = pair_mask * protein_pair_mask
+
+        # 4. Compute ΔZ strictly for protein-protein pair channels
+        delta_z = compute_diffraction_delta_z(
+            aatype=batch.templates.aatype[0],
+            atom_positions=batch.templates.atom_positions[0],
+            atom_mask=batch.templates.atom_mask[0],
+            patterson_grid=CUSTOM_DIFFRACTION_DATA["patterson_grid"],
+            grid_origin=CUSTOM_DIFFRACTION_DATA["grid_origin"],
+            grid_spacing=CUSTOM_DIFFRACTION_DATA["grid_spacing"],
+            pair_mask=effective_mask,
+            out_channels=pair_activations.shape[-1],
+            gamma=1.0,
         )
 
-        adapter = DiffractionPairAdapter(out_channels=pair_activations.shape[-1])
-        delta_z = adapter(debye_feats, patterson_feats, pair_mask)
+        norm_z = jnp.linalg.norm(updated_pair)
+        norm_delta = jnp.linalg.norm(delta_z)
+        ratio = norm_delta / (norm_z + 1e-8)
+        jax.debug.print("[Diffraction Patch] ||Z||: {norm_z} | ||ΔZ||: {norm_delta} | Ratio: {ratio}",
+                        norm_z=norm_z, norm_delta=norm_delta, ratio=ratio)
 
         updated_pair = updated_pair + delta_z
 

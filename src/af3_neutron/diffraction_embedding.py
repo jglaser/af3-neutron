@@ -79,16 +79,46 @@ class DiffractionPairAdapter(hk.Module):
         x = jnp.concatenate([debye_feats, patterson_feats], axis=-1)
         x = hk.Linear(128, name="adapter_mlp_1")(x)
         x = jax.nn.relu(x)
-        
+
+        # Use standard VarianceScaling initialization so weights start non-zero
         delta_z = hk.Linear(
             self.out_channels,
-            w_init=hk.initializers.Constant(0.0),
+            w_init=hk.initializers.VarianceScaling(scale=0.1),
             name="adapter_mlp_2",
         )(x)
-        
-        # Multiply by 2D mask to guarantee padding tokens remain 0.0
+
         return delta_z * mask_2d[..., None]
 
+def compute_diffraction_delta_z(
+    aatype: jnp.ndarray,
+    atom_positions: jnp.ndarray,
+    atom_mask: jnp.ndarray,
+    patterson_grid: jnp.ndarray,
+    grid_origin: jnp.ndarray,
+    grid_spacing: jnp.ndarray,
+    pair_mask: jnp.ndarray,
+    out_channels: int,
+    q_bins: jnp.ndarray = None,
+    gamma: float = 1.0,
+) -> jnp.ndarray:
+    """Shared core pipeline: extracts pseudo-beta, computes features, and predicts residual ΔZ."""
+    if q_bins is None:
+        q_bins = jnp.linspace(0.05, 0.5, 16)
+
+    # 1. Pseudo-Beta / CA positions
+    cb_positions, _ = scoring.pseudo_beta_fn(aatype, atom_positions, atom_mask)
+
+    # 2. Extract physical features
+    debye_feats = compute_debye_features(cb_positions, q_bins, pair_mask)
+    patterson_feats = sample_patterson_map(
+        cb_positions, patterson_grid, grid_origin, grid_spacing, pair_mask
+    )
+
+    # 3. Predict adapter residual update
+    adapter = DiffractionPairAdapter(out_channels=out_channels)
+    delta_z = adapter(debye_feats, patterson_feats, pair_mask)
+
+    return gamma * delta_z
 
 class DiffractionAugmentedTemplateEmbedding(hk.Module):
     """Wraps native AF3 SingleTemplateEmbedding with dynamic length support."""
@@ -113,10 +143,10 @@ class DiffractionAugmentedTemplateEmbedding(hk.Module):
 
     def __call__(
         self,
-        query_embedding: jnp.ndarray,  # [N_max, N_max, C]
-        templates: features.Templates,  # [N_max, 24, 3]
-        padding_mask_2d: jnp.ndarray,  # [N_max, N_max] (1.0 for valid, 0.0 for pad)
-        multichain_mask_2d: jnp.ndarray,  # [N_max, N_max]
+        query_embedding: jnp.ndarray,
+        templates: features.Templates,
+        padding_mask_2d: jnp.ndarray,
+        multichain_mask_2d: jnp.ndarray,
         patterson_grid: jnp.ndarray,
         grid_origin: jnp.ndarray,
         grid_spacing: jnp.ndarray,
@@ -124,7 +154,6 @@ class DiffractionAugmentedTemplateEmbedding(hk.Module):
         use_adapter: bool = True,
     ) -> jnp.ndarray:
 
-        # 1. Native AF3 Base Forward Pass
         native_z = self.native_embedder(
             query_embedding=query_embedding,
             templates=templates,
@@ -136,24 +165,19 @@ class DiffractionAugmentedTemplateEmbedding(hk.Module):
         if not use_adapter:
             return native_z * padding_mask_2d[..., None]
 
-        # 2. Extract Pseudo-Beta/CA positions across all residues [N_max, 3]
-        cb_positions, _ = scoring.pseudo_beta_fn(
-            templates.aatype, templates.atom_positions, templates.atom_mask
+        delta_z = compute_diffraction_delta_z(
+            aatype=templates.aatype,
+            atom_positions=templates.atom_positions,
+            atom_mask=templates.atom_mask,
+            patterson_grid=patterson_grid,
+            grid_origin=grid_origin,
+            grid_spacing=grid_spacing,
+            pair_mask=padding_mask_2d,
+            out_channels=native_z.shape[-1],
+            q_bins=self.q_bins,
         )
 
-        # 3. Compute Debye & Patterson features with explicit mask
-        debye_feats = compute_debye_features(cb_positions, self.q_bins, padding_mask_2d)
-        patterson_feats = sample_patterson_map(
-            cb_positions, patterson_grid, grid_origin, grid_spacing, padding_mask_2d
-        )
-
-        # 4. Predict & Inject Delta Z
-        adapter = DiffractionPairAdapter(out_channels=native_z.shape[-1])
-        delta_z = adapter(debye_feats, patterson_feats, padding_mask_2d)
-
-        # Return masked augmented pair representation
         return (native_z + delta_z) * padding_mask_2d[..., None]
-
 
 # ==============================================================================
 # 3. Weight Serialization Utilities

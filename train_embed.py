@@ -86,7 +86,8 @@ def generate_synthetic_batch(
     min_res: int = 16,
     max_res: int = 128,
     noise_scale: float = 2.5,
-    seed: int = None
+    seed: int = None,
+    is_neutron: bool = True,
 ) -> Dict[str, Any]:
     """Generates variable-length point clouds with complete backbone geometry padded to N_max."""
     if seed is not None:
@@ -103,7 +104,7 @@ def generate_synthetic_batch(
     
     # Compute Patterson map using true coordinates
     elements = ["C"] * n_valid
-    p_grid, origin, spacing = generate_patterson_map_gemmi(ca_true_valid, elements)
+    p_grid, origin, spacing = generate_patterson_map_gemmi(ca_true_valid, elements, is_neutron=is_neutron)
     
     # Perturb backbone for reference template
     ca_ref_valid = ca_true_valid + np.random.normal(0.0, noise_scale, size=ca_true_valid.shape)
@@ -163,8 +164,9 @@ def main():
     n_max = 512         # Allocation size for spatial pair tensors
     num_channels = 128
     learning_rate = 1e-3
-    num_steps = 50
+    num_steps = 100
     val_interval = 5
+    is_neutron = True
 
     template_config = TemplateEmbedding.Config(num_channels=num_channels)
     global_config = model_config.GlobalConfig()
@@ -188,8 +190,8 @@ def main():
     # PRNG & Synthetic Batch Setup
     key = jax.random.PRNGKey(42)
     print(f"Generating synthetic batches (padded to N_max={n_max})...")
-    val_batch = generate_synthetic_batch(n_max=n_max, min_res=32, max_res=64, noise_scale=2.5, seed=999)
-    dummy_batch = generate_synthetic_batch(n_max=n_max, min_res=16, max_res=128, noise_scale=2.5, seed=123)
+    val_batch = generate_synthetic_batch(n_max=n_max, min_res=32, max_res=64, noise_scale=2.5, seed=999, is_neutron=is_neutron)
+    dummy_batch = generate_synthetic_batch(n_max=n_max, min_res=16, max_res=128, noise_scale=2.5, seed=123, is_neutron=is_neutron)
 
     # Construct masked query_embedding
     query_embed = jax.random.normal(key, (n_max, n_max, num_channels))
@@ -222,14 +224,17 @@ def main():
 
     print("=== All Diagnostics Passed! ===\n")
 
-    # Mask Optimizer Setup (Freeze native AF3 weights, update only adapter)
+    # Masked Adam with Global Gradient Clipping
     def make_adapter_mask(params):
         return jax.tree_util.tree_map_with_path(
             lambda path, _: "diffraction_pair_adapter" in jax.tree_util.keystr(path),
             params
         )
 
-    optimizer = optax.masked(optax.adam(learning_rate), make_adapter_mask)
+    optimizer = optax.chain(
+        optax.clip_by_global_norm(1.0),  # Prevents weight collapse during spikes
+        optax.masked(optax.adam(learning_rate=3e-4), make_adapter_mask)
+    )
     opt_state = optimizer.init(init_params)
 
     # JIT-Compiled Training Step
@@ -287,7 +292,7 @@ def main():
 
     for step in range(1, num_steps + 1):
         key, subkey = jax.random.split(key)
-        train_batch = generate_synthetic_batch(n_max=n_max, min_res=16, max_res=128, noise_scale=2.5)
+        train_batch = generate_synthetic_batch(n_max=n_max, min_res=16, max_res=128, noise_scale=2.5, is_neutron=is_neutron)
         
         params, opt_state, train_loss = train_step(params, opt_state, query_embed, train_batch, subkey)
 

@@ -217,7 +217,7 @@ def _hijack_diffusion_with_custom_loss(
     sample_key: Optional[jnp.ndarray] = None,
     prox_steps: int = 20,
     eta_init: float = 1e-2,
-    sfc_weight: float = 50.0,
+    sfc_weight: float = 10.0,
     lr: int = 0.01,
     steps: int = 200,
 ) -> Conformations:
@@ -429,7 +429,7 @@ class Hijacker:
         oracle: Oracle, 
         sfc: Optional[SFC] = None, 
         key: Optional[jnp.ndarray] = None,
-        sfc_weight: float = 1000.0,
+        sfc_weight: float = 1.0,
         steps: int = None,
     ) -> jnp.ndarray:
         return _hijack_diffusion_with_custom_loss(runner, batch_dict, embeddings, gather_idxs, oracle, sfc, key, sfc_weight=sfc_weight,
