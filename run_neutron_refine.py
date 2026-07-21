@@ -33,11 +33,36 @@ from alphafold3.model.scoring import scoring
 # Import your custom modules
 from af3_neutron.diffraction_embedding import compute_debye_features, sample_patterson_map, compute_diffraction_delta_z
 from af3_neutron.patterson import extract_patterson_grid_from_mtz
+from alphafold3.constants import chemical_components
+
+def get_local_ccd():
+    """Retrieve AF3's local CCD instance by inspecting the constants module."""
+    # Check standard attribute getter names
+    for attr in ["CCD", "DEFAULT_CCD", "get_ccd", "read_ccd", "load_ccd_data"]:
+        if hasattr(chemical_components, attr):
+            val = getattr(chemical_components, attr)
+            return val() if callable(val) else val
+
+    # Dynamic fallback: inspect module attributes for a CCD instance or getter
+    for name in dir(chemical_components):
+        if "ccd" in name.lower():
+            val = getattr(chemical_components, name)
+            if callable(val):
+                try:
+                    res = val()
+                    if res is not None:
+                        return res
+                except Exception:
+                    continue
+            elif val is not None:
+                return val
+    return None
+
+# Load the local CCD once at script startup
+_LOCAL_CCD = get_local_ccd()
 
 # Save the original AF3 method
 _original_embed_template_pair = Evoformer._embed_template_pair
-
-print(_original_embed_template_pair)
 CUSTOM_DIFFRACTION_DATA = {}
 
 def patched_embed_template_pair(self, batch, pair_activations, pair_mask, key):
@@ -106,6 +131,7 @@ flags.DEFINE_string("output_path", "neutron_refined_output.cif", "Output path.")
 flags.DEFINE_integer("num_recycles", 10, "Recycles.", lower_bound=1)
 flags.DEFINE_integer("num_diffusion_samples", 5, "Samples.", lower_bound=1)
 flags.DEFINE_bool("deuterate", False, "Simulate H/D exchange (swap H for D on N, O, S) for neutron scattering.")
+flags.DEFINE_bool("perdeuterate", False, "Simulate perdeuterated system (swap all H for D) for neutron scattering.")
 flags.DEFINE_string("reference_cif", None, "Path to the explicit crystal structure (e.g., 4BD1.cif) to align the AF3 model into the correct unit cell frame.")
 
 FLAGS = flags.FLAGS
@@ -133,6 +159,45 @@ def inject_adapter_weights(af3_params: hk.Params, filepath: str = "diffraction_a
         logging.info(f"Adapter weights successfully injected into: {target_key}")
 
     return merged_params
+
+def resolve_ligand_smiles(ligand_entry: dict) -> str:
+    """Extract or resolve SMILES string for a ligand using AF3's local CCD database."""
+    # 1. Check for direct SMILES in input JSON
+    if "smiles" in ligand_entry:
+        return ligand_entry["smiles"]
+    
+    # 2. Resolve CCD code using AF3's internal CCD database
+    if "ccdCodes" in ligand_entry and len(ligand_entry["ccdCodes"]) > 0:
+        ccd_code = ligand_entry["ccdCodes"][0].upper()
+        
+        if _LOCAL_CCD is not None:
+            # Query local CCD via AF3's component_name_to_info utility
+            info = chemical_components.component_name_to_info(ccd=_LOCAL_CCD, res_name=ccd_code)
+            if info and getattr(info, "pdbx_smiles", None):
+                smiles = info.pdbx_smiles
+                logging.info(f"Resolved CCD code '{ccd_code}' from local AF3 database: {smiles}")
+                return smiles
+                
+            # Direct mapping fallback if _LOCAL_CCD is a dict
+            if hasattr(_LOCAL_CCD, "get"):
+                entry = _LOCAL_CCD.get(ccd_code)
+                if entry:
+                    smiles = None
+                    if isinstance(entry, dict):
+                        smiles = entry.get('_chem_comp.pdbx_smiles') or entry.get('pdbx_smiles')
+                    elif hasattr(entry, 'pdbx_smiles'):
+                        smiles = entry.pdbx_smiles
+                    
+                    if isinstance(smiles, list):
+                        smiles = smiles[0]
+                    if smiles and smiles not in ('?', '.', None):
+                        logging.info(f"Resolved CCD code '{ccd_code}' directly from CCD entry: {smiles}")
+                        return smiles
+
+    raise ValueError(
+        f"Unable to resolve SMILES definition for ligand {ligand_entry} "
+        "using local AF3 CCD database. Please provide 'smiles' explicitly in the JSON."
+    )
 
 def main(argv):
     del argv
@@ -243,21 +308,32 @@ def main(argv):
     plddt_heavy_only = np.array(plddt_per_atom.reshape(-1))
     # ==============================================================================
 
-    logging.info("Parsing ligand SMILES definitions from input JSON...")
+    logging.info("Parsing ligand definitions from input JSON...")
     with open(FLAGS.json_path, "r") as f:
         input_json_data = json.load(f)
 
     ligand_smiles_dict = {}
     for seq in input_json_data.get("sequences", []):
         if "ligand" in seq:
-            l_id = seq["ligand"]["id"][0]
-            l_smiles = seq["ligand"]["smiles"]
+            lig_dict = seq["ligand"]
+            l_id = lig_dict["id"]
+            if isinstance(l_id, list):
+                l_id = l_id[0]
+            
+            l_smiles = resolve_ligand_smiles(lig_dict)
             ligand_smiles_dict[l_id] = l_smiles
+            logging.info(f"Ligand ID '{l_id}' mapped to SMILES: {l_smiles}")
+
+    # Parse covalent bond definitions
+    bonded_atom_pairs = input_json_data.get("bondedAtomPairs", [])
+    if bonded_atom_pairs:
+        logging.info(f"Found {len(bonded_atom_pairs)} covalent bond(s) in input JSON: {bonded_atom_pairs}")
 
     oracle = Hijacker.build_oracle(
         batch_obj.convert_model_output.flat_output_layout,
         np.array(positions_denoised.reshape((-1, 3))[gather_idxs]),
         ligand_smiles_dict=ligand_smiles_dict,
+        bonded_atom_pairs=bonded_atom_pairs,
         ph=7.4,
     )
 
@@ -296,7 +372,7 @@ def main(argv):
     else:
         logging.warning("No --reference_cif provided. The model will remain at the AF3 origin, which may cause high R-factors.")
 
-    sfc = init_neutron_sfc(oracle.atoms, FLAGS.mtz_path, deuterate=FLAGS.deuterate) if FLAGS.mtz_path else None
+    sfc = init_neutron_sfc(oracle.atoms, FLAGS.mtz_path, deuterate=FLAGS.deuterate, perdeuterate=FLAGS.perdeuterate) if FLAGS.mtz_path else None
 
     # Get baseline coordinates
     xyz_baseline = oracle.mapping.initial_coordinates
@@ -311,6 +387,7 @@ def main(argv):
         sfc.b_sol = best_b_sol
 
     # hijack loop using the generalized proximal-based implementation
+    sfc_weight=1000
     conformations = Hijacker.hijack_diffusion(
         runner,
         batch,
@@ -319,6 +396,7 @@ def main(argv):
         oracle,
         sfc,
         jax.random.PRNGKey(0),
+        sfc_weight=sfc_weight
     )
 
     logging.info("Assembling final atomic coordinates...")
@@ -326,13 +404,19 @@ def main(argv):
         conformations[0],
         gather_idxs,
         oracle,
+        sfc_weight=sfc_weight
     )
 
     # hydride append hydrogen to array end, sort by chain and res for viz of ss
     contiguous_indices = np.lexsort((oracle.atoms.res_id, oracle.atoms.chain_id))
     oracle.atoms = oracle.atoms[contiguous_indices]
 
-    if FLAGS.deuterate:
+    if FLAGS.perdeuterate:
+        h_mask = (oracle.atoms.element == "H")
+        oracle.atoms.element[h_mask] = "D"
+        for i in np.where(h_mask)[0]:
+            oracle.atoms.atom_name[i] = "D" + oracle.atoms.atom_name[i][1:]
+    elif FLAGS.deuterate:
         h_mask = (oracle.atoms.element == "H")
         for i in np.where(h_mask)[0]:
             bonded_indices = oracle.atoms.bonds.get_bonds(i)[0]

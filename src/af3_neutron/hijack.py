@@ -114,8 +114,32 @@ def optimize_solvent_grid(sfc_instance, xyz_baseline):
 
     return best_k, best_b
 
+def add_covalent_linkages(oracle_atoms, bonded_atom_pairs):
+    """Add explicit inter-chain covalent bonds to Biotite's BondList."""
+    for pair in bonded_atom_pairs:
+        (chain1, res1, atom1), (chain2, res2, atom2) = pair[0], pair[1]
+
+        # Find index for protein atom (e.g. Chain A, Res 70, OG)
+        idx1_mask = (oracle_atoms.chain_id == chain1) & \
+                    (oracle_atoms.res_id == res1) & \
+                    (oracle_atoms.atom_name == atom1)
+
+        # Find index for ligand atom (e.g. Chain L, Res 1, B)
+        idx2_mask = (oracle_atoms.chain_id == chain2) & \
+                    (oracle_atoms.res_id == res2) & \
+                    (oracle_atoms.atom_name == atom2)
+
+        idxs1 = np.where(idx1_mask)[0]
+        idxs2 = np.where(idx2_mask)[0]
+
+        if len(idxs1) > 0 and len(idxs2) > 0:
+            oracle_atoms.bonds.add_bond(idxs1[0], idxs2[0], bond_type=1)
+            logging.info(f"Registered covalent bond in Hydride Oracle: {chain1}:{res1}:{atom1} <-> {chain2}:{res2}:{atom2}")
+
 def _build_oracle_from_baseline_af3_prediction(
-    flat_layout: Any, x_af3_flat_baseline: jnp.ndarray, ligand_smiles_dict: Dict[str, str], ph: float = 7.4
+    flat_layout: Any, x_af3_flat_baseline: jnp.ndarray, ligand_smiles_dict: Dict[str, str]=None,
+    bonded_atom_pairs=None,
+    ph: float = 7.4
 ) -> Oracle:
     logging.info(
         f"Building full-complex Hydride Oracle from Host baseline prediction at pH {ph}..."
@@ -195,6 +219,9 @@ def _build_oracle_from_baseline_af3_prediction(
             oracle_heavy_indices.append(i)
             af3_source_indices.append(af3_lookup[h_key])
 
+    if bonded_atom_pairs:
+        add_covalent_linkages(oracle_atoms, bonded_atom_pairs)
+
     return Oracle(
         mapping=OracleMapping(
             num_atoms=num_oracle_atoms,
@@ -228,9 +255,8 @@ def _hijack_diffusion_with_custom_loss(
     def proximal_operator_fn(x_0_real: jnp.ndarray, t_hat: jnp.ndarray) -> jnp.ndarray:
         x_0_flat = x_0_real.reshape(-1, 3)
 
-        # (Assuming you are keeping the safe_t clamp to prevent the restraint from freezing at t=0)
-        safe_t = jnp.maximum(t_hat, 5.0)
-        current_eta = eta_init * (safe_t ** 2)
+        # effective guidance weight
+        cur_weight = sfc_weight * jnp.exp(-t_hat)
         
         x_af3_flat = x_0_flat[gather_idxs]
         x_0_heavy_mapped = x_af3_flat[oracle_mapping.source_indices]
@@ -267,7 +293,7 @@ def _hijack_diffusion_with_custom_loss(
             # This completely bypasses the unstable SVD and iterative relaxation Autodiff graphs!
             def sfc_loss_fn(X_eval):
                 e_exp, _ = sfc_instance.compute_loss(X_eval)
-                return sfc_weight * e_exp
+                return cur_weight * e_exp
 
             if sfc_instance is not None:
                 grads_X = jax.grad(sfc_loss_fn)(X_relaxed)
@@ -417,7 +443,8 @@ def _assemble_coordinates_from_conformation(
 
 class Hijacker:
     @staticmethod
-    def build_oracle(layout, denoised_vector_field_positions, ligand_smiles_dict: Dict[str, str], ph: float = 7.4) -> Oracle:
+    def build_oracle(layout, denoised_vector_field_positions, ligand_smiles_dict: Dict[str, str], bonded_atom_pairs=None,
+                     ph: float = 7.4) -> Oracle:
         return _build_oracle_from_baseline_af3_prediction(layout, denoised_vector_field_positions, ligand_smiles_dict, ph=ph)
 
     @staticmethod

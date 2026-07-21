@@ -158,7 +158,7 @@ def align_oracle_to_reference(oracle, reference_path):
     return oracle
 
 
-def init_neutron_sfc(oracle_atoms, mtz_path, deuterate=False):
+def init_neutron_sfc(oracle_atoms, mtz_path, deuterate=False, perdeuterate=False):
     with tempfile.TemporaryDirectory() as tmpdir:
         pdb_path = os.path.join(tmpdir, "oracle.pdb")
         pdb_file = pdb.PDBFile()
@@ -171,10 +171,17 @@ def init_neutron_sfc(oracle_atoms, mtz_path, deuterate=False):
         sfc_atoms.set_annotation("b_factor", b_factors)
         
         # ==============================================================================
-        # SIMULATE H/D EXCHANGE STRICTLY FOR SFC MAP EVALUATION
+        # SIMULATE NEUTRON ISOTOPIC COMPOSITION (H/D EXCHANGE VS PERDEUTERATION)
         # ==============================================================================
-        if deuterate:
-            print("Simulating D2O H/D exchange for structure factor evaluation...", file=sys.stderr)
+        if perdeuterate:
+            print("Enforcing PERDEUTERATION (All H -> D) for structure factor evaluation...", file=sys.stderr)
+            h_mask = (sfc_atoms.element == "H")
+            sfc_atoms.element[h_mask] = "D"
+            for i in np.where(h_mask)[0]:
+                sfc_atoms.atom_name[i] = "D" + sfc_atoms.atom_name[i][1:]
+
+        elif deuterate:
+            print("Simulating D2O H/D exchange (labile N/O/S-H -> D) for structure factor evaluation...", file=sys.stderr)
             h_mask = (sfc_atoms.element == "H")
             for i in np.where(h_mask)[0]:
                 bonded_indices = sfc_atoms.bonds.get_bonds(i)[0]
@@ -186,8 +193,8 @@ def init_neutron_sfc(oracle_atoms, mtz_path, deuterate=False):
         
         sfc_atoms.res_name = np.array([name[:3] for name in sfc_atoms.res_name])
         pdb.set_structure(pdb_file, sfc_atoms)
-        pdb_file.write(pdb_path)
-        
+        pdb_file.write(pdb_path)        
+
         # ==============================================================================
         # FORCE ROBUST FLAGS USING RECIPROCALSPACESHIP
         # ==============================================================================
@@ -242,7 +249,7 @@ def init_neutron_sfc(oracle_atoms, mtz_path, deuterate=False):
         
         # Generate the solvent mask grid dynamically
         sfc.Calc_Fsolvent()
-        sfc.deuterated_solvent = deuterate
+        sfc.deuterated_solvent = (deuterate or perdeuterate)
         
         num_free = int(np.sum(fresh_flags == 0))
         num_work = len(fresh_flags) - num_free
