@@ -387,7 +387,7 @@ def main(argv):
         sfc.b_sol = best_b_sol
 
     # hijack loop using the generalized proximal-based implementation
-    sfc_weight=1000
+    sfc_weight=5000
     conformations = Hijacker.hijack_diffusion(
         runner,
         batch,
@@ -396,7 +396,7 @@ def main(argv):
         oracle,
         sfc,
         jax.random.PRNGKey(0),
-        sfc_weight=sfc_weight
+        sfc_weight=sfc_weight,
     )
 
     logging.info("Assembling final atomic coordinates...")

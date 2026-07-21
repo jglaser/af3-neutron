@@ -254,7 +254,7 @@ def _hijack_diffusion_with_custom_loss(
     oracle: Oracle,
     sfc_instance: Optional[SFC] = None,
     sample_key: Optional[jnp.ndarray] = None,
-    prox_steps: int = 20,
+    prox_steps: int = 3,
     eta_init: float = 1e-2,
     sfc_weight: float = 10.0,
     lr: int = 0.01,
