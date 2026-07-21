@@ -27,6 +27,18 @@ class NeutronSFCalculator(SFcalculator):
     JAX-differentiable structure factor amplitude loss, utilizing a pure
     functional pipeline to guarantee gradient tracking inside XLA loops.
     """
+    def __init__(self, *args, b_factors=None, occupancies=None, **kwargs):
+        # 1. Execute parent initialization (parses PDB and sets Gemmi scattering lengths)
+        super().__init__(*args, **kwargs)
+
+        # 2. Safely overwrite the parent's parsed B-factors/occupancies
+        # using the exact attribute names expected by F_protein
+        if b_factors is not None:
+            self.atom_b_iso = jnp.array(b_factors, dtype=jnp.float32)
+            
+        if occupancies is not None:
+            self.atom_occ = jnp.array(occupancies, dtype=jnp.float32)
+
     def compute_loss(self, xyz, t_hat=None):
         # 1. PURE JAX COMPUTATION
         atom_pos_frac = jnp.tensordot(xyz, self.orth2frac_tensor.T, 1)
@@ -166,9 +178,7 @@ def init_neutron_sfc(oracle_atoms, mtz_path, deuterate=False, perdeuterate=False
         # Clone oracle atoms so Hydride's internal "H" reliance isn't broken
         sfc_atoms = oracle_atoms.copy()
         
-        # Enforce realistic B-factors to prevent high-resolution noise amplification
-        b_factors = np.full(sfc_atoms.array_length(), 30.0, dtype=np.float32)
-        sfc_atoms.set_annotation("b_factor", b_factors)
+        # [REMOVED: The hardcoded 30.0 B-factor block was deleted from here]
         
         # ==============================================================================
         # SIMULATE NEUTRON ISOTOPIC COMPOSITION (H/D EXCHANGE VS PERDEUTERATION)
@@ -229,13 +239,16 @@ def init_neutron_sfc(oracle_atoms, mtz_path, deuterate=False, perdeuterate=False
             
         print(f"Injected Symmetry Header: {cryst1_line.strip()} | Dmin Limit: {dmin_val:.3f}A", file=sys.stderr)
             
+        # Explicitly thread the pLDDT-derived B-factors into the constructor
         sfc = NeutronSFCalculator(
             PDBfile_dir=pdb_path,
             mtzfile_dir=working_mtz_path,
             dmin=dmin_val,
             set_experiment=True,
             freeflag="FreeR_flag",
-            mode="neutron"
+            mode="neutron",
+            b_factors=sfc_atoms.b_factor,
+            occupancies=np.ones(sfc_atoms.array_length(), dtype=np.float32)
         )
         
         # EXPLICITLY OVERRIDE EXPERIMENTAL DATA

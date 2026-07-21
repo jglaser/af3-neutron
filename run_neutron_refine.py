@@ -544,7 +544,10 @@ def main(argv):
     else:
         logging.warning("No --reference_cif provided. The model will remain at the AF3 origin, which may cause high R-factors.")
 
-    sfc = init_neutron_sfc(oracle.atoms, FLAGS.mtz_path, deuterate=FLAGS.deuterate, perdeuterate=FLAGS.perdeuterate) if FLAGS.mtz_path else None
+    sfc = init_neutron_sfc(oracle.atoms,
+                           FLAGS.mtz_path,
+                           deuterate=FLAGS.deuterate,
+                           perdeuterate=FLAGS.perdeuterate) if FLAGS.mtz_path else None
 
     # Get baseline coordinates
     xyz_baseline = oracle.mapping.initial_coordinates
@@ -578,6 +581,20 @@ def main(argv):
         oracle,
         sfc_weight=sfc_weight
     )
+
+    # -------------------------------------------------------------------------
+    # Ligand Diagnostic Verification
+    # -------------------------------------------------------------------------
+    lig_mask = (oracle.atoms.chain_id == "L")
+    logging.info(f"Ligand total atoms: {np.sum(lig_mask)}")
+    logging.info(f"Ligand elements: {np.unique(oracle.atoms.element[lig_mask])}")
+    logging.info(f"Ligand B-factors: min={np.min(oracle.atoms.b_factor[lig_mask]):.2f}, "
+                 f"max={np.max(oracle.atoms.b_factor[lig_mask]):.2f}")
+    logging.info(f"Ligand centroid: {np.mean(oracle.atoms.coord[lig_mask], axis=0)}")
+
+    if hasattr(sfc, "b_c"):
+        lig_b_c = np.array(sfc.b_c)[lig_mask]
+        logging.info(f"SFC Ligand Scattering Lengths (b_c): {lig_b_c}")
 
     # -------------------------------------------------------------------------
     # Output Structure Factor MTZ and MRC Difference Maps
