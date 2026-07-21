@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 import biotite.structure.io.pdbx as pdbx
 import gemmi
+
 from scipy.interpolate import RegularGridInterpolator
 from absl import app, flags
 
@@ -34,6 +35,8 @@ from alphafold3.model.scoring import scoring
 from af3_neutron.diffraction_embedding import compute_debye_features, sample_patterson_map, compute_diffraction_delta_z
 from af3_neutron.patterson import extract_patterson_grid_from_mtz
 from alphafold3.constants import chemical_components
+
+import reciprocalspaceship as rs
 
 def get_local_ccd():
     """Retrieve AF3's local CCD instance by inspecting the constants module."""
@@ -137,6 +140,175 @@ flags.DEFINE_string("reference_cif", None, "Path to the explicit crystal structu
 FLAGS = flags.FLAGS
 
 import pickle
+
+def get_fmodel_and_scale(sfc, xyz_coords):
+    """Computes scaled complex structure factors F_model and scale factor k."""
+    # 1. Compute F_protein (explicitly passing Return=True)
+    f_protein = sfc.Calc_Fprotein(xyz_coords, Return=True)
+    
+    # Fallback to internal attributes if Return=True is overridden
+    if f_protein is None:
+        f_protein = getattr(sfc, "Fprotein_HKL", None)
+        if f_protein is None:
+            f_protein = getattr(sfc, "Fprotein_asu", None)
+
+    if f_protein is None:
+        raise ValueError("Failed to retrieve F_protein from SFcalculator instance.")
+
+    # 2. Determine reflection array & bulk solvent mask
+    if getattr(sfc, "HKL_array", None) is not None:
+        f_mask = getattr(sfc, "Fmask_HKL", jnp.zeros_like(f_protein))
+        d_spacing = getattr(sfc, "dHKL", None)
+    else:
+        f_mask = getattr(sfc, "Fmask_asu", jnp.zeros_like(f_protein))
+        d_spacing = getattr(sfc, "dHasu", None)
+
+    # 3. Calculate 1/d^2 (dr2_tensor) for bulk solvent B-factor attenuation
+    if hasattr(sfc, "dr2_tensor") and sfc.dr2_tensor is not None:
+        dr2_tensor = sfc.dr2_tensor
+    elif d_spacing is not None:
+        dr2_tensor = 1.0 / (jnp.array(d_spacing, dtype=jnp.float32) ** 2)
+    else:
+        dr2_tensor = jnp.zeros(len(f_protein), dtype=jnp.float32)
+
+    # 4. Apply bulk solvent scale (k_sol) and exponential B-factor (b_sol)
+    k_sol = float(getattr(sfc, "k_sol", 0.35))
+    b_sol = float(getattr(sfc, "b_sol", 50.0))
+
+    scaled_fmask = k_sol * jnp.exp(-b_sol * dr2_tensor / 4.0) * f_mask
+    f_model = f_protein + scaled_fmask
+
+    # 5. Compute overall scale factor k_scale against work reflections
+    f_obs = np.array(sfc.Fo, dtype=np.float32)
+    f_mod_abs = np.abs(np.array(f_model, dtype=np.complex64))
+
+    if hasattr(sfc, "freer_mask") and sfc.freer_mask is not None:
+        work_mask = ~np.array(sfc.freer_mask)
+    else:
+        work_mask = np.ones(len(f_obs), dtype=bool)
+
+    k_scale = np.sum(f_obs[work_mask] * f_mod_abs[work_mask]) / (
+        np.sum(f_mod_abs[work_mask] ** 2) + 1e-12
+    )
+    f_model_scaled = k_scale * f_model
+
+    return f_model_scaled, float(k_scale)
+
+
+def export_neutron_maps(
+    sfc_instance,
+    final_coords,
+    mtz_reference_path,
+    output_mtz_path="refined_neutron.mtz",
+    output_2fofc_mrc="refined_2fofc.mrc",
+    output_fofc_mrc="refined_fofc.mrc"
+):
+    """
+    Exports 2Fo-Fc and Fo-Fc map coefficients to an MTZ file
+    and renders 3D real-space density maps (.mrc) for visualization.
+    """
+    logging.info(f"Generating structure factor map coefficients -> {output_mtz_path}")
+
+    # Compute scaled F_model
+    f_model_scaled, k_scale = get_fmodel_and_scale(sfc_instance, final_coords)
+
+    f_obs = np.array(sfc_instance.Fo, dtype=np.float32)
+    sig_f = np.array(getattr(sfc_instance, "SigF", np.ones_like(f_obs)), dtype=np.float32)
+
+    f_calc_abs = np.abs(f_model_scaled)
+    f_calc_phase_deg = np.rad2deg(np.angle(f_model_scaled)) % 360.0
+
+    # 2Fo - Fc Map Amplitudes & Phases
+    f_2fofc = np.maximum(2.0 * f_obs - f_calc_abs, 0.0)
+    ph_2fofc = f_calc_phase_deg
+
+    # Fo - Fc Difference Map Amplitudes & Phases
+    diff = f_obs - f_calc_abs
+    f_fofc = np.abs(diff)
+    ph_fofc = np.where(diff >= 0, f_calc_phase_deg, (f_calc_phase_deg + 180.0) % 360.0)
+
+    # Extract Miller Indices (ensure 32-bit int)
+    if getattr(sfc_instance, "HKL_array", None) is not None:
+        hkl = np.array(sfc_instance.HKL_array, dtype=np.int32)
+    else:
+        hkl = np.array(sfc_instance.Hasu_array, dtype=np.int32)
+
+    if hasattr(sfc_instance, "freer_mask") and sfc_instance.freer_mask is not None:
+        free_flags = np.where(np.array(sfc_instance.freer_mask), 0, 1).astype(np.int32)
+    else:
+        free_flags = np.ones(len(f_obs), dtype=np.int32)
+
+    # 1. Build reciprocalspaceship DataSet with 32-bit inputs
+    ds = rs.DataSet({
+        "H": hkl[:, 0],
+        "K": hkl[:, 1],
+        "L": hkl[:, 2],
+        "FO": f_obs,
+        "SIGFO": sig_f,
+        "FC": f_calc_abs,
+        "PHIC": f_calc_phase_deg,
+        "2FOFCWT": f_2fofc,
+        "PH2FOFCWT": ph_2fofc,
+        "FOFCWT": f_fofc,
+        "PHFOFCWT": ph_fofc,
+        "FWT": f_2fofc,
+        "PHWT": ph_2fofc,
+        "DELFWT": f_fofc,
+        "PHDELWT": ph_fofc,
+        "FreeR_flag": free_flags,
+    })
+
+    # 2. Set MTZ dtypes BEFORE setting the index!
+    ds["H"] = ds["H"].astype("HKL")
+    ds["K"] = ds["K"].astype("HKL")
+    ds["L"] = ds["L"].astype("HKL")
+    ds["FO"] = ds["FO"].astype("F")
+    ds["SIGFO"] = ds["SIGFO"].astype("Q")
+    ds["FC"] = ds["FC"].astype("F")
+    ds["PHIC"] = ds["PHIC"].astype("P")
+    ds["2FOFCWT"] = ds["2FOFCWT"].astype("F")
+    ds["PH2FOFCWT"] = ds["PH2FOFCWT"].astype("P")
+    ds["FOFCWT"] = ds["FOFCWT"].astype("F")
+    ds["PHFOFCWT"] = ds["PHFOFCWT"].astype("P")
+    ds["FWT"] = ds["FWT"].astype("F")
+    ds["PHWT"] = ds["PHWT"].astype("P")
+    ds["DELFWT"] = ds["DELFWT"].astype("F")
+    ds["PHDELWT"] = ds["PHDELWT"].astype("P")
+    ds["FreeR_flag"] = ds["FreeR_flag"].astype("I")
+
+    # 3. Inherit unit cell & spacegroup from reference MTZ
+    mtz_ref = gemmi.read_mtz_file(mtz_reference_path)
+    ds.spacegroup = mtz_ref.spacegroup
+    ds.cell = mtz_ref.cell
+
+    # 4. Set multi-index now that H, K, L have the 'HKL' dtype
+    ds.set_index(["H", "K", "L"], inplace=True)
+
+    # 5. Write out MTZ file
+    ds.write_mtz(output_mtz_path)
+    logging.info(f"Saved refined MTZ map coefficients to: {output_mtz_path}")
+
+    # Generate real-space CCP4/MRC density maps
+    try:
+        mtz_out = gemmi.read_mtz_file(output_mtz_path)
+
+        # 2Fo - Fc map
+        grid_2fofc = mtz_out.transform_f_phi_to_map("2FOFCWT", "PH2FOFCWT", sample_rate=3.0)
+        ccp4_2fofc = gemmi.Ccp4Map()
+        ccp4_2fofc.grid = grid_2fofc
+        ccp4_2fofc.update_ccp4_header(2, True)
+        ccp4_2fofc.write_ccp4_map(output_2fofc_mrc)
+        logging.info(f"Saved 2Fo-Fc real-space map to: {output_2fofc_mrc}")
+
+        # Fo - Fc difference map
+        grid_fofc = mtz_out.transform_f_phi_to_map("FOFCWT", "PHFOFCWT", sample_rate=3.0)
+        ccp4_fofc = gemmi.Ccp4Map()
+        ccp4_fofc.grid = grid_fofc
+        ccp4_fofc.update_ccp4_header(2, True)
+        ccp4_fofc.write_ccp4_map(output_fofc_mrc)
+        logging.info(f"Saved Fo-Fc difference map to: {output_fofc_mrc}")
+    except Exception as e:
+        logging.warning(f"Failed to render real-space MRC maps: {e}")
 
 def inject_adapter_weights(af3_params: hk.Params, filepath: str = "diffraction_adapter_weights.pkl") -> hk.Params:
     """Injects saved adapter weights into AF3's parameter tree at the expected scope path."""
@@ -405,6 +577,18 @@ def main(argv):
         gather_idxs,
         oracle,
         sfc_weight=sfc_weight
+    )
+
+    # -------------------------------------------------------------------------
+    # Output Structure Factor MTZ and MRC Difference Maps
+    # -------------------------------------------------------------------------
+    export_neutron_maps(
+        sfc,
+        oracle.atoms.coord,
+        mtz_reference_path=FLAGS.mtz_path,
+        output_mtz_path="refined_neutron.mtz",
+        output_2fofc_mrc="refined_2fofc.mrc",
+        output_fofc_mrc="refined_fofc.mrc"
     )
 
     # hydride append hydrogen to array end, sort by chain and res for viz of ss
