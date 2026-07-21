@@ -562,7 +562,7 @@ def main(argv):
         sfc.b_sol = best_b_sol
 
     # hijack loop using the generalized proximal-based implementation
-    sfc_weight=5000
+    sfc_weight=15000
     conformations = Hijacker.hijack_diffusion(
         runner,
         batch,
@@ -629,6 +629,12 @@ def main(argv):
 
     output_path = pathlib.Path(FLAGS.output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    # Before writing out the refined CIF file:
+    # Ensure the hetero mask is active for all ligand atoms
+    ligand_chains = list(FLAGS.ligand_smiles_dict.keys()) if hasattr(FLAGS, "ligand_smiles_dict") else ["L"]
+    is_hetero = np.isin(oracle.atoms.chain_id, ligand_chains) | (oracle.atoms.res_name == "BZB")
+    oracle.atoms.hetero = is_hetero
 
     cif_file = pdbx.CIFFile()
     pdbx.set_structure(cif_file, oracle.atoms, data_block="neutron_refined")

@@ -234,6 +234,13 @@ def _build_oracle_from_baseline_af3_prediction(
             oracle_heavy_indices.append(i)
             af3_source_indices.append(af3_lookup[h_key])
 
+    # Create boolean mask for ligand/non-protein chains
+    ligand_chains = list((ligand_smiles_dict or {}).keys())
+    hetero_mask = np.isin(atoms.chain_id, ligand_chains) | (atoms.res_name == "BZB")
+
+    # Assign the 'hetero' annotation so Biotite outputs HETATM in CIF/PDB files
+    atoms.set_annotation("hetero", hetero_mask)
+
     return Oracle(
         mapping=OracleMapping(
             num_atoms=num_oracle_atoms,
