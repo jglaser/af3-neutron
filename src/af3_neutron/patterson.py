@@ -14,11 +14,7 @@ def generate_patterson_pair_rep(mtz_path: str, coords_xyz: np.ndarray, f_obs_lab
     
     # 1. Robust column name resolution
     plausible_labels = [f_obs_label, 'FP', 'FOBS', 'F', 'F-obs', 'F_obs']
-    actual_f_label = None
-    for label in plausible_labels:
-        if label in labels:
-            actual_f_label = label
-            break
+    actual_f_label = next((label for label in plausible_labels if label in labels), None)
             
     if actual_f_label is None:
         raise ValueError(f"Could not find amplitude column. Available MTZ columns: {labels}")
