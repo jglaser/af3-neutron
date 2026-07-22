@@ -1,4 +1,5 @@
 import gemmi
+import jax.Array
 import jax.numpy as jnp
 import numpy as np
 from scipy.interpolate import RegularGridInterpolator
@@ -8,10 +9,6 @@ def generate_patterson_pair_rep(mtz_path: str, coords_xyz: np.ndarray, f_obs_lab
     Computes a Patterson map from MTZ amplitudes and evaluates it at all 
     pairwise interatomic vectors for an N x 3 coordinate array.
     """
-    import gemmi
-    import numpy as np
-    from scipy.interpolate import RegularGridInterpolator
-
     mtz = gemmi.read_mtz_file(mtz_path)
     labels = mtz.column_labels()
     
@@ -87,20 +84,26 @@ def inject_patterson_into_first_bin(batch_dict: dict, patterson_map: jnp.ndarray
 
     N = p_norm.shape[0]
 
-    if "template_distogram" in batch_dict:
-        distogram = batch_dict["template_distogram"]
-        mod_template = jnp.zeros_like(distogram[0])
-        mod_template = mod_template.at[:, :, 0].set(p_norm)
-        batch_dict["template_distogram"] = distogram.at[0].set(mod_template)
-    elif "template_pair_feat" in batch_dict:
-        pair_feat = batch_dict["template_pair_feat"]
-        mod_template = jnp.zeros_like(pair_feat[0])
-        mod_template = mod_template.at[:, :, 0].set(p_norm)
-        batch_dict["template_pair_feat"] = pair_feat.at[0].set(mod_template)
-    else:
-        mod_template = jnp.zeros((1, N, N, 39))
-        mod_template = mod_template.at[0, :, :, 0].set(p_norm)
-        batch_dict["template_distogram"] = mod_template
+    def _inject_template(template: jax.Array):
+        return (template
+            .at[0]
+            .set(
+                jnp.zeros_like(template[0])
+                .at[:, :, 0]
+                .set(p_norm)
+            )
+        )
+
+    match batch_dict.keys():
+        case "template_distogram":
+            batch_dict["template_distogram"] = _inject_template(batch_dict["template_distogram"])
+        case "template_pair_feat":
+            batch_dict["template_pair_feat"] = _inject_template(batch_dict["template_pair_feat"])
+        case _:
+            batch_dict["template_distogram"] = (jnp.zeros((1, N, N, 39))
+                .at[0, :, :, 0]
+                .set(p_norm)
+            )
 
     if "template_mask" in batch_dict:
         batch_dict["template_mask"] = batch_dict["template_mask"].at[0].set(1.0)
@@ -112,36 +115,25 @@ def inject_patterson_into_first_bin(batch_dict: dict, patterson_map: jnp.ndarray
 def extract_patterson_grid_from_mtz(mtz_path: str, fobs_col: str = "FOBS", d_min: float = 2.0) -> tuple:
     """Computes a 3D Patterson grid directly from an MTZ file via FFT."""
     mtz = gemmi.read_mtz_file(mtz_path)
+    hkl = jnp.asarray(mtz.make_miller_array())
+    fobs = jnp.asarray(mtz.column_with_label(fobs_col).array)
 
-    # 1. Extract Miller indices and experimental amplitudes
-    data = np.array(mtz, copy=False)
-    hkl = data[:, :3].astype(int)
-    fobs = mtz.column_with_label(fobs_col).array
+    cell_abc = jnp.asarray([mtz.cell.a, mtz.cell.b, mtz.cell.c])
+    cell_nyquist = jnp.array(cell_abc / (d_min / 3.0), dtype=jnp.int32)
 
-    # 2. Patterson maps use Intensities (F^2) with strictly zero phase
+    grid_origin = jnp.zeros([0., 0., 0.])
+    grid_spacing = cell_abc / cell_nyquist
+
+    h, k, l = hkl.T
+    na, nb, nc = cell_nyquist
+    i1 = (+h % na, +k % nb, +l % nc)
+    i2 = (-h % na, -k % nb, -l % nc)
+
     intensities = fobs ** 2
+    fft_grid = jnp.zeros((na, nb, nc), dtype=jnp.complex64)
+    fft_grid = fft_grid.at[i1].set(intensities)
+    fft_grid = fft_grid.at[i2].set(intensities)
 
-    # 3. Define a dense grid based on the unit cell and Nyquist sampling limit
-    cell = mtz.cell
-    na = int(cell.a / (d_min / 3.0))
-    nb = int(cell.b / (d_min / 3.0))
-    nc = int(cell.c / (d_min / 3.0))
-
-    # 4. Populate reciprocal space grid and enforce Friedel symmetry
-    fft_grid = np.zeros((na, nb, nc), dtype=np.complex64)
-    for (h, k, l), i_val in zip(hkl, intensities):
-        fft_grid[h % na, k % nb, l % nc] = i_val
-        fft_grid[-h % na, -k % nb, -l % nc] = i_val
-
-    # 5. Inverse FFT to real space (Patterson vector space)
-    patterson_grid = np.real(np.fft.ifftn(fft_grid))
-
-    # 6. Extract spatial metadata for JAX map_coordinates
-    grid_origin = np.array([0.0, 0.0, 0.0], dtype=np.float32)
-    grid_spacing = np.array([
-        cell.a / na,
-        cell.b / nb,
-        cell.c / nc
-    ], dtype=np.float32)
-
+    patterson_grid =jnp.fft.ifftn(fft_grid).real
+    
     return patterson_grid, grid_origin, grid_spacing
