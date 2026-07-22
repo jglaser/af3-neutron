@@ -178,7 +178,13 @@ def init_neutron_sfc(oracle_atoms, mtz_path, deuterate=False, perdeuterate=False
         # Clone oracle atoms so Hydride's internal "H" reliance isn't broken
         sfc_atoms = oracle_atoms.copy()
         
-        # [REMOVED: The hardcoded 30.0 B-factor block was deleted from here]
+        # ==============================================================================
+        # SANITIZE B-FACTORS FOR PDB FORMAT COMPATIBILITY
+        # ==============================================================================
+        # De-novo AF3 predictions with low pLDDT can generate B-factors >= 1000.0 A^2.
+        # Clip to [0.0, 999.0] to fit Biotite's 3-pre-decimal digit PDB limit (F6.2).
+        safe_b_factors = np.nan_to_num(sfc_atoms.b_factor, nan=30.0)
+        sfc_atoms.b_factor = np.clip(safe_b_factors, 0.0, 999.0)
         
         # ==============================================================================
         # SIMULATE NEUTRON ISOTOPIC COMPOSITION (H/D EXCHANGE VS PERDEUTERATION)
@@ -203,7 +209,7 @@ def init_neutron_sfc(oracle_atoms, mtz_path, deuterate=False, perdeuterate=False
         
         sfc_atoms.res_name = np.array([name[:3] for name in sfc_atoms.res_name])
         pdb.set_structure(pdb_file, sfc_atoms)
-        pdb_file.write(pdb_path)        
+        pdb_file.write(pdb_path)
 
         # ==============================================================================
         # FORCE ROBUST FLAGS USING RECIPROCALSPACESHIP
