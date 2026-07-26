@@ -135,6 +135,10 @@ flags.DEFINE_integer("num_recycles", 10, "Recycles.", lower_bound=1)
 flags.DEFINE_integer("num_diffusion_samples", 5, "Samples.", lower_bound=1)
 flags.DEFINE_bool("deuterate", False, "Simulate H/D exchange (swap H for D on N, O, S) for neutron scattering.")
 flags.DEFINE_bool("perdeuterate", False, "Simulate perdeuterated system (swap all H for D) for neutron scattering.")
+flags.DEFINE_float("smc_lambda", 0.0, "SMC inverse temperature on the crystallographic potential. 0 disables SMC and reproduces the stock sampler exactly. Try 1-10 and watch the ESS log line.")
+flags.DEFINE_float("smc_sigma_on", 12.0, "Noise level (A) at which SMC selection ramps on.")
+flags.DEFINE_float("smc_sigma_start", -1.0, "If > 0, warm-start the trajectory from the baseline AF3 model noised to this sigma (A) instead of from pure noise. Recommended whenever SMC is enabled.")
+flags.DEFINE_float("smc_ess_threshold", 0.5, "Resample when ESS/num_diffusion_samples falls below this.")
 flags.DEFINE_string("reference_cif", None, "Path to the explicit crystal structure (e.g., 4BD1.cif) to align the AF3 model into the correct unit cell frame.")
 
 FLAGS = flags.FLAGS
@@ -563,6 +567,28 @@ def main(argv):
 
     # hijack loop using the generalized proximal-based implementation
     sfc_weight=15000
+
+    smc_config = None
+    x_start = None
+    if FLAGS.smc_lambda > 0.0:
+        from af3_neutron.smc import SMCConfig
+        smc_config = SMCConfig(
+            lambda_max=FLAGS.smc_lambda,
+            sigma_on=FLAGS.smc_sigma_on,
+            ess_threshold=FLAGS.smc_ess_threshold,
+            sigma_start=(FLAGS.smc_sigma_start if FLAGS.smc_sigma_start > 0 else None),
+        )
+        if FLAGS.smc_sigma_start > 0:
+            # Warm start from the baseline AF3 prediction, in AF3 dense layout.
+            # The proximal operator re-derives the crystal frame each step, so
+            # this does not need to be pre-aligned.
+            x_start = positions_denoised
+        if FLAGS.num_diffusion_samples < 8:
+            logging.warning(
+                "SMC is enabled with num_diffusion_samples=%d; selection needs an "
+                "ensemble. Use 16-64.", FLAGS.num_diffusion_samples
+            )
+
     conformations = Hijacker.hijack_diffusion(
         runner,
         batch,
@@ -572,6 +598,8 @@ def main(argv):
         sfc,
         jax.random.PRNGKey(0),
         sfc_weight=sfc_weight,
+        smc_config=smc_config,
+        x_start=x_start,
     )
 
     logging.info("Assembling final atomic coordinates...")

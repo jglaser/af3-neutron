@@ -266,6 +266,8 @@ def _hijack_diffusion_with_custom_loss(
     sfc_weight: float = 10.0,
     lr: int = 0.01,
     steps: int = 200,
+    smc_config=None,
+    x_start: Optional[jnp.ndarray] = None,
 ) -> Conformations:
     oracle_mapping = oracle.mapping
     params = hydride.get_relaxation_params(oracle.atoms)
@@ -336,6 +338,10 @@ def _hijack_diffusion_with_custom_loss(
         R_optimized = jax.lax.fori_loop(0, prox_steps, step_body, R_current)
 
         # --- TERMINAL LOGGING BLOCK (Also updated for CA alignment) ---
+        # V is the per-particle crystallographic potential used for SMC
+        # weighting.  compute_loss below was already being evaluated for the
+        # R_free log line; we simply stop discarding its scalar.
+        V = jnp.zeros(())
         if sfc_instance is not None:
             R_ref = oracle_mapping.initial_coordinates[oracle_mapping.heavy_indices]
             
@@ -359,11 +365,12 @@ def _hijack_diffusion_with_custom_loss(
             X_final = oracle_mapping.initial_coordinates.at[oracle_mapping.heavy_indices].set(R_log_aligned)
             X_rel, _, _ = hydride.relax_hydrogen_jit(X_final, *params, iterations=5)
 
-            _, (rw, rf) = sfc_instance.compute_loss(X_rel)
+            e_exp, (rw, rf) = sfc_instance.compute_loss(X_rel)
+            V = e_exp
             jax.debug.print("t_hat: {t:.3f} | R_work: {rw:.4f} | R_free: {rf:.4f}", t=t_hat, rw=rw, rf=rf)
 
         x_af3_updated = x_af3_flat.at[oracle_mapping.source_indices].set(R_optimized)
-        return x_0_flat.at[gather_idxs].set(x_af3_updated).reshape(x_0_real.shape)
+        return x_0_flat.at[gather_idxs].set(x_af3_updated).reshape(x_0_real.shape), V
 
     # Create a boolean array indicating which heavy atoms are C-alphas
     heavy_atom_names = oracle.atoms.atom_name[oracle_mapping.heavy_indices]
@@ -377,6 +384,8 @@ def _hijack_diffusion_with_custom_loss(
         rng_key,
         proximal_operator_fn,
         steps,
+        smc_config,
+        x_start,
     )
 
     return Conformations(atom_positions=atom_positions)
@@ -489,9 +498,11 @@ class Hijacker:
         key: Optional[jnp.ndarray] = None,
         sfc_weight: float = 1.0,
         steps: int = None,
+        smc_config=None,
+        x_start: Optional[jnp.ndarray] = None,
     ) -> jnp.ndarray:
         return _hijack_diffusion_with_custom_loss(runner, batch_dict, embeddings, gather_idxs, oracle, sfc, key, sfc_weight=sfc_weight,
-                                                  steps=steps)
+                                                  steps=steps, smc_config=smc_config, x_start=x_start)
 
     @staticmethod
     def assemble_coordinates(atom_positions: jnp.ndarray, gather_idxs: jnp.ndarray, oracle: Oracle, sfc: Optional[SFC] = None, sfc_weight: float = 1000.0) -> np.ndarray:

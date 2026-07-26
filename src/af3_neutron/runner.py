@@ -12,6 +12,7 @@ from alphafold3.model.network import diffusion_head
 from alphafold3.model.network import confidence_head
 from alphafold3.model import feat_batch
 
+from . import smc as smc_mod
 from .types import HostEmbeddings
 
 def make_model_config(
@@ -71,7 +72,7 @@ class _DiffusionHijackWrapper(_HostModule):
         self.diffusion_module = diffusion_head.DiffusionHead(self.config.heads.diffusion, self.config.global_config)
 
     def __call__(self, batch: feat_batch.Batch, embeddings: HostEmbeddings, sample_key: jnp.ndarray, proximal_fn: Callable,
-                 steps: int = None) -> jnp.ndarray:
+                 steps: int = None, smc_config=None, x_start=None) -> jnp.ndarray:
         sample_config = self.config.heads.diffusion.eval
 
         if steps is not None:
@@ -89,7 +90,10 @@ class _DiffusionHijackWrapper(_HostModule):
             # 2. Evaluate proximal_fn natively on the device
             return proximal_fn(x_0_real, t_hat)
 
-        sample_results = diffusion_head.sample(denoising_step=hijacked_denoising_step, batch=batch, key=sample_key, config=sample_config)
+        # smc_mod.sample is signature-compatible with diffusion_head.sample and
+        # reduces to it exactly when smc_config is None or lambda_max == 0.
+        sample_results = smc_mod.sample(denoising_step=hijacked_denoising_step, batch=batch, key=sample_key, config=sample_config,
+                                        smc_config=smc_config, x_start=x_start)
         return sample_results["atom_positions"]
 
 class HostRunner:
@@ -119,10 +123,10 @@ class HostRunner:
     @functools.cached_property
     def sample_guided_diffusion(self) -> Callable:
         @hk.transform
-        def forward_sample(batch_dict: Dict[str, Any], embeddings: HostEmbeddings, sample_key: jnp.ndarray, proximal_fn: Callable, steps=200) -> jnp.ndarray:
-            return _DiffusionHijackWrapper(self._model_config)(feat_batch.Batch.from_data_dict(batch_dict), embeddings, sample_key, proximal_fn, steps)
+        def forward_sample(batch_dict: Dict[str, Any], embeddings: HostEmbeddings, sample_key: jnp.ndarray, proximal_fn: Callable, steps=200, smc_config=None, x_start=None) -> jnp.ndarray:
+            return _DiffusionHijackWrapper(self._model_config)(feat_batch.Batch.from_data_dict(batch_dict), embeddings, sample_key, proximal_fn, steps, smc_config, x_start)
 
-        return functools.partial(jax.jit(forward_sample.apply, static_argnames=['proximal_fn', 'steps'], device=self._device), self.model_params)
+        return functools.partial(jax.jit(forward_sample.apply, static_argnames=['proximal_fn', 'steps', 'smc_config'], device=self._device), self.model_params)
 
     def predict_confidence(self, sample_key, batch_dict, embeddings, positions_denoised):
         """
