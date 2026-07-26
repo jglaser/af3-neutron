@@ -41,11 +41,13 @@ region; it will not rescue a globally wrong model.
 from __future__ import annotations
 
 import dataclasses
+import inspect
 from typing import Any, Callable, Optional, Tuple
 
 import haiku as hk
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 # AF3 is imported lazily so that the pure SMC helpers (SMCConfig, lambda_ramp,
 # systematic_resample, effective_sample_size) can be imported and unit-tested in
@@ -107,6 +109,37 @@ class SMCConfig:
         topology has committed.  The two are independent knobs.
     ess_threshold
         Resample when ``ESS/num_samples`` falls below this.
+    lambda_mode
+        ``"fixed"`` uses ``lambda_max`` with the sigma ramp.  ``"adaptive_ess"``
+        instead solves, at every level, for the lambda that puts ESS at
+        ``ess_target * num_samples``.
+
+        Use adaptive mode only once the potential is known to carry signal.  A
+        fixed lambda has to be matched to the *inter-particle spread* of V, not
+        to V itself, and that spread is not knowable in advance: in a run with
+        ``lambda_max=1`` on a normalised LSQ residual, V_mean was 0.9395 and
+        V_best 0.9371, so the log-weight spread was 0.88 * 0.0024 = 0.002 and ESS
+        sat at exactly 8.0/8 for all 200 levels -- zero resampling, SMC a no-op.
+        Reaching an ESS of 4/8 there would have needed lambda ~ 400.
+
+        But cranking lambda to 400 would have been wrong, and so would adaptive
+        mode: if the spread in V is noise rather than signal, adaptive tempering
+        will faithfully amplify the noise until ESS hits the target and then
+        resample on it.  Make V discriminating first (see ``guidance_d_high`` in
+        the sfc adapter), then let adaptive mode set the scale.
+    sigma_end
+        Stop the schedule at this sigma instead of running to zero.  Together
+        with ``sigma_start`` this lets the trajectory be run in *segments* from
+        the host, recomputing the bulk-solvent mask (and rescaling k_sol/b_sol)
+        between them -- which is the practical answer to a stale mask, since
+        ``Calc_Fsolvent`` is host-side numpy/gemmi and cannot run inside the
+        jitted loop.  Four segments of 50 levels is usually plenty: the mask is
+        insensitive to sub-Angstrom conformational change, and only needs
+        revisiting when the model has moved appreciably.
+    unroll
+        ``hk.scan`` unroll factor.  AF3 uses 4, which is fine when the step is
+        just the network.  Here each step also carries the guidance operator and
+        its gradient, so 4 live copies multiply peak memory by ~4x.  Default 1.
     lambda_floor
         Never resample while ``lambda(sigma)`` is below this.  Resampling on an
         uninformative potential is not merely useless, it is harmful: the
@@ -142,13 +175,52 @@ class SMCConfig:
     sigma_width: float = 6.0
     ess_threshold: float = 0.5
     lambda_floor: float = 0.05
+    lambda_mode: str = "fixed"      # "fixed" | "adaptive_ess"
+    ess_target: float = 0.5         # for adaptive_ess: target ESS/num_samples
+    lambda_cap: float = 1.0e4       # ceiling on the adaptive solve
+    unroll: int = 1                 # hk.scan unroll; AF3 uses 4
     sigma_start: Optional[float] = None
+    sigma_end: Optional[float] = None
     augment: bool = True
     verbose: bool = True
 
 
 def lambda_ramp(sigma: jnp.ndarray, cfg: SMCConfig) -> jnp.ndarray:
     return cfg.lambda_max * jax.nn.sigmoid((cfg.sigma_on - sigma) / cfg.sigma_width)
+
+
+def _ess_from_centred(lam: jnp.ndarray, v_centred: jnp.ndarray) -> jnp.ndarray:
+    lw = -lam * v_centred
+    lw = lw - jax.scipy.special.logsumexp(lw)
+    return 1.0 / jnp.maximum(jnp.sum(jnp.exp(2.0 * lw)), 1e-12)
+
+
+def adaptive_lambda(
+    potential: jnp.ndarray, cfg: SMCConfig, n_particles: int
+) -> jnp.ndarray:
+    """Smallest lambda whose weights give ``ess_target * n_particles``.
+
+    ESS is monotonically decreasing in lambda, so a fixed-iteration bisection is
+    exact enough and jit-friendly.  Scale-free: it does not matter whether the
+    potential is a normalised residual, an NLL, or an R-factor.
+
+    Returns ``lambda_cap`` if even that cannot reach the target -- which is
+    itself the useful signal, and is logged, because it means the ensemble's
+    spread in V is too small to select on.
+    """
+    v = potential - jnp.mean(potential)
+    target = cfg.ess_target * n_particles
+    lo = jnp.asarray(0.0)
+    hi = jnp.asarray(cfg.lambda_cap)
+
+    def body(_, bounds):
+        lo, hi = bounds
+        mid = 0.5 * (lo + hi)
+        too_flat = _ess_from_centred(mid, v) > target
+        return (jnp.where(too_flat, mid, lo), jnp.where(too_flat, hi, mid))
+
+    lo, hi = jax.lax.fori_loop(0, 40, body, (lo, hi))
+    return 0.5 * (lo + hi)
 
 
 def systematic_resample(key: jnp.ndarray, log_w: jnp.ndarray) -> jnp.ndarray:
@@ -166,27 +238,64 @@ def effective_sample_size(log_w: jnp.ndarray) -> jnp.ndarray:
     return 1.0 / jnp.maximum(jnp.sum(p**2), 1e-12)
 
 
-def build_schedule(steps: int, sigma_start: Optional[float] = None) -> jnp.ndarray:
+def _schedule_defaults():
+    """AF3's own schedule constants, read from its function signature.
+
+    Not hardcoded: ``smin``/``smax``/``p`` come from
+    ``diffusion_head.noise_schedule``'s defaults and ``SIGMA_DATA`` from the
+    module, so a retune upstream is picked up rather than silently ignored.
+    ``tests/test_smc_sampler.py`` round-trips the inversion against AF3's own
+    function to catch a signature change.
+    """
+    dh = _af3()
+    params = inspect.signature(dh.noise_schedule).parameters
+    try:
+        smin = float(params["smin"].default)
+        smax = float(params["smax"].default)
+        p = float(params["p"].default)
+    except (KeyError, TypeError) as exc:  # pragma: no cover
+        raise RuntimeError(
+            "alphafold3's noise_schedule no longer exposes smin/smax/p defaults; "
+            "af3_neutron.smc.build_schedule needs updating"
+        ) from exc
+    return float(dh.SIGMA_DATA), smin, smax, p
+
+
+def build_schedule(
+    steps: int,
+    sigma_start: Optional[float] = None,
+    sigma_end: Optional[float] = None,
+) -> jnp.ndarray:
     """AF3's noise schedule, optionally reparametrised to begin at ``sigma_start``.
 
-    ``sigma_start`` is honoured by inverting AF3's own ``noise_schedule`` by
-    bisection, so none of its constants (SIGMA_DATA, smin, smax, p) are
-    duplicated here.  Reparametrising over ``[t0, 1]`` rather than truncating the
-    full grid matters: the EDM update propagates x_0 with weight
+    The inversion is done in plain Python/numpy, never with jnp ops.  Inside a
+    ``jax.jit`` trace every jnp operation returns a tracer even when its inputs
+    are Python floats -- constant folding happens in XLA, not at trace time -- so
+    an earlier bisection that called ``float(noise_schedule(mid))`` raised
+    ``ConcretizationTypeError``.  ``sigma_start`` is a static field of
+    ``SMCConfig``, so resolving ``t0`` at trace time in numpy is both legal and
+    free.
+
+    Reparametrising over ``[t0, 1]`` rather than truncating the full grid
+    matters: the EDM update propagates x_0 with weight
     ``a = step_scale * |dsigma| / sigma``, and ``a > 1`` over-relaxes and
     diverges.  Truncating a coarse schedule at 2 A leaves jumps of 8 -> 0.5 A,
     i.e. ``a = 1.4``.
     """
-    if sigma_start is None:
+    if sigma_start is None and sigma_end is None:
         return noise_schedule(jnp.linspace(0, 1, steps + 1))
-    lo, hi = 0.0, 1.0 - 1e-9
-    for _ in range(60):
-        mid = 0.5 * (lo + hi)
-        if float(noise_schedule(jnp.asarray(mid))) > sigma_start:
-            lo = mid
-        else:
-            hi = mid
-    return noise_schedule(jnp.linspace(0.5 * (lo + hi), 1.0, steps + 1))
+    sd, smin, smax, p = _schedule_defaults()
+    a = smax ** (1.0 / p)
+    b = smin ** (1.0 / p)
+
+    def t_of(sigma):
+        return float(
+            np.clip(((float(sigma) / sd) ** (1.0 / p) - a) / (b - a), 0.0, 1.0 - 1e-9)
+        )
+
+    t0 = 0.0 if sigma_start is None else t_of(sigma_start)
+    t1 = 1.0 if sigma_end is None else t_of(sigma_end)
+    return noise_schedule(jnp.linspace(t0, t1, steps + 1))
 
 
 def sample(
@@ -291,11 +400,11 @@ def sample(
         if cfg.verbose:
             jax.debug.print(
                 "sigma {s:8.3f} | lambda {l:6.3f} | V_mean {vm:9.4f} "
-                "V_best {vb:9.4f} | ESS {e:5.1f}/{n} | resample {r}",
+                "V_spread {vs:9.2e} | ESS {e:5.1f}/{n} | resample {r}",
                 s=sigma,
                 l=lam,
                 vm=jnp.mean(potential),
-                vb=jnp.min(potential),
+                vs=jnp.std(potential),
                 e=ess,
                 n=num_samples,
                 r=do_resample.astype(jnp.int32),
@@ -303,7 +412,7 @@ def sample(
 
         return (particles, log_w, lam_v, gkey), None
 
-    noise_levels = build_schedule(config.steps, cfg.sigma_start)
+    noise_levels = build_schedule(config.steps, cfg.sigma_start, cfg.sigma_end)
 
     key, noise_key, global_key = jax.random.split(key, 3)
     positions = jax.random.normal(noise_key, (num_samples,) + mask.shape + (3,))
@@ -327,7 +436,7 @@ def sample(
     )
 
     (particles, log_w, lam_v, _), _ = hk.scan(
-        scan_body, init, noise_levels[1:], unroll=4
+        scan_body, init, noise_levels[1:], unroll=cfg.unroll
     )
     _, positions_out, _ = particles
 

@@ -94,20 +94,46 @@ def _guided(in_hk, smc, denoising_step, batch, key, config, **kw):
     )
 
 
+# Coordinates are float32 and accumulate over ~40-200 scan steps.  Bit-identity
+# with AF3 is not achievable and was the wrong contract to assert: the guided
+# scan carries extra state (log weights, the resampling key) and defaults to
+# `unroll=1` where AF3 uses 4, both of which change XLA fusion and therefore
+# float32 rounding.  Measured discrepancy at unroll=1 over 40 steps: 4.8e-06 A.
+#
+# The gate is set where it still catches what matters.  A structural divergence
+# -- a dropped augmentation, a mis-signed step, an off-by-one in the schedule --
+# moves atoms by 1e-2 A or more, three orders of magnitude above this tolerance.
+PARITY_ATOL = 1e-4
+
+
 @requires_af3
 @pytest.mark.parametrize("kind", ["none", "lambda_zero"])
+@pytest.mark.parametrize("unroll", [4, 1])
 def test_disabled_matches_stock_af3(
-    smc, in_hk, af3_diffusion_head, batch, sample_config, denoise_plain, kind
+    smc, in_hk, af3_diffusion_head, batch, sample_config, denoise_plain, kind, unroll
 ):
+    """With SMC off the guided sampler must reproduce AF3's trajectory.
+
+    Parametrised over ``unroll`` so the two regimes are visible: 4 matches AF3's
+    own scan and should agree most closely, 1 is our memory-driven default.
+    """
     key = jax.random.PRNGKey(7)
-    cfg = None if kind == "none" else smc.SMCConfig(lambda_max=0.0, verbose=False)
+    if kind == "none" and unroll == 4:
+        pytest.skip("smc_config=None cannot carry a non-default unroll")
+    cfg = (
+        None
+        if kind == "none"
+        else smc.SMCConfig(lambda_max=0.0, unroll=unroll, verbose=False)
+    )
 
     expected = _stock_positions(in_hk, af3_diffusion_head, denoise_plain, batch, key, sample_config)
     got = _guided(in_hk, smc, denoise_plain, batch, key, sample_config, smc_config=cfg)["atom_positions"]
 
-    assert jnp.array_equal(expected, got), (
-        "guided sampler diverged from stock AF3 with SMC disabled; max |diff| = "
-        f"{float(jnp.max(jnp.abs(expected - got))):.3e}"
+    max_diff = float(jnp.max(jnp.abs(expected - got)))
+    assert max_diff < PARITY_ATOL, (
+        f"guided sampler diverged from stock AF3 with SMC disabled (unroll={unroll}); "
+        f"max |diff| = {max_diff:.3e} A, tolerance {PARITY_ATOL:.0e}. "
+        "A value near 1e-6 is float32 accumulation; 1e-2 or above is structural."
     )
 
 
@@ -122,7 +148,7 @@ def test_tuple_returning_step_is_a_noop_when_disabled(
         in_hk, smc, denoise_with_potential, batch, key, sample_config,
         smc_config=smc.SMCConfig(lambda_max=0.0, verbose=False),
     )["atom_positions"]
-    assert jnp.array_equal(expected, got)
+    assert float(jnp.max(jnp.abs(expected - got))) < PARITY_ATOL
 
 
 @requires_af3
@@ -136,7 +162,7 @@ def test_best_first_ordering_is_not_applied_when_disabled(
         in_hk, smc, denoise_with_potential, batch, key, sample_config,
         smc_config=smc.SMCConfig(lambda_max=0.0, verbose=False),
     )["atom_positions"]
-    assert jnp.array_equal(expected, got)
+    assert float(jnp.max(jnp.abs(expected - got))) < PARITY_ATOL
 
 
 @requires_af3
@@ -150,9 +176,13 @@ def test_output_contract_matches_af3_plus_extras(
             denoising_step=denoise_plain, batch=batch, key=key, config=sample_config
         )
     )
+    # verbose=True on purpose: jax.debug.print resolves its format string at
+    # trace time, so a stale field is a KeyError from inside the scan.  Every
+    # other test here passes verbose=False, which is how a mismatched {vb} field
+    # shipped.  One live test must exercise the logging path.
     out = _guided(
         in_hk, smc, denoise_with_potential, batch, key, sample_config,
-        smc_config=smc.SMCConfig(lambda_max=1.0, verbose=False),
+        smc_config=smc.SMCConfig(lambda_max=1.0, verbose=True),
     )
     assert set(stock).issubset(set(out))
     for k in stock:
@@ -166,6 +196,40 @@ def test_output_contract_matches_af3_plus_extras(
 # ==========================================================================
 # schedule: the divergence guard
 # ==========================================================================
+@requires_af3
+@pytest.mark.parametrize("sigma_start", [0.5, 2.0, 8.0, 15.0, 100.0])
+def test_schedule_inversion_round_trips_against_af3(smc, af3_diffusion_head, sigma_start):
+    """The analytic inversion must agree with AF3's own noise_schedule.
+
+    build_schedule resolves t0 in numpy (it runs inside a jit trace, where any
+    jnp op would return a tracer and `float()` would raise
+    ConcretizationTypeError).  That means the inversion is a separate code path
+    from AF3's forward schedule, so it has to be checked against it.
+    """
+    sigmas = smc.build_schedule(8, sigma_start)
+    assert float(sigmas[0]) == pytest.approx(sigma_start, rel=1e-4)
+    # and the constants really came from AF3, not from a copy
+    sd, smin, smax, p = smc._schedule_defaults()
+    assert sd == af3_diffusion_head.SIGMA_DATA
+    t = jnp.linspace(0.0, 1.0, 11)
+    np.testing.assert_allclose(
+        np.asarray(smc.noise_schedule(t)),
+        np.asarray(af3_diffusion_head.noise_schedule(t)),
+        rtol=1e-6,
+    )
+
+
+def test_logged_sigma_is_churn_inflated(smc, af3_diffusion_head):
+    """t_hat = sigma * (1 + gamma_0), so the logged value exceeds the schedule.
+
+    Pins the interpretation of the log: a first line reading 4608 A comes from
+    2560 * 1.8, not from a schedule that starts at 4608.
+    """
+    s0 = float(smc.build_schedule(200, None)[0])
+    assert s0 == pytest.approx(af3_diffusion_head.SIGMA_DATA * 160.0, rel=1e-4)
+    assert s0 * 1.8 == pytest.approx(4608.0, rel=1e-3)
+
+
 @requires_af3
 @pytest.mark.parametrize("steps,sigma_start", [(200, None), (200, 15.0), (60, 8.0), (30, 2.0)])
 def test_warm_start_schedule_is_stable(

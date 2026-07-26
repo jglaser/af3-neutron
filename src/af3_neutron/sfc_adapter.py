@@ -82,6 +82,18 @@ class NeutronSFCalculator(SFcalculator):
         # NOTE: The low-resolution cutoff has been removed so the model 
         # can fit the newly activated solvent envelope at low angles.
         mask_valid = (f_obs > 0.0) & (~jnp.isnan(f_obs))
+
+        # Resolution window for guidance.  Set `sfc.guidance_d_high = 8.0` to
+        # restrict the target to d >= 8 A.  This is not an optimisation, it is
+        # what makes the potential informative: a model 9.9 A from truth has no
+        # signal past ~4 A, and for this cell only 1.6% of the 37,877 unique
+        # reflections lie beyond 8 A -- so summing to 2.0 A drowns the usable
+        # shells in noise.  It also cuts the (n_atoms x n_hkl) intermediate that
+        # dominates peak memory by ~50x.
+        d_high = getattr(self, "guidance_d_high", None)
+        if d_high is not None:
+            d_spacing = 1.0 / jnp.sqrt(jnp.maximum(dr2_tensor, 1e-12))
+            mask_valid = mask_valid & (d_spacing >= d_high)
         
         mask_free = mask_valid & self.freer_mask
         mask_work = mask_valid & (~self.freer_mask)

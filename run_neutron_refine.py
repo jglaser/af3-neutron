@@ -138,6 +138,10 @@ flags.DEFINE_bool("perdeuterate", False, "Simulate perdeuterated system (swap al
 flags.DEFINE_float("smc_lambda", 0.0, "SMC inverse temperature on the crystallographic potential. 0 disables SMC and reproduces the stock sampler exactly. Try 1-10 and watch the ESS log line.")
 flags.DEFINE_float("smc_sigma_on", 12.0, "Noise level (A) at which SMC selection ramps on.")
 flags.DEFINE_float("smc_sigma_start", -1.0, "If > 0, warm-start the trajectory from the baseline AF3 model noised to this sigma (A) instead of from pure noise. Recommended whenever SMC is enabled.")
+flags.DEFINE_string("smc_lambda_mode", "fixed", "SMC lambda scaling: 'fixed' uses --smc_lambda directly; 'adaptive_ess' solves each level for the lambda that hits --smc_ess_target. Use adaptive only once the potential is known to discriminate.")
+flags.DEFINE_float("smc_ess_target", 0.5, "Target ESS/num_diffusion_samples for --smc_lambda_mode=adaptive_ess.")
+flags.DEFINE_integer("smc_unroll", 1, "hk.scan unroll factor. AF3 uses 4; with the guidance operator in the loop that multiplies peak memory ~4x.", lower_bound=1)
+flags.DEFINE_float("guidance_d_high", -1.0, "If > 0, restrict the crystallographic target to d >= this value (A) during sampling. Strongly recommended: the high-resolution shells carry no signal for a model far from truth, and they dominate both the loss and the memory.")
 flags.DEFINE_float("smc_ess_threshold", 0.5, "Resample when ESS/num_diffusion_samples falls below this.")
 flags.DEFINE_string("reference_cif", None, "Path to the explicit crystal structure (e.g., 4BD1.cif) to align the AF3 model into the correct unit cell frame.")
 
@@ -557,6 +561,10 @@ def main(argv):
     xyz_baseline = oracle.mapping.initial_coordinates
 
     # Run the grid search to find the perfect neutron solvent parameters
+    if sfc is not None and FLAGS.guidance_d_high > 0:
+        sfc.guidance_d_high = FLAGS.guidance_d_high
+        logging.info("Guidance target restricted to d >= %.1f A", FLAGS.guidance_d_high)
+
     if sfc is not None:
         best_k_sol, best_b_sol = optimize_solvent_grid(sfc, xyz_baseline)
         print(f"Optimal Solvent Found -> k_sol: {best_k_sol:.3f}, b_sol: {best_b_sol:.1f}")
@@ -576,6 +584,9 @@ def main(argv):
             lambda_max=FLAGS.smc_lambda,
             sigma_on=FLAGS.smc_sigma_on,
             ess_threshold=FLAGS.smc_ess_threshold,
+            lambda_mode=FLAGS.smc_lambda_mode,
+            ess_target=FLAGS.smc_ess_target,
+            unroll=FLAGS.smc_unroll,
             sigma_start=(FLAGS.smc_sigma_start if FLAGS.smc_sigma_start > 0 else None),
         )
         if FLAGS.smc_sigma_start > 0:
