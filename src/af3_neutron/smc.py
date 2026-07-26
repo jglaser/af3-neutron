@@ -298,6 +298,52 @@ def build_schedule(
     return noise_schedule(jnp.linspace(t0, t1, steps + 1))
 
 
+def superposed_rmsd(a: jnp.ndarray, b: jnp.ndarray, w: jnp.ndarray) -> jnp.ndarray:
+    """Kabsch-superposed, mask-weighted r.m.s.d. between two atom sets.
+
+    Superposition is required, not optional: every particle receives its own
+    random augmentation each step, so two particles live in different rigid
+    frames and a raw coordinate r.m.s.d. between them measures the frames, not
+    the structures.
+    """
+    n = jnp.maximum(jnp.sum(w), 1.0)
+    ca = jnp.sum(a * w[:, None], axis=0) / n
+    cb = jnp.sum(b * w[:, None], axis=0) / n
+    p = (a - ca) * w[:, None]
+    q = (b - cb) * w[:, None]
+    h = p.T @ q
+    u, _, vt = jnp.linalg.svd(h)
+    d = jnp.sign(jnp.linalg.det(u) * jnp.linalg.det(vt))
+    r = u @ jnp.diag(jnp.stack([jnp.ones(()), jnp.ones(()), d])) @ vt
+    diff = ((a - ca) @ r) - (b - cb)
+    return jnp.sqrt(jnp.sum(w * jnp.sum(diff**2, axis=-1)) / n)
+
+
+def ensemble_diversity(positions: jnp.ndarray, mask: jnp.ndarray) -> jnp.ndarray:
+    """Mean superposed pairwise r.m.s.d. across the particle ensemble.
+
+    This is the other half of the V_spread diagnostic, and without it V_spread is
+    uninterpretable.  A small V_spread has two opposite explanations:
+
+    * diversity small too -> the ensemble has collapsed; the particles are the
+      same structure, so there is nothing to select among and no lambda helps.
+      Remedy: more diversity (higher sigma_start, repaint cycles, weaker
+      gradient -- gradient guidance is a variance-reducing force and works
+      against selection).
+    * diversity large -> the particles genuinely differ but the data cannot tell
+      them apart; the likelihood is flat along the directions the ensemble
+      explores.  Remedy: none at the sampler level.  Get the model closer first.
+    """
+    p = positions.shape[0]
+    flat = positions.reshape(p, -1, 3)
+    w = mask.reshape(-1).astype(positions.dtype)
+    i, j = np.triu_indices(p, k=1)
+    pairs = jax.vmap(lambda ii, jj: superposed_rmsd(flat[ii], flat[jj], w))(
+        jnp.asarray(i), jnp.asarray(j)
+    )
+    return jnp.mean(pairs)
+
+
 def sample(
     denoising_step: Callable[[jnp.ndarray, jnp.ndarray], Any],
     batch: Any,
@@ -344,17 +390,26 @@ def sample(
         positions_noisy = positions + noise
 
         out = denoising_step(positions_noisy, t_hat)
-        if isinstance(out, tuple):
+        if isinstance(out, tuple) and len(out) == 3:
+            # (x0, V_work, V_monitor).  V_monitor is never used for weighting --
+            # it exists so the rank agreement between the two can be checked.
+            # If the work-set and free-set losses rank the particles the same
+            # way, V_spread is signal; if they are uncorrelated, it is noise.
+            positions_denoised, potential, potential_mon = out
+        elif isinstance(out, tuple):
             positions_denoised, potential = out
+            potential_mon = jnp.zeros((), positions.dtype)
         else:
-            positions_denoised, potential = out, jnp.zeros((), positions.dtype)
+            positions_denoised = out
+            potential = jnp.zeros((), positions.dtype)
+            potential_mon = jnp.zeros((), positions.dtype)
 
         grad = (positions_noisy - positions_denoised) / t_hat
         d_t = noise_level - t_hat
         positions_out = positions_noisy + config.step_scale * d_t * grad
         # ---- end verbatim ----
 
-        return (key, positions_out, noise_level), (potential, t_hat)
+        return (key, positions_out, noise_level), (potential, potential_mon, t_hat)
 
     vstep = hk.vmap(
         apply_denoising_step, in_axes=(0, None), split_rng=(not hk.running_init())
@@ -362,9 +417,25 @@ def sample(
 
     def scan_body(carry, noise_level):
         particles, log_w, lam_v_prev, gkey = carry
-        particles, (potential, t_hat) = vstep(particles, noise_level)
+        particles, (potential, potential_mon, t_hat) = vstep(particles, noise_level)
 
+        # Instrumentation must not depend on selection being enabled.  V_spread is
+        # the number that decides whether selection can work at all, so it has to
+        # be observable with lambda_max = 0 -- otherwise measuring the potential
+        # and enabling selection are the same experiment, which is how a run with
+        # the resolution window on (lambda=0) produced no V_spread at all.
         if not use_smc:
+            if cfg.verbose:
+                jax.debug.print(
+                    "sigma {s:8.3f} | lambda      0.000 | V_mean {vm:9.4f} "
+                    "V_spread {vs:9.2e} | div {dv:7.3f} A | ESS {e:5.1f}/{n} | resample 0",
+                    s=jnp.mean(t_hat),
+                    vm=jnp.mean(potential),
+                    vs=jnp.std(potential),
+                    dv=ensemble_diversity(particles[1], mask),
+                    e=jnp.asarray(float(num_samples)),
+                    n=num_samples,
+                )
             return (particles, log_w, lam_v_prev, gkey), None
 
         sigma = jnp.mean(t_hat)
@@ -400,11 +471,12 @@ def sample(
         if cfg.verbose:
             jax.debug.print(
                 "sigma {s:8.3f} | lambda {l:6.3f} | V_mean {vm:9.4f} "
-                "V_spread {vs:9.2e} | ESS {e:5.1f}/{n} | resample {r}",
+                "V_spread {vs:9.2e} | div {dv:7.3f} A | ESS {e:5.1f}/{n} | resample {r}",
                 s=sigma,
                 l=lam,
                 vm=jnp.mean(potential),
                 vs=jnp.std(potential),
+                dv=ensemble_diversity(particles[1], mask),
                 e=ess,
                 n=num_samples,
                 r=do_resample.astype(jnp.int32),

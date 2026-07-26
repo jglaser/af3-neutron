@@ -90,33 +90,115 @@ class NeutronSFCalculator(SFcalculator):
         # reflections lie beyond 8 A -- so summing to 2.0 A drowns the usable
         # shells in noise.  It also cuts the (n_atoms x n_hkl) intermediate that
         # dominates peak memory by ~50x.
+        # The window applies to the GUIDED loss only.  R_work/R_free are always
+        # reported on the full resolution range, because a windowed R is (a) not
+        # comparable across runs and (b) statistically useless as R_free: beyond
+        # 8 A this cell has ~316 unique reflections, so a 5% free set is ~16
+        # of them.
         d_high = getattr(self, "guidance_d_high", None)
-        if d_high is not None:
+        if d_high is None:
+            mask_guide_res = jnp.ones_like(mask_valid)
+        else:
             d_spacing = 1.0 / jnp.sqrt(jnp.maximum(dr2_tensor, 1e-12))
-            mask_valid = mask_valid & (d_spacing >= d_high)
-        
+            mask_guide_res = d_spacing >= d_high
+
         mask_free = mask_valid & self.freer_mask
         mask_work = mask_valid & (~self.freer_mask)
+        mask_loss = mask_work & mask_guide_res
         
         f_obs = jnp.where(mask_valid, f_obs, 0.0)
         f_calc_mag = jnp.where(mask_valid, f_calc_mag, 0.0)
         
-        # 5. Dynamic Linear Scaling
-        num = jnp.sum(jnp.where(mask_work, f_obs * f_calc_mag, 0.0))
-        den = jnp.sum(jnp.where(mask_work, f_calc_mag ** 2, 0.0)) + 1e-8
-        scale_factor = num / den
-        
-        # 6. Monitor R-Factors
+        # 5. Dynamic Linear Scaling -- fitted separately for each purpose.
+        #
+        # The scale MUST be fitted on the same reflections the loss is evaluated
+        # on.  A single global scale fitted to 2.0 A data and then applied to the
+        # d >= 8 A subset is badly wrong, because bulk solvent makes the
+        # effective scale strongly resolution dependent.  Symptom: the normalised
+        # loss came out at 1.85-2.18, which is impossible for an LSQ-optimal
+        # scale -- that quantity is 1 - CC^2 and so bounded by 1.  Values above 1
+        # mean the scale is mis-fitted for the subset, which inflates the loss and
+        # injects a gradient that chases the scale error rather than the
+        # structure.
+        def _lsq_scale(mask):
+            num = jnp.sum(jnp.where(mask, f_obs * f_calc_mag, 0.0))
+            den = jnp.sum(jnp.where(mask, f_calc_mag ** 2, 0.0)) + 1e-8
+            return num / den
+
+        scale_factor = _lsq_scale(mask_work)   # for the reported R-factors
+        scale_loss = _lsq_scale(mask_loss)     # for the guided loss
+
+        # 6. Monitor R-Factors (full resolution range, own scale)
         diff = jnp.abs(f_obs - scale_factor * f_calc_mag)
         r_work = jnp.sum(jnp.where(mask_work, diff, 0.0)) / (jnp.sum(jnp.where(mask_work, f_obs, 0.0)) + 1e-8)
         r_free = jnp.sum(jnp.where(mask_free, diff, 0.0)) / (jnp.sum(jnp.where(mask_free, f_obs, 0.0)) + 1e-8)
         
-        # 7. Normalize Loss
-        residuals_sq = jnp.where(mask_work, (f_obs - scale_factor * f_calc_mag) ** 2, 0.0)
-        normalization = jnp.sum(jnp.where(mask_work, f_obs ** 2, 0.0)) + 1e-8
+        # 7. Normalize Loss (windowed)
+        residuals_sq = jnp.where(mask_loss, (f_obs - scale_loss * f_calc_mag) ** 2, 0.0)
+        normalization = jnp.sum(jnp.where(mask_loss, f_obs ** 2, 0.0)) + 1e-8
         normalized_loss = jnp.sum(residuals_sq) / normalization
         
         return normalized_loss, (r_work, r_free)
+
+
+def make_low_resolution_sfc(sfc, d_high: float, verbose: bool = True):
+    """A copy of ``sfc`` whose *reflection list* is truncated to ``d >= d_high``.
+
+    ``guidance_d_high`` masks reflections after ``F_protein`` has run, so it buys
+    the statistical benefit but none of the memory: the (n_atoms x n_hkl) phase
+    array -- which is what dominates peak memory, and is held live for the
+    backward pass -- is still built at full size.  Truncating the list itself is
+    what pays: for a 73x73x99 cell at 2.0 A there are ~37,900 unique reflections
+    but only ~316 beyond 8 A, a factor of ~120 on that term.
+
+    Use this for the guided loss and keep the full ``sfc`` for reporting
+    R_work/R_free.  That is also the way to raise ``num_diffusion_samples``
+    without hitting the ceiling: the per-particle cost of the guidance gradient
+    is what scales with the particle count, and this is the term to shrink.
+
+    Attributes are sliced by their leading axis, so this is robust to SFC_Jax
+    gaining or losing per-reflection fields; anything whose first dimension does
+    not match the HKL count is passed through untouched.
+    """
+    import copy as _copy
+
+    import numpy as _np
+
+    dr2 = _np.asarray(sfc.dr2HKL_array)
+    n_hkl = dr2.shape[0]
+    d = _np.where(dr2 > 0, 1.0 / _np.sqrt(_np.maximum(dr2, 1e-12)), _np.inf)
+    keep = d >= float(d_high)
+    if keep.sum() == 0:
+        raise ValueError(f"no reflections with d >= {d_high} A")
+
+    out = _copy.copy(sfc)
+    n_sliced = []
+    for name in dir(sfc):
+        if name.startswith("__"):
+            continue
+        try:
+            val = getattr(sfc, name)
+        except Exception:
+            continue
+        arr = getattr(val, "shape", None)
+        if arr is None or len(val.shape) == 0 or val.shape[0] != n_hkl:
+            continue
+        try:
+            setattr(out, name, val[keep])
+            n_sliced.append(name)
+        except Exception:
+            pass
+
+    # asu2HKL_index maps HKL rows into the ASU list; it is sliced above, and the
+    # ASU-side arrays are left whole, which is correct -- only the HKL side shrinks.
+    if verbose:
+        print(
+            f"Low-resolution guidance SFC: {int(keep.sum())}/{n_hkl} reflections "
+            f"(d >= {d_high} A); sliced {sorted(n_sliced)}",
+            file=sys.stderr,
+        )
+    return out
+
 
 def align_oracle_to_reference(oracle, reference_path):
     """
