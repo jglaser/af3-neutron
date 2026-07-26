@@ -2,6 +2,7 @@ import logging
 import pathlib
 import os
 import json
+import dataclasses
 import numpy as np
 import jax
 import jax.numpy as jnp
@@ -141,6 +142,12 @@ flags.DEFINE_float("smc_sigma_start", -1.0, "If > 0, warm-start the trajectory f
 flags.DEFINE_string("smc_lambda_mode", "fixed", "SMC lambda scaling: 'fixed' uses --smc_lambda directly; 'adaptive_ess' solves each level for the lambda that hits --smc_ess_target. Use adaptive only once the potential is known to discriminate.")
 flags.DEFINE_float("smc_ess_target", 0.5, "Target ESS/num_diffusion_samples for --smc_lambda_mode=adaptive_ess.")
 flags.DEFINE_integer("smc_unroll", 1, "hk.scan unroll factor. AF3 uses 4; with the guidance operator in the loop that multiplies peak memory ~4x.", lower_bound=1)
+flags.DEFINE_boolean("search_placement", False, "Before sampling, brute-force search the rigid placement (symmetry operator x translation grid) that best explains F_obs. Needed when the reference and the data disagree about the ASU origin: allowed origin shifts are tens of Angstrom, far beyond what any gradient refinement reaches.")
+flags.DEFINE_integer("search_grid", 12, "Translation grid divisions per cell axis for --search_placement. The c axis gets 4/3 of this.", lower_bound=2)
+flags.DEFINE_float("search_d_high", 8.0, "Resolution cutoff (A) for the placement search. Only low-resolution shells are needed to place a molecule, and truncating the reflection list is what makes the search cheap.")
+flags.DEFINE_boolean("search_symops", False, "Include the symmetry operators in the placement search. Normally unnecessary: compute_loss already expands the ASU by the full space group, so pre-applying an operator is absorbed into a relabelling of the translation. Leave off unless the translation grid does not span the cell.")
+flags.DEFINE_boolean("fit_overall_b", True, "Fit an overall B alongside the linear scale (k*exp(-B*s^2/4)). Without it a mismatch between the model's B-factors and the data goes straight into R, and the solvent parameters get abused to absorb it. Pass --nofit_overall_b to reproduce the old single-scale behaviour.")
+flags.DEFINE_string("solvent_model", "mask", "Bulk solvent: 'mask' uses the precomputed Fmask (constant, zero gradient w.r.t. coordinates); 'babinet' uses -k_sol*exp(-b_sol*s^2/4)*F_protein, which is differentiable and never stale. Prefer babinet whenever --guidance_d_high is set, since the mask term is both dominant and gradient-free at low resolution.")
 flags.DEFINE_float("guidance_d_high", -1.0, "If > 0, restrict the crystallographic target to d >= this value (A) during sampling. Strongly recommended: the high-resolution shells carry no signal for a model far from truth, and they dominate both the loss and the memory.")
 flags.DEFINE_float("smc_ess_threshold", 0.5, "Resample when ESS/num_diffusion_samples falls below this.")
 flags.DEFINE_string("reference_cif", None, "Path to the explicit crystal structure (e.g., 4BD1.cif) to align the AF3 model into the correct unit cell frame.")
@@ -531,16 +538,17 @@ def main(argv):
     variance_scale = 0.05 # Scaling multiplier
     variance_decay = 10.0 # How fast the variance explodes as pLDDT drops
 
-    # Map pLDDT to Positional Variance (sigma^2)
-    # Low pLDDT inflates the denominator, dynamically dropping the penalty to near-zero
-    sigma_sq = variance_base + variance_scale * jnp.exp((100.0 - plddt_heavy_only) / variance_decay)
+    # Map pLDDT to b factor Oeffner & Read 2022
+    rmsd = 1.5 * np.exp(4.0 * (0.7 - plddt_heavy_only / 100.0))     # Angstrom
+    b = (8.0 * np.pi**2 / 3.0) * rmsd**2
+    b = np.clip(b, 5.0, 100.0)                         # cap, and see below
 
     # Inject the gathered pLDDT values into the heavy atom indices
     # oracle.mapping.heavy_indices holds the correct indices for heavy atoms
-    full_b_factors[oracle.mapping.heavy_indices] = sigma_sq
+    full_b_factors[oracle.mapping.heavy_indices] = b
 
     # Use the precomputed map to broadcast B-factors to Hydrogens
-    final_b_factors = 26.3 * full_b_factors[np.array(oracle.mapping.hydrogen_to_heavy_map)]
+    final_b_factors = full_b_factors[np.array(oracle.mapping.hydrogen_to_heavy_map)]
     print(f"B-factor stats: min={final_b_factors.min()}, max={final_b_factors.max()}, mean={final_b_factors.mean()}")
 
     #  Apply to the oracle
@@ -560,7 +568,72 @@ def main(argv):
     # Get baseline coordinates
     xyz_baseline = oracle.mapping.initial_coordinates
 
-    # Run the grid search to find the perfect neutron solvent parameters
+    if sfc is not None:
+        sfc.fit_overall_b = FLAGS.fit_overall_b
+
+    # --- global rigid placement search -----------------------------------
+    # Runs BEFORE the solvent grid search, because a corrected placement changes
+    # the bulk-solvent mask, and before sampling, because this is the one thing
+    # the guidance operator provably cannot do: it Kabsch-superposes onto
+    # initial_coordinates every step, so any collective rigid component of a
+    # correction is projected out before compute_loss ever sees it.
+    if sfc is not None and FLAGS.search_placement:
+        from af3_neutron.sfc_adapter import make_low_resolution_sfc, search_rigid_placement
+
+        sfc_search = make_low_resolution_sfc(sfc, FLAGS.search_d_high)
+        sfc_search.fit_overall_b = FLAGS.fit_overall_b
+        if FLAGS.solvent_model != "mask":
+            sfc_search.solvent_model = FLAGS.solvent_model
+        # the search must not be windowed twice; it already has a truncated list
+        sfc_search.guidance_d_high = None
+
+        n = FLAGS.search_grid
+        xyz_placed, info = search_rigid_placement(
+            sfc_search,
+            xyz_baseline,
+            n_grid=(n, n, max(int(round(4 * n / 3)), 2)),
+            use_symops=FLAGS.search_symops,
+        )
+        logging.info(
+            "Placement search: loss %.4f -> %.4f (symop %d, frac shift %s)",
+            info["identity_loss"], info["loss"], info["symop"],
+            np.array2string(info["frac_shift"], precision=4),
+        )
+
+        logging.info("Placement search Z = %.2f (accept=%s)", info["z"], info["accept"])
+        if info["accept"]:
+            xyz_baseline = jnp.asarray(xyz_placed)
+            oracle.mapping = dataclasses.replace(
+                oracle.mapping, initial_coordinates=xyz_baseline
+            )
+            # The placement moved, so the bulk-solvent mask computed at init is
+            # stale.  Rebuild the SFC rather than patch it.  (Not needed for
+            # --solvent_model babinet, which is mask-free by construction, but
+            # harmless and keeps the two paths identical.)
+            # np.asarray on a JAX array yields a READ-ONLY view; biotite's
+            # CellList needs a writable buffer ('buffer source array is
+            # read-only'), so copy explicitly.
+            oracle.atoms.coord = np.array(xyz_baseline, dtype=np.float32, copy=True)
+            sfc = init_neutron_sfc(oracle.atoms,
+                                   FLAGS.mtz_path,
+                                   deuterate=FLAGS.deuterate,
+                                   perdeuterate=FLAGS.perdeuterate)
+            sfc.fit_overall_b = FLAGS.fit_overall_b
+            logging.info("Placement accepted; SFC and solvent mask rebuilt.")
+        else:
+            logging.warning(
+                "Placement search rejected: Z = %.2f below threshold (loss %.4f vs "
+                "identity %.4f, grid mean %.4f std %.4f). The best placement is not "
+                "distinguishable from the best of many random ones, so the model is "
+                "left where it was.",
+                info["z"], info["loss"], info["identity_loss"],
+                info["grid_mean"], info["grid_std"],
+            )
+
+    if sfc is not None and FLAGS.solvent_model != "mask":
+        sfc.solvent_model = FLAGS.solvent_model
+        logging.info("Bulk solvent model: %s", FLAGS.solvent_model)
+
     if sfc is not None and FLAGS.guidance_d_high > 0:
         sfc.guidance_d_high = FLAGS.guidance_d_high
         logging.info("Guidance target restricted to d >= %.1f A", FLAGS.guidance_d_high)

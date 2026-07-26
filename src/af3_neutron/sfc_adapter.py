@@ -63,10 +63,31 @@ class NeutronSFCalculator(SFcalculator):
         # Fetch SFC_Jax solvent parameters (with underscores), using safe defaults
         k_sol = getattr(self, "k_sol", 0.35)
         b_sol = getattr(self, "b_sol", 50.0)
-        Fmask_HKL = getattr(self, "Fmask_HKL")
-        scaled_fmask = k_sol * jnp.exp(-b_sol * dr2_tensor / 4.0) * Fmask_HKL
-        
-        f_calc_complex = f_calc_protein + scaled_fmask
+
+        # Two bulk-solvent models.
+        #
+        # MASK (default, current behaviour): Fmask_HKL is precomputed from the
+        # baseline coordinates and held constant, so d(F_bulk)/d(xyz) = 0.  That
+        # is fine when guiding on high-resolution data, where solvent is
+        # negligible -- but it is actively harmful when guiding on d >= 8 A,
+        # because bulk solvent is a large fraction of F_calc there.  With
+        # k_sol ~ 0.53 and b_sol = 10, exp(-b_sol*s^2/4) ~ 0.96 at 8 A, so
+        # roughly half of the low-resolution F_calc is a frozen constant
+        # computed from a placement that gave 0.849 solvent.  The gradient sees
+        # only the protein half while the residual is dominated by the wrong,
+        # non-differentiable half.
+        #
+        # BABINET: F_bulk = -k_sol * exp(-b_sol*s^2/4) * F_protein.  Mask-free,
+        # so it can never go stale; differentiable, so the solvent term responds
+        # to the coordinates; and least accurate at high resolution, which is
+        # exactly where it is not being used.  Set `sfc.solvent_model = "babinet"`.
+        if getattr(self, "solvent_model", "mask") == "babinet":
+            f_bulk = -k_sol * jnp.exp(-b_sol * dr2_tensor / 4.0) * f_calc_protein
+        else:
+            Fmask_HKL = getattr(self, "Fmask_HKL")
+            f_bulk = k_sol * jnp.exp(-b_sol * dr2_tensor / 4.0) * Fmask_HKL
+
+        f_calc_complex = f_calc_protein + f_bulk
         f_calc_mag = jnp.abs(f_calc_complex)
         
         # 3. Safely extract experimental amplitudes
@@ -120,13 +141,42 @@ class NeutronSFCalculator(SFcalculator):
         # mean the scale is mis-fitted for the subset, which inflates the loss and
         # injects a gradient that chases the scale error rather than the
         # structure.
-        def _lsq_scale(mask):
-            num = jnp.sum(jnp.where(mask, f_obs * f_calc_mag, 0.0))
-            den = jnp.sum(jnp.where(mask, f_calc_mag ** 2, 0.0)) + 1e-8
-            return num / den
+        # An overall B belongs in the scaling.  A single linear k has no
+        # resolution dependence, so any mismatch between the model's B-factors
+        # and the data's falls straight through into R.  With a mean B of ~11 A^2
+        # against 2.0 A data (20-40 would be typical), a dB of 15 A^2 costs a
+        # factor exp(-15*s^2/4) = 0.39 at 2.0 A that k cannot absorb.  It also
+        # explains k_sol pinning at its grid boundary run after run: with no B in
+        # the scale, the solvent parameters are the only place a resolution-
+        # dependent error can go, so the fit abuses them.
+        fit_b = bool(getattr(self, "fit_overall_b", True))
+        b_grid = jnp.asarray(getattr(self, "overall_b_grid", None)
+                             if getattr(self, "overall_b_grid", None) is not None
+                             else jnp.linspace(-30.0, 150.0, 61))
 
-        scale_factor = _lsq_scale(mask_work)   # for the reported R-factors
-        scale_loss = _lsq_scale(mask_loss)     # for the guided loss
+        def _lsq_scale_b(mask):
+            """LSQ-optimal (k, B) for f_obs ~ k * exp(-B s^2/4) * f_calc_mag."""
+            if not fit_b:
+                num = jnp.sum(jnp.where(mask, f_obs * f_calc_mag, 0.0))
+                den = jnp.sum(jnp.where(mask, f_calc_mag ** 2, 0.0)) + 1e-8
+                return num / den, jnp.zeros(())
+
+            def resid_for(b):
+                fc = f_calc_mag * jnp.exp(-b * dr2_tensor / 4.0)
+                num = jnp.sum(jnp.where(mask, f_obs * fc, 0.0))
+                den = jnp.sum(jnp.where(mask, fc ** 2, 0.0)) + 1e-8
+                k = num / den
+                r = jnp.sum(jnp.where(mask, (f_obs - k * fc) ** 2, 0.0))
+                return r, k
+
+            resid, ks = jax.vmap(resid_for)(b_grid)
+            i = jnp.argmin(resid)
+            return ks[i], b_grid[i]
+
+        k_report, b_report = _lsq_scale_b(mask_work)   # for the reported R
+        k_loss, b_loss = _lsq_scale_b(mask_loss)       # for the guided loss
+        scale_factor = k_report * jnp.exp(-b_report * dr2_tensor / 4.0)
+        scale_loss = k_loss * jnp.exp(-b_loss * dr2_tensor / 4.0)
 
         # 6. Monitor R-Factors (full resolution range, own scale)
         diff = jnp.abs(f_obs - scale_factor * f_calc_mag)
@@ -141,6 +191,254 @@ class NeutronSFCalculator(SFcalculator):
         return normalized_loss, (r_work, r_free)
 
 
+
+def _rodrigues(omega):
+    """so(3) -> SO(3), written analytic in u = |omega|^2.
+
+    The textbook form normalises by |omega|, whose derivative is NaN at the
+    origin, and jnp.where does not save you because JAX evaluates both branches.
+    Since the pose is refined from the identity, that NaN would land on the very
+    first step.  Here A(u) = sin(sqrt u)/sqrt u and B(u) = (1-cos sqrt u)/u are
+    both even analytic functions of the angle, so the small-angle branch is a
+    Taylor series in u and the large-angle branch never sees u = 0.
+    """
+    u = jnp.sum(omega * omega)
+    tol = 1e-8
+    u_safe = jnp.where(u < tol, jnp.ones_like(u), u)
+    th = jnp.sqrt(u_safe)
+    A = jnp.where(u < tol, 1.0 - u / 6.0 + u * u / 120.0, jnp.sin(th) / th)
+    B = jnp.where(u < tol, 0.5 - u / 24.0 + u * u / 720.0, (1.0 - jnp.cos(th)) / u_safe)
+    wx, wy, wz = omega[0], omega[1], omega[2]
+    W = jnp.array([[0.0, -wz, wy], [wz, 0.0, -wx], [-wy, wx, 0.0]])
+    return jnp.eye(3) + A * W + B * (W @ W)
+
+
+def refine_rigid_pose(sfc, xyz, n_steps: int = 40, lr_rot: float = 2e-3,
+                      lr_trans: float = 2e-2):
+    """Refine a 6-DOF rigid pose of ``xyz`` against F_obs and return moved coords.
+
+    Why this is needed: the guidance operator recovers the crystal frame by
+    Kabsch-superposing the current x_0 onto ``initial_coordinates`` at every
+    step.  The round trip is exact, but it means any *collective rigid* component
+    of the correction is removed again before F_calc is evaluated -- the gradient
+    can rearrange atoms within the frame, but the frame itself is pinned to the
+    initial model forever.  So a starting pose that is rigidly wrong stays wrong
+    no matter how long you sample.
+
+    Measured: aligning the same 0.44 A fold to 4BD0 (X-ray) rather than 4BD1
+    (neutron, same crystal as the data) costs R_work 0.339 -> 0.489.  That is
+    ~0.15 in R sitting in 6 parameters the sampler currently cannot touch -- for
+    comparison, fitting an overall B is worth ~0.01.  There is plenty of signal;
+    the operator simply had no way to express the correction.
+
+    CAPTURE RANGE -- read this before using it.  Adam moves about ``lr`` per step,
+    so this reaches at most ``lr_rot * n_steps`` in rotation and
+    ``lr_trans * n_steps`` in translation: with the defaults, 0.08 rad (4.6 deg)
+    and 0.8 A.  That is a *local polish*, nothing more.  It cannot cross an origin
+    mismatch: in P3(2)21 the allowed origin shifts along c are multiples of
+    c/3 = 33 A, and the 3-fold relates positions ~42 A apart in the ab plane.  If
+    two references disagree about the origin, use
+    :func:`search_rigid_placement` first -- a local gradient will never find it,
+    and running this per step instead just makes the trajectory slow without
+    moving the frame.
+
+    Stateless by design: it re-refines from the identity on each call, which is
+    fine because the frame error is a fixed offset, and it avoids threading pose
+    state through the scan carry.  It is also expensive -- one ``compute_loss``
+    per inner step, per proximal step, per particle, per level -- so keep
+    ``n_steps`` small and pair it with :func:`make_low_resolution_sfc`.
+
+    Insert into ``proximal_operator_fn`` immediately before ``compute_loss``::
+
+        X_rel = refine_rigid_pose(sfc_instance, X_rel)
+        e_exp, (rw, rf) = sfc_instance.compute_loss(X_rel)
+    """
+    centre = jnp.mean(xyz, axis=0)
+
+    def moved(params):
+        omega, tau = params[:3], params[3:]
+        return (xyz - centre) @ _rodrigues(omega).T + centre + tau
+
+    def loss(params):
+        return sfc.compute_loss(moved(params))[0]
+
+    grad_fn = jax.value_and_grad(loss)
+    lrs = jnp.concatenate([jnp.full((3,), lr_rot), jnp.full((3,), lr_trans)])
+
+    def body(carry, i):
+        p, m, v = carry
+        _, g = grad_fn(p)
+        i1 = i + 1.0
+        m = 0.9 * m + 0.1 * g
+        v = 0.999 * v + 0.001 * g**2
+        p = p - lrs * (m / (1 - 0.9**i1)) / (jnp.sqrt(v / (1 - 0.999**i1)) + 1e-8)
+        return (p, m, v), None
+
+    z = jnp.zeros((6,))
+    (p, _, _), _ = jax.lax.scan(body, (z, z, z), jnp.arange(n_steps, dtype=jnp.float32))
+    return moved(p)
+
+
+
+def search_rigid_placement(sfc, xyz, n_grid=(12, 12, 16), use_symops=False,
+                           chunk=64, refine_steps=2, min_z=6.0, verbose=True):
+    """Brute-force search for the rigid placement that best explains F_obs.
+
+    This is the piece a gradient cannot supply.  Measured on this system:
+    aligning the same 0.44 A fold to 4BD0 rather than 4BD1 costs R_work
+    0.339 -> 0.489, i.e. ~0.15 of R living in six parameters -- but the offset
+    between two origin conventions is tens of Angstrom, whereas a local
+    refinement reaches under 1 A.  A search is the only thing that closes that
+    gap, and it is cheap because it needs the likelihood *value* only, no
+    gradient, and only the low-resolution shells.
+
+    Run it ONCE after alignment, not inside the sampling loop.  Pair it with
+    ``make_low_resolution_sfc(sfc, 8.0)``: at 544 reflections a 6 x 12 x 12 x 16
+    search is a few thousand cheap evaluations, against one full-resolution
+    gradient.
+
+    The coarse grid is followed by ``refine_steps`` local passes, each a fine grid
+    over one previous cell width.  This is not a refinement of convenience: a
+    12-division grid on this cell has 6.1 A spacing, so it localises the answer to
+    only ~3 A, while :func:`refine_rigid_pose` captures 0.8 A.  Without the local
+    passes there is a gap between the two stages that neither can cross.  Two
+    passes take 6.1 -> 0.5 -> 0.04 A, comfortably inside the gradient's reach.
+
+    ``use_symops`` defaults to False, and should normally stay there.
+    ``compute_loss`` already expands the ASU by the full space group, so
+    pre-applying one operator to the ASU generates the same crystal: the set
+    {s.(op.x + t)} equals {s'.x + s'.(op.t)} with s' = s.op, so the operator is
+    absorbed into a relabelling of the translation.  As long as the translation
+    grid spans the cell, searching operators separately only multiplies the cost.
+
+    ACCEPTANCE IS BY Z-SCORE, not by improvement.  Taking the best of ~2300 grid
+    points from a flat landscape produces an apparent improvement even when there
+    is no signal, and the low-resolution translation landscape *is* fairly flat
+    because low-resolution amplitudes constrain the molecular envelope rather than
+    its position.  Observed failure: an 8% improvement (0.4151 -> 0.3821) selected
+    a 61 A shift in x on a structure whose solvent fraction was already healthy at
+    0.573, i.e. a placement that was not wrong.  ``info["z"]`` is
+    ``(mean - best) / std`` over the coarse grid; molecular replacement convention
+    (Phaser TFZ) wants > 8 for a confident solution, and ``min_z`` defaults to 6.
+    Below that the caller should reject.
+
+    Returns ``(xyz_best, info)`` with the symop index, fractional shift, loss,
+    identity loss, the grid score statistics, ``z``, and ``accept``.
+    """
+    import itertools
+
+    import numpy as _np
+
+    frac_shifts = _np.array(
+        list(
+            itertools.product(
+                _np.arange(n_grid[0]) / n_grid[0],
+                _np.arange(n_grid[1]) / n_grid[1],
+                _np.arange(n_grid[2]) / n_grid[2],
+            )
+        )
+    )
+
+    R_stack = _np.asarray(sfc.R_G_tensor_stack)
+    T_stack = _np.asarray(sfc.T_G_tensor_stack)
+    n_ops = R_stack.shape[0] if use_symops else 1
+
+    orth2frac = jnp.asarray(sfc.orth2frac_tensor)
+    frac2orth = jnp.linalg.inv(orth2frac)
+    xyz_j = jnp.asarray(xyz)
+    frac0 = xyz_j @ orth2frac.T
+
+    # The symmetry operator must NOT be a traced argument: indexing a numpy
+    # array with a tracer raises TracerArrayConversionError.  Apply the operator
+    # outside jit (it does not depend on the shift) and pass the resulting
+    # fractional coordinates in as an array.  Shape is fixed across operators, so
+    # this compiles once and is reused for all of them.
+    def score(frac_op, shift):
+        return sfc.compute_loss((frac_op + shift) @ frac2orth.T)[0]
+
+    # Sequential, NOT vmapped.  A vmap over `chunk` shifts multiplies the whole
+    # structure-factor computation by `chunk`: with chunk=64 that requested
+    # 122 GiB (1.9 GiB per shift).  lax.map traces once and runs one shift at a
+    # time, so peak memory is that of a single evaluation.  The search is a
+    # one-off setup step, so paying for it in time is the right trade.
+    def scored(frac_op, shifts):
+        return jax.lax.map(lambda sh: score(frac_op, sh), shifts)
+
+    scored = jax.jit(scored)
+
+    best = (0, jnp.zeros(3), float("inf"))
+    ident = float(sfc.compute_loss(xyz_j)[0])
+    all_scores = []
+    for op in range(n_ops):
+        frac_op = frac0 @ jnp.asarray(R_stack[op]).T + jnp.asarray(T_stack[op])
+        vals = []
+        for i in range(0, len(frac_shifts), chunk):
+            vals.append(scored(frac_op, jnp.asarray(frac_shifts[i : i + chunk])))
+        vals = jnp.concatenate(vals)
+        all_scores.append(_np.asarray(vals))
+        i = int(jnp.argmin(vals))
+        if float(vals[i]) < best[2]:
+            best = (op, jnp.asarray(frac_shifts[i]), float(vals[i]))
+        if verbose:
+            print(f"  symop {op}: best loss {float(vals[i]):.4f} at frac "
+                  f"{frac_shifts[i].round(3)}", file=sys.stderr)
+
+    grid = _np.concatenate(all_scores)
+    g_mean, g_std = float(grid.mean()), float(grid.std())
+    z = (g_mean - best[2]) / max(g_std, 1e-12)
+
+    # Local passes: re-grid over one previous cell width around the winner.
+    op, shift, loss = best
+    span = _np.array([1.0 / n_grid[0], 1.0 / n_grid[1], 1.0 / n_grid[2]])
+    frac_op = frac0 @ jnp.asarray(R_stack[op]).T + jnp.asarray(T_stack[op])
+    for _ in range(max(int(refine_steps), 0)):
+        axes = [_np.linspace(-span[k], span[k], 7) + float(shift[k]) for k in range(3)]
+        local = _np.array(list(itertools.product(*axes)))
+        vals = []
+        for i in range(0, len(local), chunk):
+            vals.append(scored(frac_op, jnp.asarray(local[i : i + chunk])))
+        vals = jnp.concatenate(vals)
+        i = int(jnp.argmin(vals))
+        if float(vals[i]) < loss:
+            shift, loss = jnp.asarray(local[i]), float(vals[i])
+        span = span / 6.0
+        if verbose:
+            print(f"  local pass: loss {loss:.4f} at frac "
+                  f"{_np.asarray(shift).round(4)}", file=sys.stderr)
+
+    if verbose:
+        print(
+            f"Rigid placement search: identity loss {ident:.4f} -> {loss:.4f} "
+            f"(symop {op}, fractional shift {_np.asarray(shift).round(4)})",
+            file=sys.stderr,
+        )
+        print(
+            f"  grid scores: mean {g_mean:.4f} std {g_std:.4f} -> Z = {z:.2f} "
+            f"({'ACCEPT' if z >= min_z else 'REJECT'}, threshold {min_z})",
+            file=sys.stderr,
+        )
+        if z < min_z:
+            print(
+                "  Z below threshold: the best placement is not distinguishable "
+                "from the best of many random ones.  Rejecting -- either the "
+                "placement was already right, or the low-resolution landscape is "
+                "too flat to localise it.",
+                file=sys.stderr,
+            )
+
+    frac_best = frac_op + shift
+    return (frac_best @ frac2orth.T), {
+        "symop": op,
+        "frac_shift": _np.asarray(shift),
+        "loss": loss,
+        "identity_loss": ident,
+        "grid_mean": g_mean,
+        "grid_std": g_std,
+        "z": z,
+        "accept": bool(z >= min_z),
+    }
+
+
 def make_low_resolution_sfc(sfc, d_high: float, verbose: bool = True):
     """A copy of ``sfc`` whose *reflection list* is truncated to ``d >= d_high``.
 
@@ -149,12 +447,23 @@ def make_low_resolution_sfc(sfc, d_high: float, verbose: bool = True):
     array -- which is what dominates peak memory, and is held live for the
     backward pass -- is still built at full size.  Truncating the list itself is
     what pays: for a 73x73x99 cell at 2.0 A there are ~37,900 unique reflections
-    but only ~316 beyond 8 A, a factor of ~120 on that term.
+    but only 544 beyond 8 A (measured), a factor of ~70 on that term.
 
     Use this for the guided loss and keep the full ``sfc`` for reporting
     R_work/R_free.  That is also the way to raise ``num_diffusion_samples``
     without hitting the ceiling: the per-particle cost of the guidance gradient
     is what scales with the particle count, and this is the term to shrink.
+
+    LIMITATION -- this truncates the HKL side only.  ``Calc_Fprotein`` runs over
+    ``Hasu_array``/``dr2asu_array`` and then maps into the HKL list via
+    ``asu2HKL_index``, and those ASU-side arrays have a different leading
+    dimension, so the leading-axis heuristic below does not match them.  The
+    result is a correct but *not cheaper* calculation: the expensive
+    [N_asu x N_atoms] intermediates are still full size.  Truncating the ASU side
+    as well requires remapping ``asu2HKL_index`` onto the reduced ASU list, which
+    is the real memory lever and is not implemented here.  Until it is, do not
+    rely on this for memory -- use it for the statistical benefit and control
+    memory with the particle count and ``unroll``.
 
     Attributes are sliced by their leading axis, so this is robust to SFC_Jax
     gaining or losing per-reflection fields; anything whose first dimension does

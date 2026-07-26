@@ -428,10 +428,12 @@ def sample(
             if cfg.verbose:
                 jax.debug.print(
                     "sigma {s:8.3f} | lambda      0.000 | V_mean {vm:9.4f} "
-                    "V_spread {vs:9.2e} | div {dv:7.3f} A | ESS {e:5.1f}/{n} | resample 0",
+                    "V_spread {vs:9.2e} | CC {cc:6.3f} | div {dv:7.3f} A | "
+                    "ESS {e:5.1f}/{n} | resample 0",
                     s=jnp.mean(t_hat),
                     vm=jnp.mean(potential),
                     vs=jnp.std(potential),
+                    cc=jnp.sqrt(jnp.maximum(1.0 - jnp.mean(potential), 0.0)),
                     dv=ensemble_diversity(particles[1], mask),
                     e=jnp.asarray(float(num_samples)),
                     n=num_samples,
@@ -439,7 +441,18 @@ def sample(
             return (particles, log_w, lam_v_prev, gkey), None
 
         sigma = jnp.mean(t_hat)
-        lam = lambda_ramp(sigma, cfg)
+        if cfg.lambda_mode not in ("fixed", "adaptive_ess"):
+            raise ValueError(
+                f"unknown lambda_mode {cfg.lambda_mode!r}; expected 'fixed' or "
+                "'adaptive_ess'"
+            )
+        if cfg.lambda_mode == "adaptive_ess":
+            # Solve for the lambda that puts ESS at ess_target * num_samples,
+            # gated by the same sigma ramp so selection still switches on late.
+            gate = jax.nn.sigmoid((cfg.sigma_on - sigma) / cfg.sigma_width) > 0.5
+            lam = adaptive_lambda(potential, cfg, num_samples) * gate
+        else:
+            lam = lambda_ramp(sigma, cfg)
 
         # Feynman-Kac incremental weight: log w_t = -lam_t V_t + lam_{t-1} V_{t-1},
         # so the potential is not double counted as the ramp turns on.
@@ -471,11 +484,13 @@ def sample(
         if cfg.verbose:
             jax.debug.print(
                 "sigma {s:8.3f} | lambda {l:6.3f} | V_mean {vm:9.4f} "
-                "V_spread {vs:9.2e} | div {dv:7.3f} A | ESS {e:5.1f}/{n} | resample {r}",
+                "V_spread {vs:9.2e} | CC {cc:6.3f} | div {dv:7.3f} A | "
+                "ESS {e:5.1f}/{n} | resample {r}",
                 s=sigma,
                 l=lam,
                 vm=jnp.mean(potential),
                 vs=jnp.std(potential),
+                cc=jnp.sqrt(jnp.maximum(1.0 - jnp.mean(potential), 0.0)),
                 dv=ensemble_diversity(particles[1], mask),
                 e=ess,
                 n=num_samples,

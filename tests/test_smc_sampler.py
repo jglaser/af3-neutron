@@ -410,3 +410,37 @@ def test_unknown_lambda_mode_is_rejected(smc):
                 f"unknown lambda_mode {cfg.lambda_mode!r}; expected 'fixed' or "
                 "'adaptive_ess'"
             )
+
+
+# ==========================================================================
+# adaptive lambda -- pure, no AF3 required
+# ==========================================================================
+def test_adaptive_lambda_hits_the_ess_target(smc):
+    """The solved lambda must actually put ESS at the requested target."""
+    rng = np.random.default_rng(0)
+    for spread in (1e-3, 1e-2, 1e-1):
+        v = jnp.asarray(0.5 + rng.normal(size=8) * spread, jnp.float32)
+        for target in (0.5, 0.75):
+            cfg = smc.SMCConfig(lambda_max=1.0, lambda_mode="adaptive_ess",
+                                ess_target=target)
+            lam = smc.adaptive_lambda(v, cfg, 8)
+            lw = -lam * (v - jnp.mean(v))
+            ess = float(smc.effective_sample_size(lw - jax.scipy.special.logsumexp(lw)))
+            assert ess == pytest.approx(target * 8, rel=0.05), (
+                f"spread={spread} target={target}: lambda={float(lam):.1f} "
+                f"gave ESS {ess:.2f}, wanted {target*8:.2f}"
+            )
+
+
+def test_adaptive_lambda_scales_inversely_with_spread(smc):
+    """Halving the spread in V should roughly double the solved lambda.
+
+    This is the property that makes adaptive mode scale-free, and the reason it
+    is preferable to picking lambda by hand: the required value depends on the
+    inter-particle spread, which is not knowable in advance.
+    """
+    cfg = smc.SMCConfig(lambda_max=1.0, lambda_mode="adaptive_ess", ess_target=0.5)
+    base = jnp.asarray([0.0, 1.0, -1.0, 0.5, -0.5, 0.25, -0.25, 0.75], jnp.float32)
+    lam_a = float(smc.adaptive_lambda(base * 1e-2, cfg, 8))
+    lam_b = float(smc.adaptive_lambda(base * 5e-3, cfg, 8))
+    assert lam_b / lam_a == pytest.approx(2.0, rel=0.1)

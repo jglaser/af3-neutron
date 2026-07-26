@@ -18,6 +18,7 @@ from .types import (
     OracleMapping,
     Conformations
 )
+from .sfc_adapter import refine_rigid_pose
 
 def build_custom_bond_dict(atoms: struc.AtomArray, ligand_smiles_dict: Dict[str, str]) -> Dict[str, Dict[tuple, Any]]:
     from biotite.structure import BondType
@@ -365,6 +366,7 @@ def _hijack_diffusion_with_custom_loss(
             X_final = oracle_mapping.initial_coordinates.at[oracle_mapping.heavy_indices].set(R_log_aligned)
             X_rel, _, _ = hydride.relax_hydrogen_jit(X_final, *params, iterations=5)
 
+            #X_rel = refine_rigid_pose(sfc_instance, X_rel)
             e_exp, (rw, rf) = sfc_instance.compute_loss(X_rel)
             V = e_exp
             jax.debug.print("t_hat: {t:.3f} | R_work: {rw:.4f} | R_free: {rf:.4f}", t=t_hat, rw=rw, rf=rf)
