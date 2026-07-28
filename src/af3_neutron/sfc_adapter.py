@@ -439,6 +439,156 @@ def search_rigid_placement(sfc, xyz, n_grid=(12, 12, 16), use_symops=False,
     }
 
 
+def _metric_tensor(cell):
+    a, b, c, al, be, ga = cell
+    al, be, ga = np.deg2rad([al, be, ga])
+    return np.array([
+        [a * a, a * b * np.cos(ga), a * c * np.cos(be)],
+        [a * b * np.cos(ga), b * b, b * c * np.cos(al)],
+        [a * c * np.cos(be), b * c * np.cos(al), c * c],
+    ])
+
+
+def reindexing_operators(cell, spacegroup, tol=1e-3):
+    """The alternative-setting ("reindexing") operators for a cell + space group.
+
+    A reindexing operator is an integer matrix W in the FRACTIONAL basis that
+    preserves the lattice metric (W^T G W = G) but is not one of the space
+    group's own rotations.  Applying one to a model produces a structure that
+    obeys the SAME space group in the SAME cell -- so nothing about the symmetry
+    description flags it -- yet has a different ``|F|``, because it permutes the
+    reflections: ``F(h) -> F(hW)``.  These are the same matrices as the twin laws.
+
+    This is the failure mode the symop x translation placement search cannot
+    reach.  ``search_rigid_placement`` covers the space group's own operators and
+    lattice translations, and ``compute_loss`` already expands the ASU by the
+    space group -- so by construction neither can represent an operator that is
+    outside the group.  Measured here: 4BD0 and 4BD1 are related by ``-x,-y,z``
+    with zero translation (0.37 A, no superposition), i.e. the two depositions
+    are indexed the other way round from each other.  Placing the model on 4BD0
+    and then computing F against 4BD1's data leaves it 82 A from where the data
+    want it, and no amount of translation searching or gradient refinement can
+    fix it.
+
+    For P 32 2 1 on a hexagonal lattice: lattice point group 6/mmm has order 24,
+    the space group's rotations number 6, giving 4 cosets, which fold to 2
+    distinct choices once Friedel pairs are identified.
+
+    Returns a list of ``(W, label)``, identity first.
+    """
+    import itertools as _it
+
+    G = _metric_tensor(cell)
+    scale = np.abs(G).max()
+    lattice = []
+    for m in _it.product((-1, 0, 1), repeat=9):
+        W = np.array(m, dtype=float).reshape(3, 3)
+        if abs(round(float(np.linalg.det(W)))) != 1:
+            continue
+        if np.abs(W.T @ G @ W - G).max() < tol * scale:
+            lattice.append(W.astype(int))
+
+    sg_rots = [np.array(op.rot, dtype=int) // op.DEN
+               for op in gemmi.SpaceGroup(spacegroup).operations()]
+
+    def key(W):
+        return tuple(int(v) for v in np.asarray(W).flatten())
+
+    def triplet(W):
+        op = gemmi.Op()
+        op.rot = [[int(W[i][j]) * op.DEN for j in range(3)] for i in range(3)]
+        op.tran = [0, 0, 0]
+        return op.triplet()
+
+    identity = np.eye(3, dtype=int)
+    seen, reps = set(), []
+    for W in lattice:
+        if key(W) in seen:
+            continue
+        coset = []
+        for R in sg_rots:
+            coset.append(R @ W)
+            coset.append(-(R @ W))          # Friedel: |F| cannot tell them apart
+        seen.update(key(X) for X in coset)
+        # Prefer the tidiest member of the coset as its representative -- the
+        # identity when present, otherwise the most diagonal matrix, so the log
+        # line reads "-x,-y,z" rather than an equivalent but opaque triplet.
+        best = min(coset, key=lambda X: (key(X) != key(identity),
+                                         -int(np.count_nonzero(np.diag(X))),
+                                         int(np.abs(X).sum()), key(X)))
+        reps.append(best)
+
+    reps.sort(key=lambda W: key(W) != key(identity))
+    return [(W, triplet(W)) for W in reps]
+
+
+def resolve_reindexing(sfc, xyz, verbose=True):
+    """Pick the alternative setting of ``xyz`` that actually fits ``F_obs``.
+
+    Cheap -- one loss evaluation per candidate, and there are usually only two.
+    Run it once, right after aligning to a reference, and before the solvent
+    grid search (the bulk-solvent mask depends on where the molecule sits).
+
+    Selection is on R_work, which is scale-invariant and directly comparable.
+    The distinction is not subtle when it is real: for a wrongly indexed
+    reference the difference is a molecule sitting tens of Angstrom from the
+    density, so expect a gap of ~0.1 in R, not a few thousandths.  If the gap is
+    small the operators are genuinely near-degenerate and the identity is kept.
+
+    Returns ``(xyz_best, info)``.
+    """
+    cell = sfc.unit_cell
+    cell_t = (cell.a, cell.b, cell.c, cell.alpha, cell.beta, cell.gamma)
+    ops = reindexing_operators(cell_t, sfc.space_group.hm)
+
+    orth2frac = jnp.asarray(sfc.orth2frac_tensor)
+    frac2orth = jnp.linalg.inv(orth2frac)
+    frac0 = jnp.asarray(xyz) @ orth2frac.T
+
+    results = []
+    for W, label in ops:
+        moved = (frac0 @ jnp.asarray(W, dtype=frac0.dtype).T) @ frac2orth.T
+        _, (r_work, r_free) = sfc.compute_loss(moved)
+        results.append((float(r_work), float(r_free), label, W, moved))
+        if verbose:
+            print(f"  reindex {label:<20} R_work {float(r_work):.4f}  "
+                  f"R_free {float(r_free):.4f}", file=sys.stderr)
+
+    identity_r = results[0][0]
+    best = min(results, key=lambda t: t[0])
+    improved = identity_r - best[0]
+    info = {
+        "label": best[2],
+        "operator": best[3],
+        "r_work": best[0],
+        "r_free": best[1],
+        "identity_r_work": identity_r,
+        "improvement": improved,
+        "n_candidates": len(ops),
+        "changed": best[2] != results[0][2],
+    }
+
+    if info["changed"] and improved > 0.02:
+        if verbose:
+            print(f"REINDEXED: applying {best[2]} lowers R_work "
+                  f"{identity_r:.4f} -> {best[0]:.4f}. The reference was indexed "
+                  f"in the other setting; without this the model sits in the "
+                  f"wrong one of two equally-valid-looking placements.",
+                  file=sys.stderr)
+        return best[4], info
+
+    info["changed"] = False
+    if verbose:
+        if improved > 0:
+            print(f"Keeping the identity setting (best alternative would gain only "
+                  f"{improved:.4f} in R_work, below the 0.02 threshold).",
+                  file=sys.stderr)
+        else:
+            print(f"Keeping the identity setting (R_work {identity_r:.4f}).",
+                  file=sys.stderr)
+    return jnp.asarray(xyz), info
+
+
 def make_low_resolution_sfc(sfc, d_high: float, verbose: bool = True):
     """A copy of ``sfc`` whose *reflection list* is truncated to ``d >= d_high``.
 
@@ -509,17 +659,169 @@ def make_low_resolution_sfc(sfc, d_high: float, verbose: bool = True):
     return out
 
 
-def align_oracle_to_reference(oracle, reference_path):
+def _box_from_cell(cell):
+    """Cell vectors as ROWS (biotite's `AtomArray.box` convention).
+
+    Goes through gemmi rather than ``struc.vectors_from_unitcell`` because the
+    latter takes its angles in RADIANS while every cell we handle -- MTZ headers,
+    CRYST1 lines, CIF -- carries DEGREES.  Feeding it degrees silently returns a
+    plausible-looking triclinic box (for 73.429 73.429 99.112 90 90 120 it gives
+    a matrix with no zero off-diagonals at all) and every downstream coordinate
+    is quietly wrong.  gemmi's UnitCell takes degrees and has no such trap.
+
+    gemmi's ``orth.mat`` maps a fractional COLUMN vector to Cartesian, i.e.
+    ``cart = M @ frac``; biotite wants ``cart = frac @ box``.  Hence the
+    transpose.
     """
-    Aligns the unanchored AF3 oracle coordinates to an explicit absolute crystal 
-    lattice frame (e.g., the exact deposited neutron structure) rather than the AF3 template.
+    uc = gemmi.UnitCell(*[float(x) for x in cell])
+    return np.array(uc.orth.mat.tolist(), dtype=np.float64).T
+
+
+def _cell_from_mtz(mtz_path):
+    """(a, b, c, alpha, beta, gamma) in degrees, from an MTZ header."""
+    c = gemmi.read_mtz_file(mtz_path).cell
+    return (c.a, c.b, c.c, c.alpha, c.beta, c.gamma)
+
+
+def _one_letter(res_names):
+    from biotite.sequence import ProteinSequence
+
+    out = []
+    for r in res_names:
+        try:
+            out.append(ProteinSequence.convert_letter_3to1(r))
+        except Exception:
+            out.append("X")
+    return "".join(out)
+
+
+def _match_ca_by_sequence(ref_ca, orc_ca):
+    """Pair CA atoms between reference and oracle by SEQUENCE alignment.
+
+    Neither array position nor residue id is a safe key:
+
+    * ``res_id`` is wrong whenever the two files use different numbering
+      schemes.  That is the case here -- the deposited beta-lactamases use the
+      Ambler scheme and run 27..290, while AF3 numbers its own input 1..261.
+      Keying on res_id pairs oracle residue 27 with reference residue 27, a
+      26-residue register slip, and it still yields 235 "matches", so a naive
+      count-based sanity check passes and the error surfaces only as a large
+      RMSD that looks like a placement problem.
+    * array position is right only as long as the reference models every residue
+      of the input sequence.  Crystal structures routinely omit disordered
+      loops, and one missing residue shifts the whole register from there on.
+
+    Aligning the residue sequences handles both: it reduces to the identity
+    pairing when the sequences match (as they do here -- 261/261 exact), and it
+    opens gaps exactly where the reference is missing residues.
+
+    Returns ``(idx_ref, idx_orc, description)``.
+    """
+    from biotite.sequence import ProteinSequence
+    from biotite.sequence.align import SubstitutionMatrix, align_optimal
+
+    matrix = SubstitutionMatrix.std_protein_matrix()
+
+    def chains(ca):
+        # dict preserves insertion order, so chain order follows the file
+        out = {}
+        for i, c in enumerate(ca.chain_id):
+            out.setdefault(c, []).append(i)
+        return {k: np.asarray(v, dtype=int) for k, v in out.items()}
+
+    ref_chains, orc_chains = chains(ref_ca), chains(orc_ca)
+
+    # Score every oracle chain against every reference chain, then assign
+    # greedily by descending score.  For the single-chain case this is just the
+    # one pairing; for a multi-chain oracle it stops chain A from being fitted
+    # onto whichever chain happens to come first in the reference.
+    cand = []
+    for oc, oi in orc_chains.items():
+        s_o = ProteinSequence(_one_letter(orc_ca.res_name[oi]))
+        for rc, ri in ref_chains.items():
+            s_r = ProteinSequence(_one_letter(ref_ca.res_name[ri]))
+            aln = align_optimal(s_r, s_o, matrix, gap_penalty=(-10, -1),
+                                terminal_penalty=False, max_number=1)[0]
+            trace = aln.trace
+            both = (trace[:, 0] >= 0) & (trace[:, 1] >= 0)
+            ident = int(
+                (s_r.symbols[trace[both, 0]] == s_o.symbols[trace[both, 1]]).sum()
+            )
+            cand.append((ident, oc, rc, ri[trace[both, 0]], oi[trace[both, 1]]))
+
+    cand.sort(key=lambda t: -t[0])
+    used_r, used_o = set(), set()
+    ir, io, notes = [], [], []
+    for ident, oc, rc, r_idx, o_idx in cand:
+        if oc in used_o or rc in used_r or ident == 0:
+            continue
+        used_o.add(oc)
+        used_r.add(rc)
+        ir.append(r_idx)
+        io.append(o_idx)
+        notes.append(f"{oc}->{rc}:{len(r_idx)}res/{ident}id")
+
+    if not ir:
+        return np.empty(0, int), np.empty(0, int), "no chain pairing found"
+    return (np.concatenate(ir), np.concatenate(io),
+            "sequence alignment [" + ", ".join(notes) + "]")
+
+
+def align_oracle_to_reference(oracle, reference_path, mtz_path=None,
+                              target_cell=None):
+    """
+    Aligns the unanchored AF3 oracle coordinates to an explicit absolute crystal
+    lattice frame (e.g. the exact deposited neutron structure) rather than the AF3
+    template.
+
+    Parameters
+    ----------
+    mtz_path : str, optional
+        The diffraction data.  Its cell header is the cell the whole pipeline
+        works in -- it is what ``init_neutron_sfc`` injects into the CRYST1 line
+        the structure factors are computed against -- so it is the authority on
+        the target cell.  Pass it whenever it is known; ``target_cell`` is only
+        for callers that have no MTZ.
+    target_cell : tuple of 6 floats, optional
+        ``(a, b, c, alpha, beta, gamma)``, angles in DEGREES.  Overrides
+        ``mtz_path`` when both are given.
+
+    Notes
+    -----
+    If the reference was deposited in a *different* cell than the data, its
+    coordinates are transferred through fractional space into the data's cell
+    before anything else happens.  Skipping that step is a silent,
+    position-dependent strain with no rigid-body representation, so no pose
+    refinement or placement search can undo it.
+
+    Measured on this system: 4BD0 (X-ray) is 72.500 72.500 97.670 while 4BD1
+    (neutron, = the data) is 73.429 73.429 99.112 -- a/b differ by 1.28% and c by
+    1.48%.  Reinterpreting 4BD0's Cartesian coordinates in 4BD1's cell slips
+    every atom in proportion to its distance from the origin: over 4BD0's own
+    atoms the displacement is 0.52 A on average and 0.93 A at worst.
+
+    The cell is NOT, however, the main thing wrong with using 4BD0 as the
+    reference for 4BD1's data.  The two are indexed in different settings --
+    related by ``-x,-y,z`` with zero translation -- so a model aligned to 4BD0
+    sits 82 A from where 4BD1's data want it.  See :func:`resolve_reindexing`,
+    which must be run after this function.  Measured R_work, 4BD0 as reference:
+
+        as-was (neither fix)          0.5228
+        cell transfer only            0.5219
+        reindexing only               0.4330
+        both                          0.3668
+
+    The two are not independent: the cell transfer is worth essentially nothing
+    on its own, because a 0.5 A strain is invisible next to an 82 A placement
+    error, and only pays once the setting is right.  Aligning to 4BD1 (the data's
+    own structure) needs neither, which is why it gave 0.38 all along.
     """
     if not os.path.exists(reference_path):
         print(f"WARNING: Reference file '{reference_path}' not found. Skipping lattice alignment.", file=sys.stderr)
         return oracle
 
     print(f"Aligning Oracle coordinates to explicit crystal reference: {reference_path}", file=sys.stderr)
-    
+
     # Handle both CIF and PDB reference files
     if reference_path.endswith('.cif') or reference_path.endswith('.mmcif'):
         ref_file = pdbx.CIFFile.read(reference_path)
@@ -534,42 +836,123 @@ def align_oracle_to_reference(oracle, reference_path):
         ref_atoms = pdb.get_structure(ref_file, model=1)
         has_altloc = "altloc_id" in ref_atoms.get_annotation_categories()
 
+    # ------------------------------------------------------------------
+    # Transfer the reference into the data's cell if they differ.
+    #
+    # biotite's `box` holds the three cell vectors as ROWS, so a point with
+    # fractional coordinates f has cart = f @ box, hence frac = cart @ inv(box).
+    # Transferring is therefore (coord @ inv(box_ref)) @ box_target, which
+    # preserves fractional coordinates exactly (verified to 4e-16).
+    #
+    # The reference ends up slightly strained -- its bond lengths scale by the
+    # cell ratio -- but that is harmless here, because the reference is only used
+    # to define WHERE and HOW the molecule sits.  The Kabsch fit below is rigid,
+    # so the oracle keeps its own correct internal geometry and simply inherits
+    # the corrected placement.  The strain shows up as a slightly larger residual
+    # RMSD, which is expected and not a problem.
+    # ------------------------------------------------------------------
+    if target_cell is None and mtz_path:
+        if os.path.exists(mtz_path):
+            target_cell = _cell_from_mtz(mtz_path)
+            print(f"Target cell from {mtz_path}: "
+                  f"{np.round(target_cell, 3).tolist()}", file=sys.stderr)
+        else:
+            print(f"WARNING: mtz_path '{mtz_path}' not found; cannot check the "
+                  f"reference against the data's cell.", file=sys.stderr)
+
+    if target_cell is not None:
+        ref_box = getattr(ref_atoms, "box", None)
+        if ref_box is None:
+            print("WARNING: reference file carries no unit cell; cannot check for a "
+                  "cell mismatch against the data. If the reference was deposited in "
+                  "a different cell, the alignment will be silently strained.",
+                  file=sys.stderr)
+        else:
+            ref_box = np.asarray(ref_box, dtype=np.float64)
+            tgt_box = _box_from_cell(target_cell)
+            # Compare the boxes themselves, not just the axis lengths: a
+            # difference in angle strains the model exactly as a difference in
+            # length does, and is just as invisible afterwards.
+            rel = np.abs(ref_box - tgt_box).max() / np.abs(tgt_box).max()
+            if rel > 1e-3:
+                frac = ref_atoms.coord @ np.linalg.inv(ref_box)
+                moved = (frac @ tgt_box).astype(np.float32)
+                shift = np.linalg.norm(moved - ref_atoms.coord, axis=1)
+                ref_cell = np.round(struc.unitcell_from_vectors(ref_box), 3)
+                print(
+                    f"WARNING: reference cell {ref_cell[:3].tolist()} "
+                    f"{np.round(np.rad2deg(ref_cell[3:]), 2).tolist()} differs from "
+                    f"the data cell {np.round(target_cell, 3).tolist()} "
+                    f"({100 * rel:.2f}%).\n"
+                    f"         Transferring the reference through fractional space "
+                    f"into the data cell; this moves its atoms by "
+                    f"{shift.mean():.2f} A on average (max {shift.max():.2f} A).\n"
+                    f"         Without this the model carries a position-dependent "
+                    f"strain that no rigid-body refinement can remove.",
+                    file=sys.stderr,
+                )
+                ref_atoms.coord = moved
+                ref_atoms.box = tgt_box.astype(np.float32)
+            else:
+                print(f"Reference cell matches the data cell to "
+                      f"{100 * rel:.3f}%.", file=sys.stderr)
+
     # Filter for CA atoms
     ca_mask = (ref_atoms.atom_name == "CA")
-    
+
     # Safely avoid alternate locations if present
     if has_altloc:
         altloc_mask = (ref_atoms.altloc_id == "") | (ref_atoms.altloc_id == ".") | (ref_atoms.altloc_id == "A")
         ca_mask = ca_mask & altloc_mask
-        
+
     ref_ca = ref_atoms[ca_mask]
     oracle_ca = oracle.atoms[oracle.atoms.atom_name == "CA"]
-    
-    # Pair CA atoms sequentially (ignores mismatched residue numbering)
-    min_len = min(len(ref_ca), len(oracle_ca))
-    
-    if min_len < 10:
+
+    # Pair CA atoms by sequence, not by array position or residue id.  See
+    # _match_ca_by_sequence for why both of the obvious keys are wrong here.
+    try:
+        idx_ref, idx_orc, how = _match_ca_by_sequence(ref_ca, oracle_ca)
+    except Exception as e:  # pragma: no cover - alignment is best-effort
+        print(f"WARNING: sequence-based CA matching failed ({e}); falling back to "
+              f"sequential pairing, which is only correct if the reference models "
+              f"every residue of the input.", file=sys.stderr)
+        idx_ref, idx_orc = np.empty(0, int), np.empty(0, int)
+        how = "failed"
+
+    if len(idx_ref) < 10:
+        n = min(len(ref_ca), len(oracle_ca))
+        idx_ref, idx_orc = np.arange(n), np.arange(n)
+        how = "sequential (FALLBACK -- correspondence unverified)"
+
+    if len(idx_ref) < 10:
         print("WARNING: Not enough CA atoms for Kabsch alignment. Skipping.", file=sys.stderr)
         return oracle
-        
-    matched_ref = ref_ca.coord[:min_len]
-    matched_oracle = oracle_ca.coord[:min_len]
-    
+
+    print(f"Matched {len(idx_ref)} CA atoms of "
+          f"{len(oracle_ca)} oracle / {len(ref_ca)} reference on {how}.",
+          file=sys.stderr)
+
+    matched_ref = ref_ca.coord[idx_ref]
+    matched_oracle = oracle_ca.coord[idx_orc]
     # Biotite's superimpose returns the fitted coordinates and the AffineTransformation object
     fitted_coords, transform = struc.superimpose(matched_ref, matched_oracle)
     rmsd = struc.rmsd(matched_ref, fitted_coords)
-    
+
     # Apply the AffineTransformation directly to the mobile Oracle coordinates
     aligned_coords = transform.apply(oracle.atoms.coord)
     oracle.atoms.coord = aligned_coords
-    
+
     # Update the JAX mapping coordinates so the diffusion target is aligned
     oracle.mapping = dataclasses.replace(
-        oracle.mapping, 
+        oracle.mapping,
         initial_coordinates=jnp.array(aligned_coords, dtype=jnp.float32)
     )
-    
+
     print(f"Successfully aligned Oracle to reference. (CA RMSD: {rmsd:.3f}A)", file=sys.stderr)
+    if rmsd > 2.0:
+        print(f"WARNING: CA RMSD of {rmsd:.3f} A is too large for a correct fold "
+              f"superposed on itself. Suspect the correspondence ({how}) before "
+              f"suspecting the coordinates.", file=sys.stderr)
     return oracle
 
 
@@ -641,8 +1024,16 @@ def init_neutron_sfc(oracle_atoms, mtz_path, deuterate=False, perdeuterate=False
             f"{sg_name:<11}\n"
         )
         
+        # Drop any CRYST1 biotite wrote of its own accord before prepending ours.
+        # biotite emits one whenever the AtomArray carries a `box`, and it labels
+        # it "P 1" -- so leaving it in place gives the file two CRYST1 records,
+        # and gemmi reads the wrong one.  The symptom is SFcalculator's
+        # "Space group from mtz file does not match that in PDB file!" assertion,
+        # or, worse, silently computing structure factors in P 1.
         with open(pdb_path, "r") as f:
-            pdb_content = f.read()
+            pdb_content = "".join(
+                line for line in f if not line.startswith("CRYST1")
+            )
         with open(pdb_path, "w") as f:
             f.write(cryst1_line + pdb_content)
             

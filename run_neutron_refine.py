@@ -151,6 +151,7 @@ flags.DEFINE_string("solvent_model", "mask", "Bulk solvent: 'mask' uses the prec
 flags.DEFINE_float("guidance_d_high", -1.0, "If > 0, restrict the crystallographic target to d >= this value (A) during sampling. Strongly recommended: the high-resolution shells carry no signal for a model far from truth, and they dominate both the loss and the memory.")
 flags.DEFINE_float("smc_ess_threshold", 0.5, "Resample when ESS/num_diffusion_samples falls below this.")
 flags.DEFINE_string("reference_cif", None, "Path to the explicit crystal structure (e.g., 4BD1.cif) to align the AF3 model into the correct unit cell frame.")
+flags.DEFINE_boolean("resolve_reindexing", True, "After aligning to a reference, test the alternative settings of the space group (the reindexing / twin-law operators) against F_obs and keep the one that fits. Costs one loss evaluation per candidate, and there are usually only two. Needed because a reference deposited in the other setting places the model tens of Angstrom from the data, and neither --search_placement nor the guidance gradient can represent an operator outside the space group. 4BD0 and 4BD1 differ by exactly this (-x,-y,z).")
 
 FLAGS = flags.FLAGS
 
@@ -556,7 +557,11 @@ def main(argv):
 
     # Use explicit reference alignment if provided
     if FLAGS.reference_cif:
-        oracle = align_oracle_to_reference(oracle, FLAGS.reference_cif)
+        # mtz_path lets the alignment read the data's own cell, so a reference
+        # deposited in a different cell is transferred rather than silently
+        # strained (4BD0 vs 4BD1 differ by 1.3-1.5%, worth ~0.13 in R).
+        oracle = align_oracle_to_reference(oracle, FLAGS.reference_cif,
+                                          mtz_path=FLAGS.mtz_path)
     else:
         logging.warning("No --reference_cif provided. The model will remain at the AF3 origin, which may cause high R-factors.")
 
@@ -570,6 +575,39 @@ def main(argv):
 
     if sfc is not None:
         sfc.fit_overall_b = FLAGS.fit_overall_b
+
+    # --- alternative-setting (reindexing) resolution ----------------------
+    # Runs FIRST, before the placement search: a reindexing operator is outside
+    # the space group, so the symop x translation search cannot represent it, and
+    # searching translations for a model in the wrong setting only finds the best
+    # wrong answer.  Measured: 4BD0 and 4BD1 are related by -x,-y,z with zero
+    # translation, so a model aligned to 4BD0 lands 82 A from 4BD1's data.
+    if sfc is not None and FLAGS.reference_cif and FLAGS.resolve_reindexing:
+        from af3_neutron.sfc_adapter import resolve_reindexing
+
+        logging.info("Testing alternative settings (reindexing operators)...")
+        xyz_reidx, reidx_info = resolve_reindexing(sfc, xyz_baseline)
+        if reidx_info["changed"]:
+            logging.info(
+                "Reindexed by %s: R_work %.4f -> %.4f",
+                reidx_info["label"], reidx_info["identity_r_work"],
+                reidx_info["r_work"],
+            )
+            xyz_baseline = jnp.asarray(xyz_reidx)
+            oracle.mapping = dataclasses.replace(
+                oracle.mapping, initial_coordinates=xyz_baseline
+            )
+            # Same reasoning as the placement branch: the molecule moved, so the
+            # bulk-solvent mask built at init no longer matches it.  np.asarray on
+            # a JAX array is read-only and biotite's CellList needs a writable
+            # buffer, hence the explicit copy.
+            oracle.atoms.coord = np.array(xyz_baseline, dtype=np.float32, copy=True)
+            sfc = init_neutron_sfc(oracle.atoms,
+                                   FLAGS.mtz_path,
+                                   deuterate=FLAGS.deuterate,
+                                   perdeuterate=FLAGS.perdeuterate)
+            sfc.fit_overall_b = FLAGS.fit_overall_b
+            logging.info("SFC and solvent mask rebuilt for the new setting.")
 
     # --- global rigid placement search -----------------------------------
     # Runs BEFORE the solvent grid search, because a corrected placement changes
