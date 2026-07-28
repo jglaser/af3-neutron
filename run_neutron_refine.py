@@ -147,10 +147,12 @@ flags.DEFINE_integer("search_grid", 12, "Translation grid divisions per cell axi
 flags.DEFINE_float("search_d_high", 8.0, "Resolution cutoff (A) for the placement search. Only low-resolution shells are needed to place a molecule, and truncating the reflection list is what makes the search cheap.")
 flags.DEFINE_boolean("search_symops", False, "Include the symmetry operators in the placement search. Normally unnecessary: compute_loss already expands the ASU by the full space group, so pre-applying an operator is absorbed into a relabelling of the translation. Leave off unless the translation grid does not span the cell.")
 flags.DEFINE_boolean("fit_overall_b", True, "Fit an overall B alongside the linear scale (k*exp(-B*s^2/4)). Without it a mismatch between the model's B-factors and the data goes straight into R, and the solvent parameters get abused to absorb it. Pass --nofit_overall_b to reproduce the old single-scale behaviour.")
-flags.DEFINE_string("solvent_model", "mask", "Bulk solvent: 'mask' uses the precomputed Fmask (constant, zero gradient w.r.t. coordinates); 'babinet' uses -k_sol*exp(-b_sol*s^2/4)*F_protein, which is differentiable and never stale. Prefer babinet whenever --guidance_d_high is set, since the mask term is both dominant and gradient-free at low resolution.")
+flags.DEFINE_string("solvent_model", "babinet", "Bulk solvent: 'babinet' uses -k_sol*exp(-b_sol*s^2/4)*F_protein, which is differentiable and never stale; 'mask' uses the precomputed Fmask, which is constant, has zero gradient w.r.t. coordinates, and is computed at the STARTING placement -- so for a model that has moved it is the mask of a molecule that is no longer there. Babinet is the default because the mask is actively wrong in the regime this pipeline runs in. Measured on a 0-5 A error ladder at d >= 8 A: with 'mask' the guided loss is non-monotone and its MINIMUM is at the 5 A-error model (0.2668) rather than the truth (0.2794) -- i.e. selection prefers a wrong structure; with 'babinet' it is monotone and the truth wins (0.1299 -> 0.3334). For placement contrast the same switch is worth z 4.69 -> 11.58 against a random-placement null. Pass --solvent_model mask only to reproduce old runs.")
 flags.DEFINE_float("guidance_d_high", -1.0, "If > 0, restrict the crystallographic target to d >= this value (A) during sampling. Strongly recommended: the high-resolution shells carry no signal for a model far from truth, and they dominate both the loss and the memory.")
 flags.DEFINE_float("smc_ess_threshold", 0.5, "Resample when ESS/num_diffusion_samples falls below this.")
 flags.DEFINE_string("reference_cif", None, "Path to the explicit crystal structure (e.g., 4BD1.cif) to align the AF3 model into the correct unit cell frame.")
+flags.DEFINE_float("guidance_sigma_on", 12.0, "Noise level (A) at which the crystallographic GRADIENT ramps on, as sfc_weight*sigmoid((sigma_on - sigma)/sigma_width). The old schedule was exp(-sigma), which underflows to exactly zero above ~700 A and is still 6e-6 at 12 A -- measured, it was numerically dead for the first 130 of 200 levels, so the gradient could only polish a fold the prior had already chosen. Set to 0 to restore the old exp(-sigma) behaviour.")
+flags.DEFINE_float("guidance_sigma_width", 6.0, "Width (A) of the logistic guidance ramp. Matches --smc_sigma_on/--smc_sigma_width so the gradient and the SMC selection switch on together.")
 flags.DEFINE_boolean("resolve_reindexing", True, "After aligning to a reference, test the alternative settings of the space group (the reindexing / twin-law operators) against F_obs and keep the one that fits. Costs one loss evaluation per candidate, and there are usually only two. Needed because a reference deposited in the other setting places the model tens of Angstrom from the data, and neither --search_placement nor the guidance gradient can represent an operator outside the space group. 4BD0 and 4BD1 differ by exactly this (-x,-y,z).")
 
 FLAGS = flags.FLAGS
@@ -187,12 +189,22 @@ def get_fmodel_and_scale(sfc, xyz_coords):
     else:
         dr2_tensor = jnp.zeros(len(f_protein), dtype=jnp.float32)
 
-    # 4. Apply bulk solvent scale (k_sol) and exponential B-factor (b_sol)
+    # 4. Apply bulk solvent scale (k_sol) and exponential B-factor (b_sol).
+    #
+    # This MUST use the same solvent model compute_loss used, or the exported
+    # maps describe a different F_model than the one the structure was refined
+    # against -- the R factors in the log and the difference density in the .mrc
+    # would then disagree, and the Fo-Fc peaks would be dominated by the
+    # mismatch rather than by anything real.
     k_sol = float(getattr(sfc, "k_sol", 0.35))
     b_sol = float(getattr(sfc, "b_sol", 50.0))
+    attenuation = jnp.exp(-b_sol * dr2_tensor / 4.0)
 
-    scaled_fmask = k_sol * jnp.exp(-b_sol * dr2_tensor / 4.0) * f_mask
-    f_model = f_protein + scaled_fmask
+    if getattr(sfc, "solvent_model", "mask") == "babinet":
+        f_bulk = -k_sol * attenuation * f_protein
+    else:
+        f_bulk = k_sol * attenuation * f_mask
+    f_model = f_protein + f_bulk
 
     # 5. Compute overall scale factor k_scale against work reflections
     f_obs = np.array(sfc.Fo, dtype=np.float32)
@@ -573,8 +585,23 @@ def main(argv):
     # Get baseline coordinates
     xyz_baseline = oracle.mapping.initial_coordinates
 
+    def _configure(s):
+        """Settings that must be in force before ANY compute_loss call.
+
+        The solvent model in particular: it used to be applied after the
+        reindexing and placement steps, which meant those decisions were made on
+        the frozen Fmask -- the one term that is guaranteed wrong for a model
+        that is about to move.  Measured, at d >= 8 A: placement contrast against
+        a random-placement null is z = 4.69 with the mask and z = 11.58 with
+        Babinet.  Anything that scores a MOVED model has to see Babinet.
+        """
+        s.fit_overall_b = FLAGS.fit_overall_b
+        s.solvent_model = FLAGS.solvent_model
+        return s
+
     if sfc is not None:
-        sfc.fit_overall_b = FLAGS.fit_overall_b
+        _configure(sfc)
+        logging.info("Bulk solvent model: %s", FLAGS.solvent_model)
 
     # --- alternative-setting (reindexing) resolution ----------------------
     # Runs FIRST, before the placement search: a reindexing operator is outside
@@ -602,11 +629,10 @@ def main(argv):
             # a JAX array is read-only and biotite's CellList needs a writable
             # buffer, hence the explicit copy.
             oracle.atoms.coord = np.array(xyz_baseline, dtype=np.float32, copy=True)
-            sfc = init_neutron_sfc(oracle.atoms,
-                                   FLAGS.mtz_path,
-                                   deuterate=FLAGS.deuterate,
-                                   perdeuterate=FLAGS.perdeuterate)
-            sfc.fit_overall_b = FLAGS.fit_overall_b
+            sfc = _configure(init_neutron_sfc(oracle.atoms,
+                                              FLAGS.mtz_path,
+                                              deuterate=FLAGS.deuterate,
+                                              perdeuterate=FLAGS.perdeuterate))
             logging.info("SFC and solvent mask rebuilt for the new setting.")
 
     # --- global rigid placement search -----------------------------------
@@ -618,10 +644,7 @@ def main(argv):
     if sfc is not None and FLAGS.search_placement:
         from af3_neutron.sfc_adapter import make_low_resolution_sfc, search_rigid_placement
 
-        sfc_search = make_low_resolution_sfc(sfc, FLAGS.search_d_high)
-        sfc_search.fit_overall_b = FLAGS.fit_overall_b
-        if FLAGS.solvent_model != "mask":
-            sfc_search.solvent_model = FLAGS.solvent_model
+        sfc_search = _configure(make_low_resolution_sfc(sfc, FLAGS.search_d_high))
         # the search must not be windowed twice; it already has a truncated list
         sfc_search.guidance_d_high = None
 
@@ -652,11 +675,10 @@ def main(argv):
             # CellList needs a writable buffer ('buffer source array is
             # read-only'), so copy explicitly.
             oracle.atoms.coord = np.array(xyz_baseline, dtype=np.float32, copy=True)
-            sfc = init_neutron_sfc(oracle.atoms,
-                                   FLAGS.mtz_path,
-                                   deuterate=FLAGS.deuterate,
-                                   perdeuterate=FLAGS.perdeuterate)
-            sfc.fit_overall_b = FLAGS.fit_overall_b
+            sfc = _configure(init_neutron_sfc(oracle.atoms,
+                                              FLAGS.mtz_path,
+                                              deuterate=FLAGS.deuterate,
+                                              perdeuterate=FLAGS.perdeuterate))
             logging.info("Placement accepted; SFC and solvent mask rebuilt.")
         else:
             logging.warning(
@@ -667,10 +689,6 @@ def main(argv):
                 info["z"], info["loss"], info["identity_loss"],
                 info["grid_mean"], info["grid_std"],
             )
-
-    if sfc is not None and FLAGS.solvent_model != "mask":
-        sfc.solvent_model = FLAGS.solvent_model
-        logging.info("Bulk solvent model: %s", FLAGS.solvent_model)
 
     if sfc is not None and FLAGS.guidance_d_high > 0:
         sfc.guidance_d_high = FLAGS.guidance_d_high
@@ -722,6 +740,8 @@ def main(argv):
         sfc_weight=sfc_weight,
         smc_config=smc_config,
         x_start=x_start,
+        guidance_sigma_on=FLAGS.guidance_sigma_on,
+        guidance_sigma_width=FLAGS.guidance_sigma_width,
     )
 
     logging.info("Assembling final atomic coordinates...")

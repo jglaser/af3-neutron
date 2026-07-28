@@ -269,6 +269,8 @@ def _hijack_diffusion_with_custom_loss(
     steps: int = 200,
     smc_config=None,
     x_start: Optional[jnp.ndarray] = None,
+    guidance_sigma_on: float = 12.0,
+    guidance_sigma_width: float = 6.0,
 ) -> Conformations:
     oracle_mapping = oracle.mapping
     params = hydride.get_relaxation_params(oracle.atoms)
@@ -277,8 +279,34 @@ def _hijack_diffusion_with_custom_loss(
     def proximal_operator_fn(x_0_real: jnp.ndarray, t_hat: jnp.ndarray) -> jnp.ndarray:
         x_0_flat = x_0_real.reshape(-1, 3)
 
-        # effective guidance weight
-        cur_weight = sfc_weight * jnp.exp(-t_hat)
+        # --- effective guidance weight ------------------------------------
+        # ``t_hat`` is the noise level in ANGSTROM (sigma, inflated by the churn
+        # factor 1+gamma), running from 16*160*1.8 = 4608 down to ~0.
+        #
+        # This used to be ``sfc_weight * exp(-t_hat)``, which is a ramp in the
+        # wrong units: exp(-sigma) with sigma in Angstrom underflows to exactly
+        # 0.0 for all sigma > ~700, and is still only 6e-6 at sigma = 12 A.
+        # Measured on a 200-level trajectory: the weight was numerically zero for
+        # the first 130 levels and exceeded 1.0 only for the last 60 (30%).  The
+        # fold is decided at high sigma, so the crystallographic term could only
+        # ever polish a structure the prior had already committed to -- which is
+        # exactly why guidance cannot rescue a template-less run, where the fold
+        # is the thing that is wrong.
+        #
+        # The replacement is the same logistic ramp SMC already uses for its
+        # selection weight (``smc.lambda_ramp``), with the same defaults, so the
+        # gradient and the resampling now switch on together instead of ~9 A
+        # apart.  Below sigma_on the weight tends to ``sfc_weight``, so the
+        # endgame is unchanged; the difference is entirely that the 3-20 A window
+        # is no longer dead.
+        # guidance_sigma_on is a Python float closed over at trace time, so this
+        # branch costs nothing at runtime.
+        if guidance_sigma_on > 0.0:
+            cur_weight = sfc_weight * jax.nn.sigmoid(
+                (guidance_sigma_on - t_hat) / guidance_sigma_width
+            )
+        else:
+            cur_weight = sfc_weight * jnp.exp(-t_hat)   # legacy schedule
 
         x_af3_flat = x_0_flat[gather_idxs]
         x_0_heavy_mapped = x_af3_flat[oracle_mapping.source_indices]
@@ -502,9 +530,13 @@ class Hijacker:
         steps: int = None,
         smc_config=None,
         x_start: Optional[jnp.ndarray] = None,
+        guidance_sigma_on: float = 12.0,
+        guidance_sigma_width: float = 6.0,
     ) -> jnp.ndarray:
         return _hijack_diffusion_with_custom_loss(runner, batch_dict, embeddings, gather_idxs, oracle, sfc, key, sfc_weight=sfc_weight,
-                                                  steps=steps, smc_config=smc_config, x_start=x_start)
+                                                  steps=steps, smc_config=smc_config, x_start=x_start,
+                                                  guidance_sigma_on=guidance_sigma_on,
+                                                  guidance_sigma_width=guidance_sigma_width)
 
     @staticmethod
     def assemble_coordinates(atom_positions: jnp.ndarray, gather_idxs: jnp.ndarray, oracle: Oracle, sfc: Optional[SFC] = None, sfc_weight: float = 1000.0) -> np.ndarray:
