@@ -1,5 +1,7 @@
+import functools
 import logging
-from typing import Any, Optional
+import sys
+from typing import Any, Optional, Dict
 
 import hydride
 import biotite.structure as struc
@@ -7,26 +9,155 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from SFC_Jax.Fmodel import SFcalculator as SFC
+from rdkit import Chem
 
-from .loss import hijack_physics_loss # expose into this file later
 from .runner import HostRunner
 from .types import (
     HostEmbeddings,
-    RotorTable,
-    WaterMapping,
     Oracle,
     OracleMapping,
-    Conformation,
     Conformations
 )
+from .sfc_adapter import refine_rigid_pose
+
+def build_custom_bond_dict(atoms: struc.AtomArray, ligand_smiles_dict: Dict[str, str]) -> Dict[str, Dict[tuple, Any]]:
+    from biotite.structure import BondType
+    from biotite.structure.info import bonds_in_residue
+    
+    custom_bond_dict = {}
+    
+    unique_res_names = np.unique(atoms.res_name)
+    for res_name_raw in unique_res_names:
+        res_name = str(res_name_raw)
+        
+        # 1. First, check if Biotite already knows this CCD residue (e.g. 'BZB', 'HEM', 'ATP')
+        standard_bonds = bonds_in_residue(res_name)
+        if standard_bonds is not None and len(standard_bonds) > 0:
+            custom_bond_dict[res_name] = dict(standard_bonds)
+            logging.info(f"Loaded {len(standard_bonds)} standard CCD bonds for residue '{res_name}' from Biotite.")
+            continue
+
+        # 2. Fallback for custom non-CCD ligands defined via SMILES
+        for chain_id, smiles in ligand_smiles_dict.items():
+            chain_mask = (atoms.chain_id == chain_id)
+            chain_res_names = np.unique(atoms.res_name[chain_mask])
+            if len(chain_res_names) == 0 or str(chain_res_names[0]) != res_name:
+                continue
+            
+            mol = Chem.MolFromSmiles(smiles)
+            if mol is None:
+                continue
+            
+            # Hydride REQUIRES single/double bonds (Kekulized), NOT aromatic (type 9)
+            try:
+                Chem.Kekulize(mol, clearAromaticFlags=True)
+            except Exception:
+                pass
+                
+            res_bonds = {}
+            lig_indices = np.where(chain_mask)[0]
+            
+            # Map RDKit bonds if atom count matches
+            if mol.GetNumAtoms() == len(lig_indices):
+                # Check if AF3 attached atom_name properties to RDKit atoms
+                has_props = all(a.HasProp("atom_name") for a in mol.GetAtoms())
+                atom_names = [str(name) for name in atoms.atom_name[lig_indices]]
+                
+                for bond in mol.GetBonds():
+                    idx1 = bond.GetBeginAtomIdx()
+                    idx2 = bond.GetEndAtomIdx()
+                    
+                    name1 = mol.GetAtomWithIdx(idx1).GetProp("atom_name") if has_props else atom_names[idx1]
+                    name2 = mol.GetAtomWithIdx(idx2).GetProp("atom_name") if has_props else atom_names[idx2]
+                        
+                    rdkit_btype = bond.GetBondType()
+                    if rdkit_btype == Chem.BondType.DOUBLE:
+                        btype = int(BondType.DOUBLE)
+                    elif rdkit_btype == Chem.BondType.TRIPLE:
+                        btype = int(BondType.TRIPLE)
+                    else:
+                        btype = int(BondType.SINGLE)
+                        
+                    res_bonds[(name1, name2)] = btype
+                    
+                custom_bond_dict[res_name] = res_bonds
+            else:
+                logging.warning(f"Heavy atom count mismatch for ligand chain {chain_id}: RDKit {mol.GetNumAtoms()} vs AF3 {len(lig_indices)}")
+            
+    return custom_bond_dict
+
+def optimize_solvent_grid(sfc_instance, xyz_baseline):
+    """
+    Mimics cctbx grid search to find optimal k_sol and b_sol for neutrons.
+    """
+    # 1. Define the grid (allow negative k_sol for neutrons!)
+    k_sols = jnp.linspace(-0.5, 0.8, 20)
+    b_sols = jnp.linspace(10.0, 300.0, 20)
+
+    # Create a 2D meshgrid
+    K, B = jnp.meshgrid(k_sols, b_sols)
+    K_flat, B_flat = K.flatten(), B.flatten()
+
+    # 2. Define a pure function to compute R_work for a given (k_sol, b_sol)
+    def test_solvent(k, b):
+        # Temporarily override the parameters in the SFC instance
+        # (Assuming your SFC_Jax compute_loss can accept these, or you
+        # temporarily inject them into the object)
+        sfc_instance.k_sol = k
+        sfc_instance.b_sol = b
+
+        # Calculate loss using the baseline unrefined coordinates
+        _, (r_work, _) = sfc_instance.compute_loss(xyz_baseline)
+        return r_work
+
+    # 3. Vectorize the search across the grid
+    # (In practice, you might need to adapt this depending on how
+    # SFC_Jax manages state, perhaps using a loop if vmap complains about objects)
+    r_works = jax.vmap(test_solvent)(K_flat, B_flat)
+
+    # 4. Find the minimum
+    best_idx = jnp.argmin(r_works)
+    best_k = K_flat[best_idx]
+    best_b = B_flat[best_idx]
+
+    return best_k, best_b
+
+
+def add_covalent_linkages(oracle_atoms: struc.AtomArray, bonded_atom_pairs: list):
+    """Add explicit inter-chain covalent bonds to Biotite's BondList."""
+    if not bonded_atom_pairs:
+        return
+
+    for pair in bonded_atom_pairs:
+        (chain1, res1, atom1), (chain2, res2, atom2) = pair[0], pair[1]
+        res1, res2 = int(res1), int(res2)
+
+        idx1_mask = (oracle_atoms.chain_id == chain1) & \
+                    (oracle_atoms.res_id == res1) & \
+                    (oracle_atoms.atom_name == atom1)
+
+        idx2_mask = (oracle_atoms.chain_id == chain2) & \
+                    (oracle_atoms.res_id == res2) & \
+                    (oracle_atoms.atom_name == atom2)
+
+        idxs1 = np.where(idx1_mask)[0]
+        idxs2 = np.where(idx2_mask)[0]
+
+        if len(idxs1) > 0 and len(idxs2) > 0:
+            oracle_atoms.bonds.add_bond(idxs1[0], idxs2[0], bond_type=1)
+            logging.info(f"Registered covalent bond in Hydride Oracle: {chain1}:{res1}:{atom1} <-> {chain2}:{res2}:{atom2}")
+        else:
+            logging.warning(f"Could not find atoms for covalent pair: {chain1}:{res1}:{atom1} <-> {chain2}:{res2}:{atom2}")
+
 
 def _build_oracle_from_baseline_af3_prediction(
-    flat_layout: Any, x_af3_flat_baseline: jnp.ndarray
+    flat_layout: Any, 
+    x_af3_flat_baseline: jnp.ndarray, 
+    ligand_smiles_dict: Dict[str, str] = None,
+    bonded_atom_pairs: list = None,
+    ph: float = 7.4
 ) -> Oracle:
-    """Builds a full complex topological oracle from an unguided baseline prediction."""
-    logging.info(
-        "Building full-complex Hydride Oracle from Host baseline prediction..."
-    )
+    logging.info(f"Building full-complex Hydride Oracle from Host baseline prediction at pH {ph}...")
 
     num_atoms = flat_layout.shape[0]
     atoms = struc.AtomArray(num_atoms)
@@ -36,136 +167,80 @@ def _build_oracle_from_baseline_af3_prediction(
     atoms.res_name = np.array(flat_layout.res_name, dtype="U")
     atoms.chain_id = np.array(flat_layout.chain_id, dtype="U")
     atoms.res_id = np.array(flat_layout.res_id, dtype=int)
-    atoms.element = np.array(
-        [str(e).strip().upper() for e in flat_layout.atom_element], dtype="U2"
-    )
+    atoms.element = np.array([str(e).strip().upper() for e in flat_layout.atom_element], dtype="U2")
 
+    # Strip existing hydrogens/deuteriums
     oracle_atoms = atoms[(atoms.element != "H") & (atoms.element != "D")]
-    oracle_atoms.bonds = struc.connect_via_residue_names(oracle_atoms)
-    if "charge" not in oracle_atoms.get_annotation_categories():
-        oracle_atoms.add_annotation("charge", dtype=int)
-        oracle_atoms.charge[:] = 0
+    
+    # 1. Build custom bond dictionary using index-aligned RDKit topology
+    custom_bonds = build_custom_bond_dict(oracle_atoms, ligand_smiles_dict or {})
+    
+    # 2. Connect intra-residue/ligand bonds
+    oracle_atoms.bonds = struc.connect_via_residue_names(oracle_atoms, inter_residue=True, custom_bond_dict=custom_bonds)
 
+    # 3. CRITICAL: Register inter-chain covalent bonds BEFORE Hydride runs!
+    if bonded_atom_pairs:
+        add_covalent_linkages(oracle_atoms, bonded_atom_pairs)
+
+    # 4. Estimate charges
+    charges_array = hydride.estimate_amino_acid_charges(oracle_atoms, ph)
+    for chain_id, smiles in (ligand_smiles_dict or {}).items():
+        mol = Chem.MolFromSmiles(smiles)
+        if mol is None:
+            continue
+        try:
+            Chem.ComputeGasteigerCharges(mol)
+            rdkit_charges = [float(a.GetProp("_GasteigerCharge")) for a in mol.GetAtoms()]
+            rdkit_charges = [0.0 if np.isnan(c) or np.isinf(c) else c for c in rdkit_charges]
+        except Exception:
+            rdkit_charges = [0.0] * mol.GetNumAtoms()
+            
+        chain_mask = (oracle_atoms.chain_id == chain_id)
+        lig_indices = np.where(chain_mask)[0]
+        for idx, g_idx in enumerate(lig_indices):
+            if idx < len(rdkit_charges):
+                charges_array[g_idx] = rdkit_charges[idx]
+                
+    oracle_atoms.set_annotation("charge", charges_array)
+
+    # 5. Hydride adds and relaxes explicit hydrogens
     oracle_atoms, _ = hydride.add_hydrogen(oracle_atoms)
     oracle_atoms.coord = hydride.relax_hydrogen(oracle_atoms)
     num_oracle_atoms = oracle_atoms.array_length()
+
+    is_heavy = (oracle_atoms.element != "H") & (oracle_atoms.element != "D")
+    parent_map = np.arange(num_oracle_atoms)
+    bonds = oracle_atoms.bonds.as_array()
+
+    for i in range(bonds.shape[0]):
+        a1, a2, _ = bonds[i]
+        if not is_heavy[a1] and is_heavy[a2]:
+            parent_map[a1] = a2
+        elif not is_heavy[a2] and is_heavy[a1]:
+            parent_map[a2] = a1
 
     af3_lookup = {
         (flat_layout.chain_id[i], flat_layout.res_id[i], flat_layout.atom_name[i]): i
         for i in range(num_atoms)
     }
-    bonds, _ = oracle_atoms.bonds.get_all_bonds()
 
-    water_o_source, water_h1_target, water_h2_target = [], [], []
-    for i in range(num_oracle_atoms):
-        if (
-            oracle_atoms.res_name[i] not in ["HOH", "WAT", "H2O"]
-            or oracle_atoms.element[i] != "O"
-        ):
-            continue
-        o_key = (
-            oracle_atoms.chain_id[i],
-            oracle_atoms.res_id[i],
-            oracle_atoms.atom_name[i],
-        )
-        if o_key not in af3_lookup:
-            continue
-        h_idx = [
-            idx for idx in bonds[i][bonds[i] != -1] if oracle_atoms.element[idx] == "H"
-        ]
-        if len(h_idx) == 2:
-            water_o_source.append(af3_lookup[o_key])
-            water_h1_target.append(h_idx[0])
-            water_h2_target.append(h_idx[1])
-
-    rotor_table = {
-        k: []
-        for k in [
-            "target_idx",
-            "parent_idx",
-            "grandparent_idx",
-            "greatgrand_idx",
-            "ideal_r",
-            "ideal_theta",
-            "initial_chi",
-        ]
-    }
     oracle_heavy_indices, af3_source_indices = [], []
-
     for i in range(num_oracle_atoms):
         h_key = (
             oracle_atoms.chain_id[i],
             oracle_atoms.res_id[i],
             oracle_atoms.atom_name[i],
         )
-        if oracle_atoms.element[i] != "H":
-            if h_key in af3_lookup:
-                oracle_heavy_indices.append(i)
-                af3_source_indices.append(af3_lookup[h_key])
-            continue
-        if i in water_h1_target or i in water_h2_target:
-            continue
+        if oracle_atoms.element[i] != "H" and h_key in af3_lookup:
+            oracle_heavy_indices.append(i)
+            af3_source_indices.append(af3_lookup[h_key])
 
-        p_idx = bonds[i][bonds[i] != -1]
-        if len(p_idx) == 0:
-            continue
-        p_i = p_idx[0]
+    # Create boolean mask for ligand/non-protein chains
+    ligand_chains = list((ligand_smiles_dict or {}).keys())
+    hetero_mask = np.isin(atoms.chain_id, ligand_chains) | (atoms.res_name == "BZB")
 
-        gp_idx = bonds[p_i][(bonds[p_i] != -1) & (bonds[p_i] != i)]
-        if len(gp_idx) == 0:
-            continue
-        gp_i = gp_idx[0]
-
-        ggp_idx = bonds[gp_i][(bonds[gp_i] != -1) & (bonds[gp_i] != p_i)]
-        if len(ggp_idx) == 0:
-            continue
-        ggp_i = ggp_idx[0]
-
-        p_key = (
-            oracle_atoms.chain_id[p_i],
-            oracle_atoms.res_id[p_i],
-            oracle_atoms.atom_name[p_i],
-        )
-        gp_key = (
-            oracle_atoms.chain_id[gp_i],
-            oracle_atoms.res_id[gp_i],
-            oracle_atoms.atom_name[gp_i],
-        )
-        ggp_key = (
-            oracle_atoms.chain_id[ggp_i],
-            oracle_atoms.res_id[ggp_i],
-            oracle_atoms.atom_name[ggp_i],
-        )
-
-        if not (p_key in af3_lookup and gp_key in af3_lookup and ggp_key in af3_lookup):
-            continue
-
-        c_h, c_p, c_gp, c_ggp = (
-            oracle_atoms.coord[i],
-            oracle_atoms.coord[p_i],
-            oracle_atoms.coord[gp_i],
-            oracle_atoms.coord[ggp_i],
-        )
-        v_hp, v_gpp = c_h - c_p, c_gp - c_p
-
-        r_ideal = np.linalg.norm(v_hp)
-        cos_theta = np.dot(v_hp, v_gpp) / (r_ideal * np.linalg.norm(v_gpp) + 1e-8)
-        theta_ideal = np.degrees(np.arccos(np.clip(cos_theta, -1.0, 1.0)))
-
-        z_axis = (c_p - c_gp) / (np.linalg.norm(c_p - c_gp) + 1e-8)
-        x_axis_raw = np.cross(c_gp - c_ggp, z_axis)
-        x_axis = x_axis_raw / (np.linalg.norm(x_axis_raw) + 1e-8)
-        y_axis = np.cross(z_axis, x_axis)
-
-        chi_initial = np.arctan2(np.dot(v_hp, y_axis), np.dot(v_hp, x_axis))
-
-        rotor_table["target_idx"].append(i)
-        rotor_table["parent_idx"].append(af3_lookup[p_key])
-        rotor_table["grandparent_idx"].append(af3_lookup[gp_key])
-        rotor_table["greatgrand_idx"].append(af3_lookup[ggp_key])
-        rotor_table["ideal_r"].append(r_ideal)
-        rotor_table["ideal_theta"].append(theta_ideal)
-        rotor_table["initial_chi"].append(chi_initial)
+    # Assign the 'hetero' annotation so Biotite outputs HETATM in CIF/PDB files
+    atoms.set_annotation("hetero", hetero_mask)
 
     return Oracle(
         mapping=OracleMapping(
@@ -173,79 +248,190 @@ def _build_oracle_from_baseline_af3_prediction(
             heavy_indices=jnp.array(oracle_heavy_indices, dtype=jnp.int32),
             source_indices=jnp.array(af3_source_indices, dtype=jnp.int32),
             initial_coordinates=jnp.array(oracle_atoms.coord, dtype=jnp.float32),
-            rotor_table = RotorTable(
-                **{ k: jnp.array(v, dtype=jnp.float32 if ("ideal" in k or "chi" in k) else jnp.int32)
-                    for k, v in rotor_table.items()
-                }),
-            water_mapping=WaterMapping(
-                oxygen_source=jnp.array(water_o_source, dtype=jnp.int32),
-                h1_target=jnp.array(water_h1_target, dtype=jnp.int32),
-                h2_target=jnp.array(water_h2_target, dtype=jnp.int32),
-            )
+            hydrogen_to_heavy_map=jnp.array(parent_map, dtype=jnp.int32)
         ),
         atoms=oracle_atoms,
     )
 
-# TODO(vivek): let user handle desired loss (or default) to pass and directly run guided diffusion
+
 def _hijack_diffusion_with_custom_loss(
     model_runner: HostRunner,
     batch_dict: dict,
     embeddings: HostEmbeddings,
     gather_idxs: jnp.ndarray,
-    oracle_mapping: OracleMapping,
+    oracle: Oracle,
     sfc_instance: Optional[SFC] = None,
     sample_key: Optional[jnp.ndarray] = None,
+    prox_steps: int = 3,
+    eta_init: float = 1e-2,
+    sfc_weight: float = 10.0,
+    lr: int = 0.01,
+    steps: int = 200,
+    smc_config=None,
+    x_start: Optional[jnp.ndarray] = None,
+    guidance_sigma_on: float = 12.0,
+    guidance_sigma_width: float = 6.0,
 ) -> Conformations:
-    """Intercepts and steers Host diffusion trajectories."""
+    oracle_mapping = oracle.mapping
+    params = hydride.get_relaxation_params(oracle.atoms)
 
-    def single_sample_loss_fn(p_single, c_single, w_single):
-        return hijack_physics_loss(
-            p_single.reshape((-1, 3)),
-            c_single,
-            w_single,
-            gather_idxs,
-            oracle_mapping,
-            sfc_instance,
-        )
+    @functools.partial(jax.jit, inline=False)
+    def proximal_operator_fn(x_0_real: jnp.ndarray, t_hat: jnp.ndarray) -> jnp.ndarray:
+        x_0_flat = x_0_real.reshape(-1, 3)
 
-    val_and_grad_fn = jax.value_and_grad(single_sample_loss_fn, argnums=(0, 1, 2))
-    conformations = model_runner.sample_guided_diffusion(
-        jax.random.PRNGKey(0),
+        # --- effective guidance weight ------------------------------------
+        # ``t_hat`` is the noise level in ANGSTROM (sigma, inflated by the churn
+        # factor 1+gamma), running from 16*160*1.8 = 4608 down to ~0.
+        #
+        # This used to be ``sfc_weight * exp(-t_hat)``, which is a ramp in the
+        # wrong units: exp(-sigma) with sigma in Angstrom underflows to exactly
+        # 0.0 for all sigma > ~700, and is still only 6e-6 at sigma = 12 A.
+        # Measured on a 200-level trajectory: the weight was numerically zero for
+        # the first 130 levels and exceeded 1.0 only for the last 60 (30%).  The
+        # fold is decided at high sigma, so the crystallographic term could only
+        # ever polish a structure the prior had already committed to -- which is
+        # exactly why guidance cannot rescue a template-less run, where the fold
+        # is the thing that is wrong.
+        #
+        # The replacement is the same logistic ramp SMC already uses for its
+        # selection weight (``smc.lambda_ramp``), with the same defaults, so the
+        # gradient and the resampling now switch on together instead of ~9 A
+        # apart.  Below sigma_on the weight tends to ``sfc_weight``, so the
+        # endgame is unchanged; the difference is entirely that the 3-20 A window
+        # is no longer dead.
+        # guidance_sigma_on is a Python float closed over at trace time, so this
+        # branch costs nothing at runtime.
+        if guidance_sigma_on > 0.0:
+            cur_weight = sfc_weight * jax.nn.sigmoid(
+                (guidance_sigma_on - t_hat) / guidance_sigma_width
+            )
+        else:
+            cur_weight = sfc_weight * jnp.exp(-t_hat)   # legacy schedule
+
+        x_af3_flat = x_0_flat[gather_idxs]
+        x_0_heavy_mapped = x_af3_flat[oracle_mapping.source_indices]
+
+        def step_body(i, r_current):
+            # --- 1. FORWARD PASS ALIGNMENT (C-alpha ONLY) ---
+            R_ref = oracle_mapping.initial_coordinates[oracle_mapping.heavy_indices]
+
+            # Extract only the C-alpha coordinates for calculating the transform
+            r_curr_ca = r_current[ca_mask_heavy]
+            R_ref_ca = R_ref[ca_mask_heavy]
+
+            # Compute centroids using ONLY C-alphas
+            avg_ca_curr = jnp.mean(r_curr_ca, axis=0)
+            avg_ca_ref = jnp.mean(R_ref_ca, axis=0)
+
+            p_ca = r_curr_ca - avg_ca_curr
+            q_ca = R_ref_ca - avg_ca_ref
+
+            # SVD on the C-alpha covariance matrix
+            H = jnp.einsum("ni,nj->ij", p_ca, q_ca)
+            U, _, Vt = jnp.linalg.svd(H, full_matrices=False)
+            d = jnp.sign(jnp.linalg.det(U) * jnp.linalg.det(Vt))
+            R_mat = U @ jnp.diag(jnp.array([1.0, 1.0, d])) @ Vt
+
+            # Apply the CA-derived transformation to ALL heavy atoms
+            R_aligned = (r_current - avg_ca_curr) @ R_mat + avg_ca_ref
+            
+            X_base = oracle_mapping.initial_coordinates.at[oracle_mapping.heavy_indices].set(R_aligned)
+            X_relaxed, _, _ = hydride.relax_hydrogen_jit(X_base, *params, iterations=5)
+            
+            # --- 2. COMPUTE EXPERIMENTAL LOSS GRADIENTS ---
+            # Gradients are taken strictly with respect to the 3D crystal coordinates.
+            # This completely bypasses the unstable SVD and iterative relaxation Autodiff graphs!
+            def sfc_loss_fn(X_eval):
+                e_exp, _ = sfc_instance.compute_loss(X_eval)
+                return cur_weight * e_exp
+
+            if sfc_instance is not None:
+                grads_X = jax.grad(sfc_loss_fn)(X_relaxed)
+            else:
+                grads_X = jnp.zeros_like(X_relaxed)
+
+            # --- 3. UPDATE RELAXED POSITIONS ---
+            # (Assuming 'lr' is defined in your outer scope as before)
+            X_updated = X_relaxed - lr * grads_X
+
+            # --- 4. MAP BACK FOR THE DIFFUSION HEAD ---
+            # Extract the updated heavy atoms
+            R_aligned_updated = X_updated[oracle_mapping.heavy_indices]
+
+            # Reverse the Kabsch rotation to project the updated coordinates back into the unaligned AF3 frame
+            r_next = (R_aligned_updated - avg_ca_ref) @ R_mat.T + avg_ca_curr
+
+            return r_next
+
+        R_current = x_0_heavy_mapped
+        R_optimized = jax.lax.fori_loop(0, prox_steps, step_body, R_current)
+
+        # --- TERMINAL LOGGING BLOCK (Also updated for CA alignment) ---
+        # V is the per-particle crystallographic potential used for SMC
+        # weighting.  compute_loss below was already being evaluated for the
+        # R_free log line; we simply stop discarding its scalar.
+        V = jnp.zeros(())
+        if sfc_instance is not None:
+            R_ref = oracle_mapping.initial_coordinates[oracle_mapping.heavy_indices]
+            
+            r_opt_ca = R_optimized[ca_mask_heavy]
+            R_ref_ca = R_ref[ca_mask_heavy]
+            
+            avg_ca_opt = jnp.mean(r_opt_ca, axis=0)
+            avg_ca_ref = jnp.mean(R_ref_ca, axis=0)
+            
+            p_ca = r_opt_ca - avg_ca_opt
+            q_ca = R_ref_ca - avg_ca_ref
+            
+            H = jnp.einsum("ni,nj->ij", p_ca, q_ca)
+            U, _, Vt = jnp.linalg.svd(H, full_matrices=False)
+            d = jnp.sign(jnp.linalg.det(U) * jnp.linalg.det(Vt))
+            R_mat = U @ jnp.diag(jnp.array([1.0, 1.0, d])) @ Vt
+            
+            # Rotate all optimized heavy atoms using the CA transform
+            R_log_aligned = (R_optimized - avg_ca_opt) @ R_mat + avg_ca_ref
+
+            X_final = oracle_mapping.initial_coordinates.at[oracle_mapping.heavy_indices].set(R_log_aligned)
+            X_rel, _, _ = hydride.relax_hydrogen_jit(X_final, *params, iterations=5)
+
+            #X_rel = refine_rigid_pose(sfc_instance, X_rel)
+            e_exp, (rw, rf) = sfc_instance.compute_loss(X_rel)
+            V = e_exp
+            jax.debug.print("t_hat: {t:.3f} | R_work: {rw:.4f} | R_free: {rf:.4f}", t=t_hat, rw=rw, rf=rf)
+
+        x_af3_updated = x_af3_flat.at[oracle_mapping.source_indices].set(R_optimized)
+        return x_0_flat.at[gather_idxs].set(x_af3_updated).reshape(x_0_real.shape), V
+
+    # Create a boolean array indicating which heavy atoms are C-alphas
+    heavy_atom_names = oracle.atoms.atom_name[oracle_mapping.heavy_indices]
+    ca_mask_heavy = jnp.array(heavy_atom_names == "CA")
+
+    rng_key = jax.random.PRNGKey(0) if sample_key is None else sample_key
+    atom_positions = model_runner.sample_guided_diffusion(
+        rng_key,
         batch_dict,
         embeddings,
-        val_and_grad_fn,
-        sample_key,
-        oracle_mapping.rotor_table.initial_chi,
-        oracle_mapping.water_mapping.oxygen_source.shape[0],
+        rng_key,
+        proximal_operator_fn,
+        steps,
+        smc_config,
+        x_start,
     )
 
-    if sfc_instance is None:
-        logging.info("Physics guidance is disabled. Preserving ideal relaxed hydrogen geometries.")
-        num_samples = conformations["atom_positions"].shape[0]
-        clean_chis = jnp.tile(oracle_mapping.rotor_table.initial_chi[None, ...], (num_samples, 1))
-        clean_waters = jnp.zeros((num_samples, oracle_mapping.water_mapping.oxygen_source.shape[0], 3))
-        
-        return Conformations(
-            conformations["atom_positions"],
-            clean_chis,
-            clean_waters,
-        )
-
-    return Conformations(
-        conformations["atom_positions"],
-        conformations["chi_angles"],
-        conformations["water_rotations"],
-    )
+    return Conformations(atom_positions=atom_positions)
 
 
 def _assemble_coordinates_from_conformation(
-    conformation: Conformation,
+    atom_positions: jnp.ndarray,
     gather_idxs: jnp.ndarray,
     oracle_mapping: OracleMapping,
-    reference_coords: jnp.ndarray,
+    oracle_atoms: Any,
+    sfc_instance: Optional[SFC] = None,
+    sfc_weight: float = 1000.0
 ) -> jnp.ndarray:
-    """Snaps coordinates back into the crystal's global reference frame via Kabsch alignment."""
-    x_af3_flat = conformation.atom_positions.reshape((-1, 3))[gather_idxs]
+    params = hydride.get_relaxation_params(oracle_atoms)
+
+    x_af3_flat = atom_positions.reshape((-1, 3))[gather_idxs]
 
     x_drift_heavy = x_af3_flat[oracle_mapping.source_indices]
     x_ref_heavy = oracle_mapping.initial_coordinates[oracle_mapping.heavy_indices]
@@ -263,23 +449,96 @@ def _assemble_coordinates_from_conformation(
 
     x_af3_aligned = (x_af3_flat - avg_drift) @ R + avg_ref
 
-    return oracle_mapping.assemble_coordinates(x_af3_aligned, conformation.chi_angles, conformation.water_rotations)
+    X_final = oracle_mapping.initial_coordinates.at[oracle_mapping.heavy_indices].set(x_af3_aligned[oracle_mapping.source_indices])
 
-# TODO: need descriptive comments and type annotation
+    if sfc_instance is None:
+        X_relaxed, _, _ = hydride.relax_hydrogen_jit(X_final, *params, iterations=200)
+        return X_relaxed
+
+    pairs, elec_param, eps, r_6, r_12 = params[3], params[4], params[5], params[6], params[7]
+    box, box_inv = params[9], params[10]
+    reduction_indices, reduction_signs, reduction_pair_map = params[11], params[12], params[13]
+
+    @jax.jit
+    def final_refinement_step(carry, i):
+        R_heavy, m, v = carry
+
+        def loss_fn(R):
+            X_complex = oracle_mapping.initial_coordinates.at[oracle_mapping.heavy_indices].set(R)
+            X_rel, _, _ = hydride.relax_hydrogen_jit(X_complex, *params, iterations=10)
+
+            e_phys = hydride.relax.compute_energy(X_rel, pairs, elec_param, eps, r_6, r_12, box, box_inv, reduction_indices, reduction_signs, reduction_pair_map)
+            e_exp, _ = sfc_instance.compute_loss(X_rel)
+
+            return (sfc_weight * e_exp) + (0.05 * e_phys)
+
+        grads = jax.grad(loss_fn)(R_heavy)
+        grads = jnp.clip(grads, -1.0, 1.0)
+
+        m_next = 0.9 * m + 0.1 * grads
+        v_next = 0.999 * v + 0.001 * (grads ** 2)
+
+        m_hat = m_next / (1.0 - 0.9 ** (i + 1))
+        v_hat = v_next / (1.0 - 0.999 ** (i + 1))
+
+        R_next = R_heavy - 5e-3 * m_hat / (jnp.sqrt(v_hat) + 1e-8)
+        return (R_next, m_next, v_next), None
+
+    R_init = X_final[oracle_mapping.heavy_indices]
+    (R_opt, _, _), _ = jax.lax.scan(
+        final_refinement_step,
+        (R_init, jnp.zeros_like(R_init), jnp.zeros_like(R_init)),
+        jnp.arange(150)
+    )
+
+    X_refined = oracle_mapping.initial_coordinates.at[oracle_mapping.heavy_indices].set(R_opt)
+    X_relaxed, _, _ = hydride.relax_hydrogen_jit(X_refined, *params, iterations=200)
+
+    _, (rw, rf) = sfc_instance.compute_loss(X_relaxed)
+    jax.debug.print("Final Assembly | R_work: {rw:.4f} | R_free: {rf:.4f}", rw=rw, rf=rf)
+
+    return X_relaxed
+
 class Hijacker:
     @staticmethod
-    def build_oracle(layout, denoised_vector_field_positions) -> Oracle:
-        return _build_oracle_from_baseline_af3_prediction(layout, denoised_vector_field_positions)
+    def build_oracle(
+        layout, 
+        denoised_vector_field_positions, 
+        ligand_smiles_dict: Dict[str, str], 
+        bonded_atom_pairs=None,
+        ph: float = 7.4
+    ) -> Oracle:
+        # Pass bonded_atom_pairs down correctly!
+        return _build_oracle_from_baseline_af3_prediction(
+            layout, 
+            denoised_vector_field_positions, 
+            ligand_smiles_dict, 
+            bonded_atom_pairs=bonded_atom_pairs, 
+            ph=ph
+        )
 
     @staticmethod
-    def hijack_diffusion(runner: HostRunner, batch_dict: dict, embeddings: HostEmbeddings, gather_idxs: jnp.ndarray, oracle_mapping: OracleMapping, sfc: Optional[SFC] = None, key: Optional[jnp.ndarray] = None) -> Conformations:
-        return _hijack_diffusion_with_custom_loss(runner, batch_dict, embeddings, gather_idxs, oracle_mapping, sfc, key)
+    def hijack_diffusion(
+        runner: HostRunner, 
+        batch_dict: dict, 
+        embeddings: HostEmbeddings, 
+        gather_idxs: jnp.ndarray, 
+        oracle: Oracle, 
+        sfc: Optional[SFC] = None, 
+        key: Optional[jnp.ndarray] = None,
+        sfc_weight: float = 1.0,
+        steps: int = None,
+        smc_config=None,
+        x_start: Optional[jnp.ndarray] = None,
+        guidance_sigma_on: float = 12.0,
+        guidance_sigma_width: float = 6.0,
+    ) -> jnp.ndarray:
+        return _hijack_diffusion_with_custom_loss(runner, batch_dict, embeddings, gather_idxs, oracle, sfc, key, sfc_weight=sfc_weight,
+                                                  steps=steps, smc_config=smc_config, x_start=x_start,
+                                                  guidance_sigma_on=guidance_sigma_on,
+                                                  guidance_sigma_width=guidance_sigma_width)
 
     @staticmethod
-    def assemble_coordinates(conformation: Conformation, gather_idxs: jnp.ndarray, oracle: Oracle) -> np.ndarray:
-        "Assemble AtomArray compatible coordinates from conformations and oracle"
-        oracle_atoms_coord = jnp.array(oracle.atoms.coord, dtype=jnp.float32)
-        complex = _assemble_coordinates_from_conformation(conformation, gather_idxs, oracle.mapping, oracle_atoms_coord)
-        return np.array(complex)
-
-
+    def assemble_coordinates(atom_positions: jnp.ndarray, gather_idxs: jnp.ndarray, oracle: Oracle, sfc: Optional[SFC] = None, sfc_weight: float = 1000.0) -> np.ndarray:
+        complex_coords = _assemble_coordinates_from_conformation(atom_positions, gather_idxs, oracle.mapping, oracle.atoms, sfc, sfc_weight)
+        return np.array(complex_coords)

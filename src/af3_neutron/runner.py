@@ -1,8 +1,6 @@
 import functools
-import math
 import pathlib
 from typing import Any, Callable, Dict
-
 
 import haiku as hk
 import jax
@@ -11,27 +9,15 @@ import jax.numpy as jnp
 from alphafold3.model import model, params, feat_batch
 from alphafold3.model.network import evoformer as evoformer_network
 from alphafold3.model.network import diffusion_head
+from alphafold3.model.network import confidence_head
+from alphafold3.model import feat_batch
 
+from . import smc as smc_mod
 from .types import HostEmbeddings
 
 def make_model_config(
     num_recycles: int = 10, num_diffusion_samples: int = 5
 ) -> model.Model.Config:
-    """
-    Generates the configuration object for the AlphaFold 3 model.
-
-    Parameters
-    ----------
-    num_recycles : int, optional
-        Number of recycling iterations for the Evoformer trunk, by default 10.
-    num_diffusion_samples : int, optional
-        Number of independent diffusion trajectories to generate, by default 5.
-
-    Returns
-    -------
-    model.Model.Config
-        The instantiated and populated AlphaFold 3 configuration.
-    """
     config = model.Model.Config()
     config.global_config.flash_attention_implementation = "triton"
     config.heads.diffusion.eval.num_samples = num_diffusion_samples
@@ -44,7 +30,6 @@ class _HostModule(hk.Module):
         self.config = config
 
 class _HostTrunkWrapper(_HostModule):
-    "Evoformer trunk recycling loop"
     def __call__(self, batch: feat_batch.Batch) -> HostEmbeddings:
         embedding_module = evoformer_network.Evoformer(self.config.evoformer, self.config.global_config)
         target_feat = model.create_target_feat_embedding(batch, config=embedding_module.config, global_config=self.config.global_config)
@@ -69,7 +54,6 @@ class _HostTrunkWrapper(_HostModule):
         return HostEmbeddings(pair=embeddings["pair"], single=embeddings["single"], target_feat=target_feat)
 
 class _HostDiffusionWrapper(_HostModule):
-    """Evaluates a single unguided pass of the native Diffusion Head."""
     def __init__(self, config: model.Model.Config, name: str = "diffuser"):
         super().__init__(config, name=name)
         self.diffusion_module = diffusion_head.DiffusionHead(self.config.heads.diffusion, self.config.global_config)
@@ -81,68 +65,38 @@ class _HostDiffusionWrapper(_HostModule):
             use_conditioning=True,
         )
 
-# NOTE: woe be the day when I come back to this and forget everything
 class _DiffusionHijackWrapper(_HostModule):
-    """Hijacks the Host solver trajectory to update non-native physics state."""
+    """Evaluates the unguided structural trajectory updates inside the tracking head."""
     def __init__(self, config: model.Model.Config, name: str = "diffuser"):
         super().__init__(config, name=name)
         self.diffusion_module = diffusion_head.DiffusionHead(self.config.heads.diffusion, self.config.global_config)
 
-    def __call__(self, batch: feat_batch.Batch, embeddings: HostEmbeddings, val_and_grad_fn: Callable, sample_key: jnp.ndarray, initial_chis: jnp.ndarray, num_waters: int) -> Dict[str, jnp.ndarray]:
+    def __call__(self, batch: feat_batch.Batch, embeddings: HostEmbeddings, sample_key: jnp.ndarray, proximal_fn: Callable,
+                 steps: int = None, smc_config=None, x_start=None) -> jnp.ndarray:
         sample_config = self.config.heads.diffusion.eval
-        orig_mask = batch.predicted_structure_info.atom_mask
-        num_tokens, orig_A = orig_mask.shape[-2:]
-        num_floats = initial_chis.shape[0] + num_waters * 3
-        N_extra = math.ceil(num_floats / (num_tokens * 3.0)) if num_floats > 0 else 0
 
-        if N_extra > 0:
-            pad_mask = jnp.zeros(orig_mask.shape[:-1] + (N_extra,), dtype=orig_mask.dtype)
-            padded_mask = jnp.concatenate([orig_mask, pad_mask], axis=-1)
-            padded_batch = jax.tree_util.tree_map(lambda x: padded_mask if id(x) == id(orig_mask) else x, batch)
-        else:
-            padded_batch = batch
+        if steps is not None:
+            # override default number of steps
+            sample_config.steps = steps
 
         def hijacked_denoising_step(positions_noisy: jnp.ndarray, t_hat: jnp.ndarray) -> jnp.ndarray:
-            if N_extra > 0:
-                real_coords = positions_noisy[..., :orig_A, :]
-                flat_angles = positions_noisy[..., orig_A:, :].reshape(-1)
-                chi = flat_angles[:initial_chis.shape[0]]
-                water = flat_angles[initial_chis.shape[0]:num_floats].reshape((num_waters, 3)) if num_waters > 0 else jnp.zeros((0, 3))
-            else:
-                real_coords, chi, water = positions_noisy, initial_chis, jnp.zeros((0, 3))
-
+            # 1. Evaluate native unguided structural prediction target (\hat{x}_0)
             x_0_real = self.diffusion_module(
-                positions_noisy=real_coords, noise_level=t_hat, batch=batch,
+                positions_noisy=positions_noisy, noise_level=t_hat, batch=batch,
                 embeddings={"pair": embeddings.pair, "single": embeddings.single, "target_feat": embeddings.target_feat},
                 use_conditioning=True,
             )
+            
+            # 2. Evaluate proximal_fn natively on the device
+            return proximal_fn(x_0_real, t_hat)
 
-            _, (grad_x0, grad_chi, grad_water) = val_and_grad_fn(x_0_real, chi, water)
-            x_0_guided = x_0_real - (0.05 * jnp.clip(grad_x0, -1.0, 1.0))
-
-            if N_extra > 0:
-                flat_grad = jnp.concatenate([grad_chi.reshape(-1), grad_water.reshape(-1), jnp.zeros(num_tokens * N_extra * 3 - num_floats)])
-                positions_denoised = jnp.concatenate([x_0_guided, (positions_noisy[..., orig_A:, :] + flat_grad.reshape(positions_noisy[..., orig_A:, :].shape))], axis=-2)
-            else:
-                positions_denoised = x_0_guided
-            return positions_denoised
-
-        sample_results = diffusion_head.sample(denoising_step=hijacked_denoising_step, batch=padded_batch, key=sample_key, config=sample_config)
-        pos_tensor = sample_results["atom_positions"]
-
-        # TODO(vivek): return conformation directly from here
-        if N_extra > 0:
-            final_positions = pos_tensor[..., :orig_A, :]
-            flat_angles = pos_tensor[..., orig_A:, :].reshape(pos_tensor.shape[0], -1)
-            return {
-                "atom_positions": final_positions,
-                "chi_angles": flat_angles[:, :initial_chis.shape[0]],
-                "water_rotations": flat_angles[:, initial_chis.shape[0]:num_floats].reshape((pos_tensor.shape[0], num_waters, 3)) if num_waters > 0 else jnp.zeros((pos_tensor.shape[0], 0, 3))
-            }
-        return {"atom_positions": pos_tensor, "chi_angles": jnp.tile(initial_chis[None, ...], (sample_config.num_samples, 1)), "water_rotations": jnp.zeros((sample_config.num_samples, 0, 3))}
+        # smc_mod.sample is signature-compatible with diffusion_head.sample and
+        # reduces to it exactly when smc_config is None or lambda_max == 0.
+        sample_results = smc_mod.sample(denoising_step=hijacked_denoising_step, batch=batch, key=sample_key, config=sample_config,
+                                        smc_config=smc_config, x_start=x_start)
+        return sample_results["atom_positions"]
 
 class HostRunner:
-    """Primary orchestration interface for compiled execution of Host primitives."""
     def __init__(self, config: model.Model.Config, device: jax.Device, model_dir: pathlib.Path):
         self._model_config = config
         self._device = device
@@ -169,6 +123,63 @@ class HostRunner:
     @functools.cached_property
     def sample_guided_diffusion(self) -> Callable:
         @hk.transform
-        def forward_sample(batch_dict: Dict[str, Any], embeddings: HostEmbeddings, val_and_grad_fn: Callable, sample_key: jnp.ndarray, initial_chis: jnp.ndarray, num_waters: int) -> Dict[str, jnp.ndarray]:
-            return _DiffusionHijackWrapper(self._model_config)(feat_batch.Batch.from_data_dict(batch_dict), embeddings, val_and_grad_fn, sample_key, initial_chis, num_waters)
-        return functools.partial(jax.jit(forward_sample.apply, static_argnums=(4, 7), device=self._device), self.model_params)
+        def forward_sample(batch_dict: Dict[str, Any], embeddings: HostEmbeddings, sample_key: jnp.ndarray, proximal_fn: Callable, steps=200, smc_config=None, x_start=None) -> jnp.ndarray:
+            return _DiffusionHijackWrapper(self._model_config)(feat_batch.Batch.from_data_dict(batch_dict), embeddings, sample_key, proximal_fn, steps, smc_config, x_start)
+
+        return functools.partial(jax.jit(forward_sample.apply, static_argnames=['proximal_fn', 'steps', 'smc_config'], device=self._device), self.model_params)
+
+    def predict_confidence(self, sample_key, batch_dict, embeddings, positions_denoised):
+        """
+        Evaluates the AF3 Confidence Head using the denoised positions to extract pLDDT.
+        """
+        # The true positional signature for AF3 ConfidenceHead:
+        def forward_confidence(pos, emb, seq_mask_arr, token_to_pseudo, asym_id_arr):
+            head = confidence_head.ConfidenceHead(
+                self._model_config.heads.confidence,
+                self._model_config.global_config
+            )
+                
+            # Convert HostEmbeddings dataclass to a subscriptable dict
+            if not isinstance(emb, dict):
+                emb = {
+                    "pair": emb.pair,
+                    "single": emb.single,
+                    "target_feat": emb.target_feat
+                }
+                
+            # Call positionally in the EXACT order AF3 expects
+            return head(pos, emb, seq_mask_arr, token_to_pseudo, asym_id_arr)
+
+        confidence_fn = hk.transform(forward_confidence)
+        
+        # Rebuild the Batch object outside to safely extract required topology arrays
+        batch_obj = feat_batch.Batch.from_data_dict(batch_dict)
+        
+        # Extract the specific tensors needed by the network
+        token_to_pseudo = batch_obj.pseudo_beta_info.token_atoms_to_pseudo_beta
+        asym_id = batch_obj.token_features.asym_id
+        seq_mask = batch_obj.token_features.mask
+
+        # DYNAMIC HAIKU RE-SCOPING
+        confidence_params = {}
+        for mod_name, param_dict in self.model_params.items():
+            if "confidence_head" in mod_name:
+                idx = mod_name.find("confidence_head")
+                new_mod_name = mod_name[idx:]
+                confidence_params[new_mod_name] = param_dict
+
+        if not confidence_params:
+            raise ValueError("Could not locate 'confidence_head' weights in model_params.")
+
+        # Evaluate the confidence head using the properly scoped params
+        confidence_dict = confidence_fn.apply(
+            confidence_params, 
+            sample_key, 
+            positions_denoised,  # 1st: pred_positions
+            embeddings,          # 2nd: embeddings
+            seq_mask,            # 3rd: seq_mask array
+            token_to_pseudo,     # 4th: token_atoms_to_pseudo_beta
+            asym_id              # 5th: asym_id
+        )
+        
+        return confidence_dict
