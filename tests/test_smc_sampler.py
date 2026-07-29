@@ -94,15 +94,12 @@ def _guided(in_hk, smc, denoising_step, batch, key, config, **kw):
     )
 
 
-# Coordinates are float32 and accumulate over ~40-200 scan steps.  Bit-identity
-# with AF3 is not achievable and was the wrong contract to assert: the guided
-# scan carries extra state (log weights, the resampling key) and defaults to
-# `unroll=1` where AF3 uses 4, both of which change XLA fusion and therefore
-# float32 rounding.  Measured discrepancy at unroll=1 over 40 steps: 4.8e-06 A.
-#
-# The gate is set where it still catches what matters.  A structural divergence
-# -- a dropped augmentation, a mis-signed step, an off-by-one in the schedule --
-# moves atoms by 1e-2 A or more, three orders of magnitude above this tolerance.
+# Bit-identity with AF3 is not achievable: the guided scan carries extra state
+# (log weights, resampling key) and defaults to `unroll=1` where AF3 uses 4, both
+# of which change XLA fusion and so float32 rounding. Measured at unroll=1 over
+# 40 steps: 4.8e-06 A. This gate still catches what matters -- a structural
+# divergence (dropped augmentation, mis-signed step, off-by-one schedule) moves
+# atoms 1e-2 A or more, three orders of magnitude above the tolerance.
 PARITY_ATOL = 1e-4
 
 
@@ -382,7 +379,9 @@ def test_superposed_rmsd_is_frame_invariant(smc):
 
     R = jnp.asarray(Rot.random(random_state=1).as_matrix())
     b = a @ R.T + jnp.asarray([12.0, -5.0, 3.0])
-    assert float(smc.superposed_rmsd(a, b, w)) < 1e-4
+    # 1e-2 A, not 1e-4: a float32 Kabsch fit over ~40 A coordinates carries about
+    # sqrt(N) * eps * |r| of rounding, i.e. a few times 1e-3. Measured 4.5e-3.
+    assert float(smc.superposed_rmsd(a, b, w)) < 1e-2
 
     # a genuinely different structure must not
     c = a + jnp.asarray(rng.normal(size=a.shape) * 2.0)

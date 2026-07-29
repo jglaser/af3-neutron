@@ -1,41 +1,20 @@
 """Drop-in replacement for ``alphafold3...diffusion_head.sample`` adding SMC.
 
-Same signature, same defaults, same numerics.  With ``smc_config=None`` (or
+Same signature, same defaults, same numerics. With ``smc_config=None`` (or
 ``lambda_max=0``) this is byte-for-byte the stock AF3 sampler: the inner
 ``apply_denoising_step`` is copied verbatim, and ``random_augmentation`` /
-``noise_schedule`` are imported from AF3 rather than reimplemented, so there is
-nothing to drift out of sync.
+``noise_schedule`` are imported from AF3 rather than reimplemented.
 
-Why selection rather than a bigger gradient
--------------------------------------------
-DPS-style guidance is a local gradient in x_0 space; it does not tunnel.  The
-barrier crossing comes from the *prior*, which at high sigma visits different
-basins on different noise draws.  The data's realistic job is to **select among
-the basins the prior offers** -- and selection needs only the likelihood
-*value*, not its gradient.  That matters because at sigma ~ 10 A the crystal
-frame recovered by superposition is noisy enough that any gradient is
-meaningless, while the likelihood value on the denoised estimate still is not.
+``denoising_step`` may return either ``x_0`` (stock behaviour) or ``(x_0, V)``
+where ``V`` is a scalar crystallographic negative log likelihood. Selection uses
+the likelihood value only, never its gradient, which is what makes it usable at
+high sigma where the superposed crystal frame is too noisy to differentiate.
 
-Two things make this cheap to bolt on here:
-
-* ``config.num_samples`` is already the particle axis -- AF3 vmaps the step over
-  it and scans.  Set ``num_samples`` to 16-64 and you have an SMC ensemble.
-* the guidance operator already evaluates ``sfc_instance.compute_loss`` once per
-  step for its ``R_free`` log line.  Returning that scalar alongside x_0 is the
-  only interface change needed.
-
-So ``denoising_step`` may now return either ``x_0`` (stock behaviour) or
-``(x_0, V)`` where ``V`` is a scalar crystallographic negative log likelihood.
-
-Scaling caveat worth knowing before tuning
-------------------------------------------
-The log-likelihood ratio between two basins of the prior is *extensive* in the
-number of atoms that differ, going as ``N d^2 / sigma^2``.  So the noise level
-at which the prior will consider a different fold scales as ``d sqrt(N)``.  For
-a whole 2000-atom protein and a 3 A error that is tens of Angstrom -- past the
-point where the pose survives.  For a 40-atom loop it is a few Angstrom.
-Selection helps most when the alternative folds differ over a *localised*
-region; it will not rescue a globally wrong model.
+Selection chooses among the basins the prior offers; it does not create one. The
+log-likelihood ratio between two basins goes as ``N d^2 / sigma^2``, so the noise
+level at which the prior still reaches a different fold scales as ``d sqrt(N)``:
+a few Angstrom for a 40-atom loop, tens for a whole 2000-atom protein. It will
+not rescue a globally wrong model.
 """
 
 from __future__ import annotations
@@ -88,101 +67,43 @@ def noise_schedule(*args, **kwargs):
 
 @dataclasses.dataclass(frozen=True)
 class SMCConfig:
-    """Selection parameters.  ``lambda_max=0`` disables SMC entirely.
+    """Selection parameters. ``lambda_max=0`` disables SMC entirely.
 
-    Attributes
-    ----------
-    lambda_max
-        Inverse temperature on the potential.  Start around 1-10 and tune by
-        watching ESS: if it collapses to ~1 immediately, lambda is too high and
-        the ensemble degenerates to a single particle; if it never drops below
-        the threshold, the potential is not discriminating and lambda is too low
-        (or the data cannot tell the folds apart at all -- see the module note
-        on sqrt(N) scaling).
-    sigma_on, sigma_width
-        Logistic ramp on sigma: ``lambda(sigma) = lambda_max *
-        sigmoid((sigma_on - sigma) / sigma_width)``.  Defaults turn selection on
-        around 12 A, which is roughly where a localised fold error melts.  Note
-        this is deliberately *earlier* than the existing gradient weight
-        ``sfc_weight * exp(-t_hat)``, which is numerically dead until sigma < 3 A
-        (8e-9 at 18.6 A, 6e-3 at 5.1 A) and therefore only ever acts after the
-        topology has committed.  The two are independent knobs.
-    ess_threshold
-        Resample when ``ESS/num_samples`` falls below this.
-    lambda_mode
-        ``"fixed"`` uses ``lambda_max`` with the sigma ramp.  ``"adaptive_ess"``
-        instead solves, at every level, for the lambda that puts ESS at
-        ``ess_target * num_samples``.
-
-        Use adaptive mode only once the potential is known to carry signal.  A
-        fixed lambda has to be matched to the *inter-particle spread* of V, not
-        to V itself, and that spread is not knowable in advance: in a run with
-        ``lambda_max=1`` on a normalised LSQ residual, V_mean was 0.9395 and
-        V_best 0.9371, so the log-weight spread was 0.88 * 0.0024 = 0.002 and ESS
-        sat at exactly 8.0/8 for all 200 levels -- zero resampling, SMC a no-op.
-        Reaching an ESS of 4/8 there would have needed lambda ~ 400.
-
-        But cranking lambda to 400 would have been wrong, and so would adaptive
-        mode: if the spread in V is noise rather than signal, adaptive tempering
-        will faithfully amplify the noise until ESS hits the target and then
-        resample on it.  Make V discriminating first (see ``guidance_d_high`` in
-        the sfc adapter), then let adaptive mode set the scale.
-    sigma_end
-        Stop the schedule at this sigma instead of running to zero.  Together
-        with ``sigma_start`` this lets the trajectory be run in *segments* from
-        the host, recomputing the bulk-solvent mask (and rescaling k_sol/b_sol)
-        between them -- which is the practical answer to a stale mask, since
-        ``Calc_Fsolvent`` is host-side numpy/gemmi and cannot run inside the
-        jitted loop.  Four segments of 50 levels is usually plenty: the mask is
-        insensitive to sub-Angstrom conformational change, and only needs
-        revisiting when the model has moved appreciably.
-    unroll
-        ``hk.scan`` unroll factor.  AF3 uses 4, which is fine when the step is
-        just the network.  Here each step also carries the guidance operator and
-        its gradient, so 4 live copies multiply peak memory by ~4x.  Default 1.
-    lambda_floor
-        Never resample while ``lambda(sigma)`` is below this.  Resampling on an
-        uninformative potential is not merely useless, it is harmful: the
-        ensemble locks onto whichever particle was transiently lucky, and since
-        the only later source of divergence is the churn noise (which is small
-        at low sigma) the collapse is permanent.  In a single-basin test where V
-        carries no signal, enabling selection early made the final potential
-        *worse* than unguided (196.6 vs a best-of-ensemble 108.7).  This is why
-        the ESS log line matters and why the melting/likelihood-gap diagnostic
-        should be run before turning selection on at all.
-    sigma_start
-        If set, the schedule is *reparametrised* over ``[t0, 1]`` so that it
-        begins at this sigma, and ``x_start`` is noised to it (SDEdit).  Without
-        a warm start the trajectory begins at sigma_max = 16 * 160 = 2560 A,
-        where the crystal frame recovered by superposition is an arbitrary
-        rotation -- so F_c, its gradient, and the potential are all noise, and
-        selection has nothing to select on.  Reparametrising rather than
-        truncating matters: the EDM update propagates x_0 with weight
-        ``a = step_scale * |dsigma| / sigma``, and ``a > 1`` over-relaxes and
-        diverges.  Truncating a coarse schedule at 2 A gives jumps of 8 -> 0.5 A,
-        i.e. ``a = 1.4``.  Reparametrising keeps ``a`` at 0.24-0.38.
-    augment
-        Leave True for AF3.  Only set False for analytic/mock denoisers that are
-        not equivariant -- AF3's test-time augmentation is harmless only because
-        the network is approximately equivariant, having been trained with it.
-    verbose
-        Print sigma / lambda / V / ESS per level via ``jax.debug.print``,
-        matching the existing logging style.
+    Tune ``lambda_max`` by watching the ESS log line: collapse to ~1 means it is
+    too high, never dropping below ``ess_threshold`` means the potential does not
+    discriminate. Run the melting/likelihood-gap diagnostic before enabling
+    selection at all -- resampling on an uninformative potential is permanent.
     """
 
+    # Inverse temperature on the potential.
     lambda_max: float = 0.0
+    # Logistic ramp: lambda(sigma) = lambda_max * sigmoid((sigma_on - sigma) / sigma_width).
+    # Defaults switch on near where a localised fold error melts.
     sigma_on: float = 12.0
     sigma_width: float = 6.0
+    # Resample when ESS/num_samples falls below this.
     ess_threshold: float = 0.5
+    # Never resample while lambda(sigma) is below this; early collapse is irreversible.
     lambda_floor: float = 0.05
-    lambda_mode: str = "fixed"      # "fixed" | "adaptive_ess"
-    ess_target: float = 0.5         # for adaptive_ess: target ESS/num_samples
+    # "fixed" uses lambda_max with the ramp; "adaptive_ess" solves per level for
+    # the lambda putting ESS at ess_target. Adaptive amplifies noise if V does not
+    # yet discriminate, so make V informative first (see guidance_d_high).
+    lambda_mode: str = "fixed"
+    ess_target: float = 0.5
     lambda_cap: float = 1.0e4       # ceiling on the adaptive solve
-    unroll: int = 1                 # hk.scan unroll; AF3 uses 4
+    # AF3 uses 4, but each step here also carries the guidance operator and its
+    # gradient, so 4 live copies cost ~4x peak memory.
+    unroll: int = 1
+    # Reparametrise the schedule to start here and noise x_start to it (SDEdit).
+    # Reparametrising, not truncating: truncation drives the EDM weight
+    # a = step_scale * |dsigma| / sigma above 1, which over-relaxes and diverges.
     sigma_start: Optional[float] = None
+    # Stop before zero, so the host can recompute the bulk-solvent mask between
+    # segments; Calc_Fsolvent is host-side and cannot run inside the jitted loop.
     sigma_end: Optional[float] = None
+    # False only for non-equivariant analytic/mock denoisers.
     augment: bool = True
-    verbose: bool = True
+    verbose: bool = True            # print sigma / lambda / V / ESS per level
 
 
 def lambda_ramp(sigma: jnp.ndarray, cfg: SMCConfig) -> jnp.ndarray:
@@ -268,19 +189,13 @@ def build_schedule(
 ) -> jnp.ndarray:
     """AF3's noise schedule, optionally reparametrised to begin at ``sigma_start``.
 
-    The inversion is done in plain Python/numpy, never with jnp ops.  Inside a
-    ``jax.jit`` trace every jnp operation returns a tracer even when its inputs
-    are Python floats -- constant folding happens in XLA, not at trace time -- so
-    an earlier bisection that called ``float(noise_schedule(mid))`` raised
-    ``ConcretizationTypeError``.  ``sigma_start`` is a static field of
-    ``SMCConfig``, so resolving ``t0`` at trace time in numpy is both legal and
-    free.
+    Reparametrises over ``[t0, 1]`` rather than truncating the grid, which would
+    drive the EDM weight ``a = step_scale * |dsigma| / sigma`` above 1.
 
-    Reparametrising over ``[t0, 1]`` rather than truncating the full grid
-    matters: the EDM update propagates x_0 with weight
-    ``a = step_scale * |dsigma| / sigma``, and ``a > 1`` over-relaxes and
-    diverges.  Truncating a coarse schedule at 2 A leaves jumps of 8 -> 0.5 A,
-    i.e. ``a = 1.4``.
+    The ``t0`` inversion must stay in plain Python/numpy: inside a jit trace every
+    jnp op returns a tracer even for Python-float inputs, so bisecting on
+    ``float(noise_schedule(mid))`` raises ``ConcretizationTypeError``. Legal here
+    because ``sigma_start`` is a static field of ``SMCConfig``.
     """
     if sigma_start is None and sigma_end is None:
         return noise_schedule(jnp.linspace(0, 1, steps + 1))
