@@ -8,6 +8,8 @@ import urllib.error
 import urllib.request
 from typing import Any, Dict, List
 
+import numpy as np
+
 try:
     from Bio.Data.PDBData import protein_letters_3to1
     from Bio.PDB import MMCIFParser, PDBParser, Select
@@ -21,10 +23,22 @@ except ImportError:
     print("Please install it using: pip install biopython", file=sys.stderr)
     sys.exit(1)
 
+# Crystallisation agents and buffer salts: present in the deposited crystal
+# because of how it was grown, not because they are part of the biological
+# assembly. Passing them to AF3 as ligands asks it to predict binders that the
+# protein has no reason to bind, and they occupy sites a real ligand may want.
+# Override per-run with --keep_agents, or by naming one in --ligand_smiles.
 DEFAULT_EXCLUDED_AGENTS = {
     "SO4", "PO4", "GOL", "EDO", "ACT", "CL", "NA", "K", "NH4", "CIT",
     "TRS", "MES", "HEPES", "PEG", "PGE", "PG4", "PE4", "1PE", "DTT", "DMS", "FMT"
 }
+
+# AF3 filters templates by revision date against its own --max_template_date.
+# Deliberately a fixed past date, not today's: a template stamped in the future
+# relative to that cutoff is silently dropped, and the symmetry templates this
+# script writes must always survive the filter.
+TEMPLATE_REVISION_DATE = "2026-07-06"
+
 
 class ChainSelect(Select):
     """Filter class to isolate a single chain during MMCIFIO writing."""
@@ -176,13 +190,9 @@ def generate_af3_json(input_path: str, job_name: str, output_dir: str, remove_wa
 
                 for residue in transformed_chain:
                     for atom in residue:
-                        coord = atom.get_coord()
-                        new_coord = [
-                            oper["matrix"][0][0]*coord[0] + oper["matrix"][0][1]*coord[1] + oper["matrix"][0][2]*coord[2] + oper["vector"][0],
-                            oper["matrix"][1][0]*coord[0] + oper["matrix"][1][1]*coord[1] + oper["matrix"][1][2]*coord[2] + oper["vector"][1],
-                            oper["matrix"][2][0]*coord[0] + oper["matrix"][2][1]*coord[1] + oper["matrix"][2][2]*coord[2] + oper["vector"][2]
-                        ]
-                        atom.set_coord(new_coord)
+                        matrix = np.asarray(oper["matrix"], dtype=float)
+                        vector = np.asarray(oper["vector"], dtype=float)
+                        atom.set_coord(matrix @ atom.get_coord() + vector)
 
                 # Save out to its isolated template destination
                 dummy_struct = Structure("temp")
@@ -200,7 +210,7 @@ def generate_af3_json(input_path: str, job_name: str, output_dir: str, remove_wa
                     f.write("loop_\n")
                     f.write("_pdbx_audit_revision_history.ordinal\n")
                     f.write("_pdbx_audit_revision_history.revision_date\n")
-                    f.write("1 2026-07-06\n")
+                    f.write(f"1 {TEMPLATE_REVISION_DATE}\n")
                     f.write("#\n")
 
                 print(f"Exported symmetry template file: {template_filepath}", file=sys.stderr)
