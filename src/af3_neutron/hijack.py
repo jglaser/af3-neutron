@@ -1,35 +1,34 @@
 import functools
 import logging
-import sys
-from typing import Any, Optional, Dict
+from typing import Any, Dict, Optional
 
-import hydride
 import biotite.structure as struc
+import hydride
 import jax
 import jax.numpy as jnp
 import numpy as np
-from SFC_Jax.Fmodel import SFcalculator as SFC
 from rdkit import Chem
+from SFC_Jax.Fmodel import SFcalculator as SFC
 
 from .runner import HostRunner
-from .types import (
-    HostEmbeddings,
-    Oracle,
-    OracleMapping,
-    Conformations
-)
-from .sfc_adapter import refine_rigid_pose
+
+# Kept deliberately: the only call site (in proximal_operator_fn, below) is
+# commented out, so rigid-pose refinement is currently disabled. Removing the
+# import would erase the only remaining sign of that. See PR #4.
+from .sfc_adapter import refine_rigid_pose  # noqa: F401
+from .types import Conformations, HostEmbeddings, Oracle, OracleMapping
+
 
 def build_custom_bond_dict(atoms: struc.AtomArray, ligand_smiles_dict: Dict[str, str]) -> Dict[str, Dict[tuple, Any]]:
     from biotite.structure import BondType
     from biotite.structure.info import bonds_in_residue
-    
+
     custom_bond_dict = {}
-    
+
     unique_res_names = np.unique(atoms.res_name)
     for res_name_raw in unique_res_names:
         res_name = str(res_name_raw)
-        
+
         # 1. First, check if Biotite already knows this CCD residue (e.g. 'BZB', 'HEM', 'ATP')
         standard_bonds = bonds_in_residue(res_name)
         if standard_bonds is not None and len(standard_bonds) > 0:
@@ -43,33 +42,33 @@ def build_custom_bond_dict(atoms: struc.AtomArray, ligand_smiles_dict: Dict[str,
             chain_res_names = np.unique(atoms.res_name[chain_mask])
             if len(chain_res_names) == 0 or str(chain_res_names[0]) != res_name:
                 continue
-            
+
             mol = Chem.MolFromSmiles(smiles)
             if mol is None:
                 continue
-            
+
             # Hydride REQUIRES single/double bonds (Kekulized), NOT aromatic (type 9)
             try:
                 Chem.Kekulize(mol, clearAromaticFlags=True)
             except Exception:
                 pass
-                
+
             res_bonds = {}
             lig_indices = np.where(chain_mask)[0]
-            
+
             # Map RDKit bonds if atom count matches
             if mol.GetNumAtoms() == len(lig_indices):
                 # Check if AF3 attached atom_name properties to RDKit atoms
                 has_props = all(a.HasProp("atom_name") for a in mol.GetAtoms())
                 atom_names = [str(name) for name in atoms.atom_name[lig_indices]]
-                
+
                 for bond in mol.GetBonds():
                     idx1 = bond.GetBeginAtomIdx()
                     idx2 = bond.GetEndAtomIdx()
-                    
+
                     name1 = mol.GetAtomWithIdx(idx1).GetProp("atom_name") if has_props else atom_names[idx1]
                     name2 = mol.GetAtomWithIdx(idx2).GetProp("atom_name") if has_props else atom_names[idx2]
-                        
+
                     rdkit_btype = bond.GetBondType()
                     if rdkit_btype == Chem.BondType.DOUBLE:
                         btype = int(BondType.DOUBLE)
@@ -77,13 +76,13 @@ def build_custom_bond_dict(atoms: struc.AtomArray, ligand_smiles_dict: Dict[str,
                         btype = int(BondType.TRIPLE)
                     else:
                         btype = int(BondType.SINGLE)
-                        
+
                     res_bonds[(name1, name2)] = btype
-                    
+
                 custom_bond_dict[res_name] = res_bonds
             else:
                 logging.warning(f"Heavy atom count mismatch for ligand chain {chain_id}: RDKit {mol.GetNumAtoms()} vs AF3 {len(lig_indices)}")
-            
+
     return custom_bond_dict
 
 def _guidance_ramp_weight(sfc_weight, t_hat, sigma_on, sigma_width):
@@ -106,9 +105,7 @@ def _guidance_ramp_weight(sfc_weight, t_hat, sigma_on, sigma_width):
 
 
 def optimize_solvent_grid(sfc_instance, xyz_baseline):
-    """
-    Mimics cctbx grid search to find optimal k_sol and b_sol for neutrons.
-    """
+    """Grid-search k_sol and b_sol for neutrons, after cctbx."""
     # 1. Define the grid (allow negative k_sol for neutrons!)
     k_sols = jnp.linspace(-0.5, 0.8, 20)
     b_sols = jnp.linspace(10.0, 300.0, 20)
@@ -170,8 +167,8 @@ def add_covalent_linkages(oracle_atoms: struc.AtomArray, bonded_atom_pairs: list
 
 
 def _build_oracle_from_baseline_af3_prediction(
-    flat_layout: Any, 
-    x_af3_flat_baseline: jnp.ndarray, 
+    flat_layout: Any,
+    x_af3_flat_baseline: jnp.ndarray,
     ligand_smiles_dict: Dict[str, str] = None,
     bonded_atom_pairs: list = None,
     ph: float = 7.4
@@ -190,10 +187,10 @@ def _build_oracle_from_baseline_af3_prediction(
 
     # Strip existing hydrogens/deuteriums
     oracle_atoms = atoms[(atoms.element != "H") & (atoms.element != "D")]
-    
+
     # 1. Build custom bond dictionary using index-aligned RDKit topology
     custom_bonds = build_custom_bond_dict(oracle_atoms, ligand_smiles_dict or {})
-    
+
     # 2. Connect intra-residue/ligand bonds
     oracle_atoms.bonds = struc.connect_via_residue_names(oracle_atoms, inter_residue=True, custom_bond_dict=custom_bonds)
 
@@ -213,13 +210,13 @@ def _build_oracle_from_baseline_af3_prediction(
             rdkit_charges = [0.0 if np.isnan(c) or np.isinf(c) else c for c in rdkit_charges]
         except Exception:
             rdkit_charges = [0.0] * mol.GetNumAtoms()
-            
+
         chain_mask = (oracle_atoms.chain_id == chain_id)
         lig_indices = np.where(chain_mask)[0]
         for idx, g_idx in enumerate(lig_indices):
             if idx < len(rdkit_charges):
                 charges_array[g_idx] = rdkit_charges[idx]
-                
+
     oracle_atoms.set_annotation("charge", charges_array)
 
     # 5. Hydride adds and relaxes explicit hydrogens
@@ -328,10 +325,10 @@ def _hijack_diffusion_with_custom_loss(
 
             # Apply the CA-derived transformation to ALL heavy atoms
             R_aligned = (r_current - avg_ca_curr) @ R_mat + avg_ca_ref
-            
+
             X_base = oracle_mapping.initial_coordinates.at[oracle_mapping.heavy_indices].set(R_aligned)
             X_relaxed, _, _ = hydride.relax_hydrogen_jit(X_base, *params, iterations=5)
-            
+
             # --- 2. COMPUTE EXPERIMENTAL LOSS GRADIENTS ---
             # Gradients are taken strictly with respect to the 3D crystal coordinates.
             # This completely bypasses the unstable SVD and iterative relaxation Autodiff graphs!
@@ -367,21 +364,21 @@ def _hijack_diffusion_with_custom_loss(
         V = jnp.zeros(())
         if sfc_instance is not None:
             R_ref = oracle_mapping.initial_coordinates[oracle_mapping.heavy_indices]
-            
+
             r_opt_ca = R_optimized[ca_mask_heavy]
             R_ref_ca = R_ref[ca_mask_heavy]
-            
+
             avg_ca_opt = jnp.mean(r_opt_ca, axis=0)
             avg_ca_ref = jnp.mean(R_ref_ca, axis=0)
-            
+
             p_ca = r_opt_ca - avg_ca_opt
             q_ca = R_ref_ca - avg_ca_ref
-            
+
             H = jnp.einsum("ni,nj->ij", p_ca, q_ca)
             U, _, Vt = jnp.linalg.svd(H, full_matrices=False)
             d = jnp.sign(jnp.linalg.det(U) * jnp.linalg.det(Vt))
             R_mat = U @ jnp.diag(jnp.array([1.0, 1.0, d])) @ Vt
-            
+
             # Rotate all optimized heavy atoms using the CA transform
             R_log_aligned = (R_optimized - avg_ca_opt) @ R_mat + avg_ca_ref
 
@@ -496,29 +493,29 @@ def _assemble_coordinates_from_conformation(
 class Hijacker:
     @staticmethod
     def build_oracle(
-        layout, 
-        denoised_vector_field_positions, 
-        ligand_smiles_dict: Dict[str, str], 
+        layout,
+        denoised_vector_field_positions,
+        ligand_smiles_dict: Dict[str, str],
         bonded_atom_pairs=None,
         ph: float = 7.4
     ) -> Oracle:
         # Pass bonded_atom_pairs down correctly!
         return _build_oracle_from_baseline_af3_prediction(
-            layout, 
-            denoised_vector_field_positions, 
-            ligand_smiles_dict, 
-            bonded_atom_pairs=bonded_atom_pairs, 
+            layout,
+            denoised_vector_field_positions,
+            ligand_smiles_dict,
+            bonded_atom_pairs=bonded_atom_pairs,
             ph=ph
         )
 
     @staticmethod
     def hijack_diffusion(
-        runner: HostRunner, 
-        batch_dict: dict, 
-        embeddings: HostEmbeddings, 
-        gather_idxs: jnp.ndarray, 
-        oracle: Oracle, 
-        sfc: Optional[SFC] = None, 
+        runner: HostRunner,
+        batch_dict: dict,
+        embeddings: HostEmbeddings,
+        gather_idxs: jnp.ndarray,
+        oracle: Oracle,
+        sfc: Optional[SFC] = None,
         key: Optional[jnp.ndarray] = None,
         sfc_weight: float = 1.0,
         steps: int = None,

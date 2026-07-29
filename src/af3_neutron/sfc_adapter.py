@@ -1,17 +1,17 @@
-import os
-import sys  
-import json
-import tempfile
 import dataclasses
-import numpy as np
+import os
+import sys
+import tempfile
+
+import biotite.structure as struc
+import biotite.structure.io.pdbx as pdbx
+import gemmi
 import jax
 import jax.numpy as jnp
-import gemmi  
+import numpy as np
 import reciprocalspaceship as rs
 from biotite.structure.io import pdb
-import biotite.structure.io.pdbx as pdbx
-import biotite.structure as struc
-from SFC_Jax.Fmodel import SFcalculator, F_protein
+from SFC_Jax.Fmodel import F_protein, SFcalculator
 
 # ==============================================================================
 # MONKEYPATCH FOR GEMMI VERSION CONFLICT (v0.7.0+)
@@ -66,30 +66,30 @@ class NeutronSFCalculator(SFcalculator):
         # using the exact attribute names expected by F_protein
         if b_factors is not None:
             self.atom_b_iso = jnp.array(b_factors, dtype=jnp.float32)
-            
+
         if occupancies is not None:
             self.atom_occ = jnp.array(occupancies, dtype=jnp.float32)
 
     def compute_loss(self, xyz, t_hat=None):
         # 1. PURE JAX COMPUTATION
         atom_pos_frac = jnp.tensordot(xyz, self.orth2frac_tensor.T, 1)
-        
+
         f_calc_protein_asu = F_protein(
-            self.Hasu_array, 
+            self.Hasu_array,
             self.dr2asu_array,
             self.fullsf_tensor,
             self.reciprocal_cell_paras,
-            self.R_G_tensor_stack, 
+            self.R_G_tensor_stack,
             self.T_G_tensor_stack,
             atom_pos_frac,
-            self.atom_b_iso, 
-            self.atom_b_aniso, 
+            self.atom_b_iso,
+            self.atom_b_aniso,
             self.atom_occ
         )
-        
+
         f_calc_protein = f_calc_protein_asu[self.asu2HKL_index]
         dr2_tensor = jnp.array(self.dr2HKL_array)
-        
+
         # 2. Reactivate Bulk Solvent Mask
         # Fetch SFC_Jax solvent parameters (with underscores), using safe defaults
         k_sol = getattr(self, "k_sol", 0.35)
@@ -102,18 +102,18 @@ class NeutronSFCalculator(SFcalculator):
 
         f_calc_complex = f_calc_protein + f_bulk
         f_calc_mag = jnp.abs(f_calc_complex)
-        
+
         # 3. Safely extract experimental amplitudes
         f_obs_attr = getattr(self, "Fo", None)
         if f_obs_attr is None:
             f_obs_attr = getattr(self, "Fobs", None)
         if f_obs_attr is None:
             f_obs_attr = getattr(self, "fo", None)
-            
+
         f_obs = jnp.array(f_obs_attr)
-        
+
         # 4. Enforce Cross-Validation
-        # NOTE: The low-resolution cutoff has been removed so the model 
+        # NOTE: The low-resolution cutoff has been removed so the model
         # can fit the newly activated solvent envelope at low angles.
         mask_valid = (f_obs > 0.0) & (~jnp.isnan(f_obs))
 
@@ -126,10 +126,10 @@ class NeutronSFCalculator(SFcalculator):
         mask_free = mask_valid & self.freer_mask
         mask_work = mask_valid & (~self.freer_mask)
         mask_loss = mask_work & mask_guide_res
-        
+
         f_obs = jnp.where(mask_valid, f_obs, 0.0)
         f_calc_mag = jnp.where(mask_valid, f_calc_mag, 0.0)
-        
+
         # Fitted separately per purpose: the scale must come from the same
         # reflections the loss is evaluated on. Bulk solvent makes the effective
         # scale strongly resolution dependent, so a global scale applied to a
@@ -171,12 +171,12 @@ class NeutronSFCalculator(SFcalculator):
         diff = jnp.abs(f_obs - scale_factor * f_calc_mag)
         r_work = jnp.sum(jnp.where(mask_work, diff, 0.0)) / (jnp.sum(jnp.where(mask_work, f_obs, 0.0)) + 1e-8)
         r_free = jnp.sum(jnp.where(mask_free, diff, 0.0)) / (jnp.sum(jnp.where(mask_free, f_obs, 0.0)) + 1e-8)
-        
+
         # 7. Normalize Loss (windowed)
         residuals_sq = jnp.where(mask_loss, (f_obs - scale_loss * f_calc_mag) ** 2, 0.0)
         normalization = jnp.sum(jnp.where(mask_loss, f_obs ** 2, 0.0)) + 1e-8
         normalized_loss = jnp.sum(residuals_sq) / normalization
-        
+
         return normalized_loss, (r_work, r_free)
 
 
@@ -701,9 +701,9 @@ def _match_ca_by_sequence(ref_ca, orc_ca):
 
 def align_oracle_to_reference(oracle, reference_path, mtz_path=None,
                               target_cell=None):
-    """
-    Move the oracle onto an absolute crystal frame taken from a reference (e.g. a
-    deposited neutron structure) rather than the AF3 template.
+    """Move the oracle onto an absolute crystal frame taken from a reference.
+
+    Uses e.g. a deposited neutron structure rather than the AF3 template.
 
     A reference deposited in a different cell is transferred through fractional space
     first; reinterpreting its Cartesian coordinates directly is a position-dependent
@@ -844,10 +844,10 @@ def init_neutron_sfc(oracle_atoms, mtz_path, deuterate=False, perdeuterate=False
     with tempfile.TemporaryDirectory() as tmpdir:
         pdb_path = os.path.join(tmpdir, "oracle.pdb")
         pdb_file = pdb.PDBFile()
-        
+
         # Clone oracle atoms so Hydride's internal "H" reliance isn't broken
         sfc_atoms = oracle_atoms.copy()
-        
+
         # ==============================================================================
         # SANITIZE B-FACTORS FOR PDB FORMAT COMPATIBILITY
         # ==============================================================================
@@ -855,7 +855,7 @@ def init_neutron_sfc(oracle_atoms, mtz_path, deuterate=False, perdeuterate=False
         # Clip to [0.0, 999.0] to fit Biotite's 3-pre-decimal digit PDB limit (F6.2).
         safe_b_factors = np.nan_to_num(sfc_atoms.b_factor, nan=30.0)
         sfc_atoms.b_factor = np.clip(safe_b_factors, 0.0, 999.0)
-        
+
         # ==============================================================================
         # SIMULATE NEUTRON ISOTOPIC COMPOSITION (H/D EXCHANGE VS PERDEUTERATION)
         # ==============================================================================
@@ -876,7 +876,7 @@ def init_neutron_sfc(oracle_atoms, mtz_path, deuterate=False, perdeuterate=False
                         sfc_atoms.element[i] = "D"
                         sfc_atoms.atom_name[i] = "D" + sfc_atoms.atom_name[i][1:]
                         break
-        
+
         sfc_atoms.res_name = np.array([name[:3] for name in sfc_atoms.res_name])
         pdb.set_structure(pdb_file, sfc_atoms)
         pdb_file.write(pdb_path)
@@ -885,29 +885,29 @@ def init_neutron_sfc(oracle_atoms, mtz_path, deuterate=False, perdeuterate=False
         # FORCE ROBUST FLAGS USING RECIPROCALSPACESHIP
         # ==============================================================================
         mtz_rs = rs.read_mtz(mtz_path)
-        
+
         print("Forcing robust 5% Free-R holdout set...", file=sys.stderr)
-        
+
         # Generate reproducible random flags: 0 for Free (5%), 1 for Work (95%)
         np.random.seed(42)
         fresh_flags = np.random.choice([0, 1], size=len(mtz_rs), p=[0.05, 0.95])
         mtz_rs["FreeR_flag"] = rs.DataSeries(fresh_flags, dtype="I")
-        
+
         working_mtz_path = os.path.join(tmpdir, "working_data.mtz")
         mtz_rs.write_mtz(working_mtz_path)
-        
+
         # Read headers safely via Gemmi for the PDB CRYST1 line
         mtz_gemmi = gemmi.read_mtz_file(mtz_path)
         cell = mtz_gemmi.cell
         sg_name = mtz_gemmi.spacegroup_name
         dmin_val = mtz_gemmi.resolution_high()
-        
+
         cryst1_line = (
             f"CRYST1{cell.a:9.3f}{cell.b:9.3f}{cell.c:9.3f}"
             f"{cell.alpha:7.2f}{cell.beta:7.2f}{cell.gamma:7.2f} "
             f"{sg_name:<11}\n"
         )
-        
+
         # Drop any CRYST1 biotite wrote of its own accord before prepending ours.
         # biotite emits one whenever the AtomArray carries a `box`, and it labels
         # it "P 1" -- so leaving it in place gives the file two CRYST1 records,
@@ -920,9 +920,9 @@ def init_neutron_sfc(oracle_atoms, mtz_path, deuterate=False, perdeuterate=False
             )
         with open(pdb_path, "w") as f:
             f.write(cryst1_line + pdb_content)
-            
+
         print(f"Injected Symmetry Header: {cryst1_line.strip()} | Dmin Limit: {dmin_val:.3f}A", file=sys.stderr)
-            
+
         # Explicitly thread the pLDDT-derived B-factors into the constructor
         sfc = NeutronSFCalculator(
             PDBfile_dir=pdb_path,
@@ -934,7 +934,7 @@ def init_neutron_sfc(oracle_atoms, mtz_path, deuterate=False, perdeuterate=False
             b_factors=sfc_atoms.b_factor,
             occupancies=np.ones(sfc_atoms.array_length(), dtype=np.float32)
         )
-        
+
         # EXPLICITLY OVERRIDE EXPERIMENTAL DATA
         sfc.Fo = jnp.array(mtz_rs["FP"].to_numpy(), dtype=jnp.float32)
         sfc.SigF = jnp.array(mtz_rs["SIGFP"].to_numpy(), dtype=jnp.float32)
@@ -943,13 +943,13 @@ def init_neutron_sfc(oracle_atoms, mtz_path, deuterate=False, perdeuterate=False
         print("Initializing Baseline Bulk Solvent Mask...", file=sys.stderr)
         sfc.inspect_data()
         sfc.Calc_Fprotein(jnp.array(sfc_atoms.coord))
-        
+
         # Generate the solvent mask grid dynamically
         sfc.Calc_Fsolvent()
         sfc.deuterated_solvent = (deuterate or perdeuterate)
-        
+
         num_free = int(np.sum(fresh_flags == 0))
         num_work = len(fresh_flags) - num_free
         print(f"Cross-Validation Split | Work: {num_work} | Free: {num_free}", file=sys.stderr)
-        
+
         return sfc

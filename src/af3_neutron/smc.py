@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import dataclasses
 import inspect
-from typing import Any, Callable, Optional, Tuple
+from typing import Any, Callable, Optional
 
 import haiku as hk
 import jax

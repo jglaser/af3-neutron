@@ -1,43 +1,35 @@
-import logging
-import pathlib
-import os
-import json
 import dataclasses
-import numpy as np
-import jax
-import jax.numpy as jnp
+import json
+import logging
+import os
+import pathlib
+
 import biotite.structure.io.pdbx as pdbx
 import gemmi
-
-from scipy.interpolate import RegularGridInterpolator
-from absl import app, flags
-
-from alphafold3.common import folding_input
-from alphafold3.data import featurisation
-from alphafold3.constants import chemical_components
-from alphafold3.model.pipeline import structure_cleaning
-from alphafold3.model.components import utils
-from alphafold3.model.network import diffusion_head
-from alphafold3.model import feat_batch
-from alphafold3.model.atom_layout import atom_layout
-
-from af3_neutron import make_model_config, HostRunner, Hijacker
-from af3_neutron.sfc_adapter import init_neutron_sfc, align_oracle_to_reference
-from af3_neutron.hijack import optimize_solvent_grid
-
+import haiku as hk
 import jax
 import jax.numpy as jnp
-import haiku as hk
-import logging
+import numpy as np
+import reciprocalspaceship as rs
+from absl import app, flags
+from alphafold3.common import folding_input
+from alphafold3.constants import chemical_components
+from alphafold3.data import featurisation
+from alphafold3.model import feat_batch
+from alphafold3.model.atom_layout import atom_layout
+from alphafold3.model.components import utils
+from alphafold3.model.network import diffusion_head
 from alphafold3.model.network.evoformer import Evoformer
-from alphafold3.model.scoring import scoring
+from alphafold3.model.pipeline import structure_cleaning
+
+from af3_neutron import Hijacker, HostRunner, make_model_config
 
 # Import your custom modules
-from af3_neutron.diffraction_embedding import compute_debye_features, sample_patterson_map, compute_diffraction_delta_z
+from af3_neutron.diffraction_embedding import compute_diffraction_delta_z
+from af3_neutron.hijack import optimize_solvent_grid
 from af3_neutron.patterson import extract_patterson_grid_from_mtz
-from alphafold3.constants import chemical_components
+from af3_neutron.sfc_adapter import align_oracle_to_reference, init_neutron_sfc
 
-import reciprocalspaceship as rs
 
 def get_local_ccd():
     """Retrieve AF3's local CCD instance by inspecting the constants module."""
@@ -120,7 +112,9 @@ def patched_embed_template_pair(self, batch, pair_activations, pair_mask, key):
 _original_embed_template_pair = Evoformer._embed_template_pair
 Evoformer._embed_template_pair = patched_embed_template_pair
 
-from jax.experimental.compilation_cache import compilation_cache as cc
+# After the Evoformer patch above, which must land before JAX traces anything.
+from jax.experimental.compilation_cache import compilation_cache as cc  # noqa: E402
+
 cc.set_cache_dir(os.path.expanduser('./.jax_cache'))
 
 flags.DEFINE_string(
@@ -157,13 +151,14 @@ flags.DEFINE_boolean("resolve_reindexing", True, "After aligning to a reference,
 
 FLAGS = flags.FLAGS
 
-import pickle
+import pickle  # noqa: E402
+
 
 def get_fmodel_and_scale(sfc, xyz_coords):
     """Computes scaled complex structure factors F_model and scale factor k."""
     # 1. Compute F_protein (explicitly passing Return=True)
     f_protein = sfc.Calc_Fprotein(xyz_coords, Return=True)
-    
+
     # Fallback to internal attributes if Return=True is overridden
     if f_protein is None:
         f_protein = getattr(sfc, "Fprotein_HKL", None)
@@ -231,10 +226,7 @@ def export_neutron_maps(
     output_2fofc_mrc="refined_2fofc.mrc",
     output_fofc_mrc="refined_fofc.mrc"
 ):
-    """
-    Exports 2Fo-Fc and Fo-Fc map coefficients to an MTZ file
-    and renders 3D real-space density maps (.mrc) for visualization.
-    """
+    """Export 2Fo-Fc and Fo-Fc map coefficients, plus real-space .mrc maps."""
     logging.info(f"Generating structure factor map coefficients -> {output_mtz_path}")
 
     # Compute scaled F_model
@@ -365,11 +357,11 @@ def resolve_ligand_smiles(ligand_entry: dict) -> str:
     # 1. Check for direct SMILES in input JSON
     if "smiles" in ligand_entry:
         return ligand_entry["smiles"]
-    
+
     # 2. Resolve CCD code using AF3's internal CCD database
     if "ccdCodes" in ligand_entry and len(ligand_entry["ccdCodes"]) > 0:
         ccd_code = ligand_entry["ccdCodes"][0].upper()
-        
+
         if _LOCAL_CCD is not None:
             # Query local CCD via AF3's component_name_to_info utility
             info = chemical_components.component_name_to_info(ccd=_LOCAL_CCD, res_name=ccd_code)
@@ -377,7 +369,7 @@ def resolve_ligand_smiles(ligand_entry: dict) -> str:
                 smiles = info.pdbx_smiles
                 logging.info(f"Resolved CCD code '{ccd_code}' from local AF3 database: {smiles}")
                 return smiles
-                
+
             # Direct mapping fallback if _LOCAL_CCD is a dict
             if hasattr(_LOCAL_CCD, "get"):
                 entry = _LOCAL_CCD.get(ccd_code)
@@ -387,7 +379,7 @@ def resolve_ligand_smiles(ligand_entry: dict) -> str:
                         smiles = entry.get('_chem_comp.pdbx_smiles') or entry.get('pdbx_smiles')
                     elif hasattr(entry, 'pdbx_smiles'):
                         smiles = entry.pdbx_smiles
-                    
+
                     if isinstance(smiles, list):
                         smiles = smiles[0]
                     if smiles and smiles not in ('?', '.', None):
@@ -459,10 +451,10 @@ def main(argv):
     if FLAGS.mtz_path and os.path.exists(FLAGS.mtz_path):
         logging.info(f"Extracting Patterson grid directly from {FLAGS.mtz_path}...")
         p_grid, origin, spacing = extract_patterson_grid_from_mtz(
-            FLAGS.mtz_path, 
+            FLAGS.mtz_path,
             fobs_col="FP"
         )
-        
+
         # Populate registry BEFORE running host embeddings
         CUSTOM_DIFFRACTION_DATA["patterson_grid"] = jnp.array(p_grid)
         CUSTOM_DIFFRACTION_DATA["grid_origin"] = jnp.array(origin)
@@ -519,7 +511,7 @@ def main(argv):
             l_id = lig_dict["id"]
             if isinstance(l_id, list):
                 l_id = l_id[0]
-            
+
             l_smiles = resolve_ligand_smiles(lig_dict)
             ligand_smiles_dict[l_id] = l_smiles
             logging.info(f"Ligand ID '{l_id}' mapped to SMILES: {l_smiles}")
@@ -545,11 +537,6 @@ def main(argv):
     # Create a full-size array initialized to 0.0
     # (or a reasonable default, like the mean pLDDT)
     full_b_factors = np.zeros(num_oracle_atoms)
-
-    # Configurable exponential scaling parameters
-    variance_base = 0.1   # Minimum variance floor for perfect predictions
-    variance_scale = 0.05 # Scaling multiplier
-    variance_decay = 10.0 # How fast the variance explodes as pLDDT drops
 
     # Map pLDDT to b factor Oeffner & Read 2022
     rmsd = 1.5 * np.exp(4.0 * (0.7 - plddt_heavy_only / 100.0))     # Angstrom

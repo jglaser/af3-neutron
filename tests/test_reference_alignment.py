@@ -15,11 +15,10 @@ third is checked both as pure group theory (always runs) and against the real
 
 import os
 
-import numpy as np
-import pytest
-
 import biotite.structure as struc
 import gemmi
+import numpy as np
+import pytest
 
 from af3_neutron.sfc_adapter import (
     _box_from_cell,
@@ -234,7 +233,7 @@ def test_4bd0_and_4bd1_differ_by_a_reindexing_operator():
     # ... but applying -x,-y,z to 4BD0 lands it on 4BD1, with NO superposition
     uc = gemmi.UnitCell(*CELL_4BD1)
     F = np.array(uc.frac.mat.tolist())
-    O = np.array(uc.orth.mat.tolist())
+    orth = np.array(uc.orth.mat.tolist())
     M = np.diag([-1.0, -1.0, 1.0])
-    x0M = ((F @ x0.T).T @ M.T) @ O.T
+    x0M = ((F @ x0.T).T @ M.T) @ orth.T
     assert np.sqrt(((x0M - x1) ** 2).sum(1).mean()) < 1.0

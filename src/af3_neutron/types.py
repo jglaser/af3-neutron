@@ -1,7 +1,9 @@
 import dataclasses
+from typing import Any
+
 import jax
 import jax.numpy as jnp
-from typing import Any
+
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)

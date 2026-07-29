@@ -10,11 +10,10 @@ prove nothing.  Where alphafold3 is unavailable those tests skip.
 The pure SMC helpers need no AF3 and are tested unconditionally.
 """
 
-import numpy as np
 import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
-
 from conftest import HAVE_AF3, requires_af3
 
 

@@ -1,10 +1,11 @@
+from typing import Any, Dict, Tuple
+
+import gemmi
+import haiku as hk
 import jax
 import jax.numpy as jnp
-import haiku as hk
-import optax
 import numpy as np
-import gemmi
-from typing import Dict, Any, Tuple
+import optax
 
 # Native AlphaFold 3 imports
 from alphafold3.model import features, model_config
@@ -16,14 +17,13 @@ from af3_neutron.diffraction_embedding import (
     save_adapter_weights,
 )
 
-
 # ==============================================================================
 # 1. Gemmi Forward Physics Simulator
 # ==============================================================================
 
 def generate_patterson_map_gemmi(
-    coords: np.ndarray, 
-    elements: list[str], 
+    coords: np.ndarray,
+    elements: list[str],
     box_size: float = 60.0,
     d_min: float = 2.5,
     is_neutron: bool = False
@@ -32,48 +32,48 @@ def generate_patterson_map_gemmi(
     structure = gemmi.Structure()
     cell = gemmi.UnitCell(box_size, box_size, box_size, 90, 90, 90)
     structure.cell = cell
-    
+
     model = gemmi.Model("1")
     chain = gemmi.Chain("A")
-    
-    for i, (pos, elem_str) in enumerate(zip(coords, elements)):
+
+    for i, (pos, elem_str) in enumerate(zip(coords, elements, strict=True)):
         res = gemmi.Residue()
         res.name = "UNK"
         res.seqid = gemmi.SeqId(str(i + 1))  # String conversion for SeqId
-        
+
         atom = gemmi.Atom()
         atom.name = f"P{i}"
         atom.element = gemmi.Element(elem_str)
         atom.pos = gemmi.Position(float(pos[0]), float(pos[1]), float(pos[2]))
         atom.occ = 1.0
         atom.b_iso = 15.0
-        
+
         res.add_atom(atom)
         chain.add_residue(res)
-        
+
     model.add_chain(chain)
     structure.add_model(model)
-    
+
     dencalc = gemmi.DensityCalculatorN() if is_neutron else gemmi.DensityCalculatorX()
     dencalc.d_min = d_min
     dencalc.grid.spacegroup = gemmi.find_spacegroup_by_name("P1")
     dencalc.grid.set_unit_cell(cell)
     dencalc.put_model_density_on_grid(model)
-    
+
     density_map = np.array(dencalc.grid, copy=True)
-    
+
     # 3D FFT Autocorrelation
     f_k = np.fft.fftn(density_map)
     intensities = np.abs(f_k) ** 2
     patterson_map = np.real(np.fft.ifftn(intensities)).astype(np.float32)
-    
+
     grid_origin = np.array([0.0, 0.0, 0.0], dtype=np.float32)
     grid_spacing = np.array([
         box_size / patterson_map.shape[0],
         box_size / patterson_map.shape[1],
         box_size / patterson_map.shape[2]
     ], dtype=np.float32)
-    
+
     return patterson_map, grid_origin, grid_spacing
 
 
@@ -92,39 +92,39 @@ def generate_synthetic_batch(
     """Generates variable-length point clouds with complete backbone geometry padded to N_max."""
     if seed is not None:
         np.random.seed(seed)
-        
+
     n_valid = np.random.randint(min_res, min(max_res, n_max) + 1)
-    
+
     # 1. Generate CA backbone trajectory
     t = np.linspace(0, 4 * np.pi, n_valid)
     x = 12.0 * np.cos(t) + 20.0
     y = 12.0 * np.sin(t) + 20.0
     z = 2.5 * t + 10.0
     ca_true_valid = np.stack([x, y, z], axis=-1)
-    
+
     # Compute Patterson map using true coordinates
     elements = ["C"] * n_valid
     p_grid, origin, spacing = generate_patterson_map_gemmi(ca_true_valid, elements, is_neutron=is_neutron)
-    
+
     # Perturb backbone for reference template
     ca_ref_valid = ca_true_valid + np.random.normal(0.0, noise_scale, size=ca_true_valid.shape)
 
     # 2. Construct complete N, CA, C, CB backbone positions
     def make_padded_af3_atoms(ca_positions):
         atom_pos = np.zeros((n_max, 24, 3), dtype=np.float32)
-        
+
         # Standard ideal backbone offsets relative to CA
         n_offset  = np.array([-1.2,  0.8, 0.0], dtype=np.float32)
         c_offset  = np.array([ 1.2,  0.8, 0.0], dtype=np.float32)
         cb_offset = np.array([ 0.0, -1.2, 0.8], dtype=np.float32)
-        
+
         for i in range(n_valid):
             ca = ca_positions[i]
             atom_pos[i, 0, :] = ca + n_offset   # Atom 0: N
             atom_pos[i, 1, :] = ca              # Atom 1: CA
             atom_pos[i, 2, :] = ca + c_offset   # Atom 2: C
             atom_pos[i, 3, :] = ca + cb_offset  # Atom 3: CB
-            
+
         return atom_pos
 
     # 3. Create 1D and 2D Padding Masks
@@ -163,7 +163,9 @@ def generate_synthetic_batch(
 def main():
     n_max = 512         # Allocation size for spatial pair tensors
     num_channels = 128
-    learning_rate = 1e-3
+    # 3e-4, not the 1e-3 this used to read: the optimizer hardcoded 3e-4 and
+    # ignored this variable, so 3e-4 is the rate every run so far actually used.
+    learning_rate = 3e-4
     num_steps = 100
     val_interval = 5
     is_neutron = True
@@ -206,7 +208,7 @@ def main():
 
     # --- Pre-Flight Diagnostic Suite ---
     print("\n=== Running Pre-Flight Diagnostics ===")
-    
+
     # Diagnostic 1: Verify Optax Mask Targets
     adapter_keys = [k for k in init_params.keys() if "diffraction_pair_adapter" in k]
     print(f"1. Optax Adapter Target Keys: {adapter_keys}")
@@ -233,7 +235,7 @@ def main():
 
     optimizer = optax.chain(
         optax.clip_by_global_norm(1.0),  # Prevents weight collapse during spikes
-        optax.masked(optax.adam(learning_rate=3e-4), make_adapter_mask)
+        optax.masked(optax.adam(learning_rate=learning_rate), make_adapter_mask)
     )
     opt_state = optimizer.init(init_params)
 
@@ -255,7 +257,7 @@ def main():
                 batch["multichain_mask_2d"], batch["patterson_grid"], batch["grid_origin"],
                 batch["grid_spacing"], rng_key, True
             )
-            
+
             diff_sq = jnp.square(z_pred - jax.lax.stop_gradient(z_true))
             return jnp.sum(diff_sq * mask_2d[..., None]) / (num_valid_pairs * z_pred.shape[-1])
 
@@ -281,7 +283,7 @@ def main():
             batch["multichain_mask_2d"], batch["patterson_grid"], batch["grid_origin"],
             batch["grid_spacing"], rng_key, True
         )
-        
+
         diff_sq = jnp.square(z_pred - jax.lax.stop_gradient(z_true))
         return jnp.sum(diff_sq * mask_2d[..., None]) / (num_valid_pairs * z_pred.shape[-1])
 
@@ -293,12 +295,12 @@ def main():
     for step in range(1, num_steps + 1):
         key, subkey = jax.random.split(key)
         train_batch = generate_synthetic_batch(n_max=n_max, min_res=16, max_res=128, noise_scale=2.5, is_neutron=is_neutron)
-        
+
         params, opt_state, train_loss = train_step(params, opt_state, query_embed, train_batch, subkey)
 
         if step % val_interval == 0 or step == 1:
             val_loss = eval_step(params, query_embed, val_batch, subkey)
-            
+
             checkpoint_str = ""
             if val_loss < best_val_loss:
                 best_val_loss = val_loss
