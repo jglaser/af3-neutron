@@ -22,6 +22,14 @@ if not hasattr(gemmi.UnitCell, "orthogonalization_matrix"):
     gemmi.UnitCell.orthogonalization_matrix = property(lambda self: self.orth.mat)
 # ==============================================================================
 
+# Adam hyperparameters for the rigid-pose refiner, at the reference defaults
+# (Kingma & Ba 2015). Named rather than inline so the update rule below reads as
+# the textbook one.
+ADAM_BETA1 = 0.9
+ADAM_BETA2 = 0.999
+ADAM_EPS = 1e-8
+
+
 def _f_bulk_babinet(k_sol, b_sol, dr2, f_protein):
     """Babinet bulk solvent: mask-free, so it cannot go stale when the model moves.
 
@@ -232,17 +240,20 @@ def refine_rigid_pose(sfc, xyz, n_steps: int = 40, lr_rot: float = 2e-3,
     grad_fn = jax.value_and_grad(loss)
     lrs = jnp.concatenate([jnp.full((3,), lr_rot), jnp.full((3,), lr_trans)])
 
-    def body(carry, i):
+    def adam_step(carry, i):
+        """One Adam update on the 6 pose parameters, with bias correction."""
         p, m, v = carry
         _, g = grad_fn(p)
         i1 = i + 1.0
-        m = 0.9 * m + 0.1 * g
-        v = 0.999 * v + 0.001 * g**2
-        p = p - lrs * (m / (1 - 0.9**i1)) / (jnp.sqrt(v / (1 - 0.999**i1)) + 1e-8)
+        m = ADAM_BETA1 * m + (1.0 - ADAM_BETA1) * g
+        v = ADAM_BETA2 * v + (1.0 - ADAM_BETA2) * g**2
+        m_hat = m / (1.0 - ADAM_BETA1**i1)
+        v_hat = v / (1.0 - ADAM_BETA2**i1)
+        p = p - lrs * m_hat / (jnp.sqrt(v_hat) + ADAM_EPS)
         return (p, m, v), None
 
     z = jnp.zeros((6,))
-    (p, _, _), _ = jax.lax.scan(body, (z, z, z), jnp.arange(n_steps, dtype=jnp.float32))
+    (p, _, _), _ = jax.lax.scan(adam_step, (z, z, z), jnp.arange(n_steps, dtype=jnp.float32))
     return moved(p)
 
 
