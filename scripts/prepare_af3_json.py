@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 import argparse
 import copy
+import functools
 import json
 import os
+import pathlib
 import sys
 import urllib.error
 import urllib.request
@@ -77,12 +79,93 @@ def get_assembly_operators(mmcif_dict: Dict[str, Any]) -> List[Dict[str, Any]]:
         return [{"id": "1", "matrix": [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]], "vector": [0.0, 0.0, 0.0]}]
     return operators
 
+WATER_CODES = ("HOH", "DOD", "WAT")
+PLACEHOLDER_SMILES = "PLACEHOLDER_SMILES"
+
+# Persisted `ligand_id -> SMILES` table. The CCD is 49,835 components and AF3
+# already ships it, so the network is a fallback rather than the default path.
+# Overridable for tests and for running without a writable home directory.
+CCD_CACHE_PATH = pathlib.Path(
+    os.environ.get("AF3_NEUTRON_CCD_CACHE")
+    or pathlib.Path.home() / ".cache" / "af3_neutron" / "ccd_smiles.json"
+)
+
+
+@functools.lru_cache(maxsize=1)
+def _ccd_cache() -> Dict[str, str]:
+    """Load the on-disk SMILES table. Corrupt or unreadable cache starts empty."""
+    try:
+        with open(CCD_CACHE_PATH, encoding="utf-8") as f:
+            table = json.load(f)
+        return table if isinstance(table, dict) else {}
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {}
+
+
+def _save_ccd_cache(table: Dict[str, str]) -> None:
+    """Write the table, atomically, so a killed run cannot truncate it."""
+    try:
+        CCD_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        tmp = CCD_CACHE_PATH.with_suffix(".json.tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(table, f, sort_keys=True)
+        os.replace(tmp, CCD_CACHE_PATH)
+    except OSError as e:
+        print(f"Warning: could not write CCD cache: {e}", file=sys.stderr)
+
+
+@functools.lru_cache(maxsize=1)
+def _local_ccd():
+    """AF3's bundled CCD, or None if alphafold3 is not importable.
+
+    Imported lazily and softly: this script otherwise needs only Biopython, and
+    constructing the CCD costs ~5 s, so it is worth avoiding on a cache hit.
+    """
+    try:
+        from alphafold3.constants import chemical_components
+
+        return chemical_components, chemical_components.Ccd()
+    except Exception as e:
+        print(f"Note: AF3 CCD unavailable ({e}); falling back to RCSB.", file=sys.stderr)
+        return None
+
+
+def _smiles_from_local_ccd(ligand_id: str) -> str | None:
+    """SMILES for one component from AF3's bundled CCD."""
+    loaded = _local_ccd()
+    if loaded is None:
+        return None
+    chemical_components, ccd = loaded
+    info = chemical_components.component_name_to_info(ccd=ccd, res_name=ligand_id)
+    return getattr(info, "pdbx_smiles", None) if info else None
+
+
 def fetch_pdb_ligand_smiles(ligand_id: str) -> str:
-    """Queries the RCSB PDB Chemical Component API for a ligand's SMILES string."""
+    """SMILES for a ligand, from the on-disk cache, then AF3's CCD, then RCSB."""
     ligand_id = ligand_id.upper().strip()
-    if ligand_id in ["HOH", "DOD", "WAT"]:
+    if ligand_id in WATER_CODES:
         return "O"
 
+    cache = _ccd_cache()
+    if ligand_id in cache:
+        return cache[ligand_id]
+
+    smiles = _smiles_from_local_ccd(ligand_id)
+    if smiles:
+        cache[ligand_id] = smiles
+        _save_ccd_cache(cache)
+        print(f"Resolved '{ligand_id}' from AF3's local CCD.", file=sys.stderr)
+        return smiles
+
+    smiles = _fetch_ligand_smiles_from_rcsb(ligand_id)
+    if smiles and smiles != PLACEHOLDER_SMILES:
+        cache[ligand_id] = smiles
+        _save_ccd_cache(cache)
+    return smiles
+
+
+def _fetch_ligand_smiles_from_rcsb(ligand_id: str) -> str:
+    """Query the RCSB Chemical Component API. Needs network connectivity."""
     url = f"https://data.rcsb.org/rest/v1/core/chemcomp/{ligand_id}"
     print(f"Fetching SMILES for ligand '{ligand_id}' from PDB Component DB...", file=sys.stderr)
 
@@ -103,7 +186,7 @@ def fetch_pdb_ligand_smiles(ligand_id: str) -> str:
     except Exception as e:
         print(f"Warning: Network error fetching ligand '{ligand_id}': {str(e)}", file=sys.stderr)
 
-    return "PLACEHOLDER_SMILES"
+    return PLACEHOLDER_SMILES
 
 def generate_af3_json(input_path: str, job_name: str, output_dir: str, remove_water: bool, keep_agents: bool, cmd_smiles: Dict[str, str], model_seed: int = 1) -> Dict[str, Any]:
     """Generates the AF3 JSON input and applies symmetry operators using MMCIF2Dict."""

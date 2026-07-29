@@ -153,6 +153,12 @@ FLAGS = flags.FLAGS
 
 import pickle  # noqa: E402
 
+# rs.infer_mtz_dtypes() keys off the column name, and these two do not match any
+# of its amplitude patterns -- they come back as R (generic real) instead of F.
+# Coot and PyMOL pick map coefficients by looking for F/PHI pairs, so an R column
+# is silently never offered as a map. Everything else infers correctly.
+MTZ_DTYPE_OVERRIDES = {"2FOFCWT": "F", "DELFWT": "F"}
+
 
 def get_fmodel_and_scale(sfc, xyz_coords):
     """Computes scaled complex structure factors F_model and scale factor k."""
@@ -278,33 +284,19 @@ def export_neutron_maps(
         "FreeR_flag": free_flags,
     })
 
-    # 2. Set MTZ dtypes BEFORE setting the index!
-    ds["H"] = ds["H"].astype("HKL")
-    ds["K"] = ds["K"].astype("HKL")
-    ds["L"] = ds["L"].astype("HKL")
-    ds["FO"] = ds["FO"].astype("F")
-    ds["SIGFO"] = ds["SIGFO"].astype("Q")
-    ds["FC"] = ds["FC"].astype("F")
-    ds["PHIC"] = ds["PHIC"].astype("P")
-    ds["2FOFCWT"] = ds["2FOFCWT"].astype("F")
-    ds["PH2FOFCWT"] = ds["PH2FOFCWT"].astype("P")
-    ds["FOFCWT"] = ds["FOFCWT"].astype("F")
-    ds["PHFOFCWT"] = ds["PHFOFCWT"].astype("P")
-    ds["FWT"] = ds["FWT"].astype("F")
-    ds["PHWT"] = ds["PHWT"].astype("P")
-    ds["DELFWT"] = ds["DELFWT"].astype("F")
-    ds["PHDELWT"] = ds["PHDELWT"].astype("P")
-    ds["FreeR_flag"] = ds["FreeR_flag"].astype("I")
-
-    # 3. Inherit unit cell & spacegroup from reference MTZ
+    # 2. Inherit unit cell & spacegroup from reference MTZ
     mtz_ref = gemmi.read_mtz_file(mtz_reference_path)
     ds.spacegroup = mtz_ref.spacegroup
     ds.cell = mtz_ref.cell
 
-    # 4. Set multi-index now that H, K, L have the 'HKL' dtype
+    # 3. Index, then let rs infer the column types. The index can be set on plain
+    # integer H/K/L -- the old "dtypes BEFORE the index" ordering was not needed.
     ds.set_index(["H", "K", "L"], inplace=True)
+    ds = ds.infer_mtz_dtypes()
+    for column, mtz_type in MTZ_DTYPE_OVERRIDES.items():
+        ds[column] = ds[column].astype(mtz_type)
 
-    # 5. Write out MTZ file
+    # 4. Write out MTZ file
     ds.write_mtz(output_mtz_path)
     logging.info(f"Saved refined MTZ map coefficients to: {output_mtz_path}")
 
