@@ -29,7 +29,47 @@ hydride = { git = "https://github.com/jglaser/hydride-jax", rev="differentiate_h
 [dependency-groups]
 dev = [
     "pytest>=9.0.2",
+    "ruff>=0.9",
 ]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+extend-exclude = ["build"]
+
+[tool.ruff.lint]
+# E,F,W: pyflakes/pycodestyle. I: import order (asked for on run_neutron_refine.py).
+# D2xx/D4xx: the pydocstyle rules that bound docstring *shape* -- one-line
+# summary, no blank-line padding, imperative mood. Deliberately NOT D1xx
+# (missing-docstring): requiring a docstring everywhere is what produced the
+# filler this project is trying to delete.
+select = ["E", "F", "W", "I", "B", "D200", "D201", "D202", "D205", "D209", "D210", "D400", "D403", "D419"]
+# E501: line length is the formatter's job, not a second error.
+# UP (pep585/604 annotation modernization) and `ruff format` are both deliberately
+# left off for now -- each would rewrite most of the tree and bury the review.
+ignore = ["E501"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "numpy"
+
+[tool.ruff.lint.isort]
+known-first-party = ["af3_neutron"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["D"]
+
+[tool.lint_docs]
+# Budgets for tools/lint_docs.py. Tightening these is the point; loosening them
+# needs a reason in the commit message.
+max_docstring_lines = 12
+max_module_docstring_lines = 20
+max_comment_block = 8
+max_emphasis = 2
+# A ratchet, not a target. The per-site rules above do the real enforcement; this
+# only stops aggregate creep. Set just above the current worst file so nothing can
+# get worse: smc.py 49%, sfc_adapter.py 39% (from 81% and 62%), patterson.py 33%.
+# Lower it as those come down. Per-file baselines would be the better mechanism.
+max_prose_ratio = 0.50

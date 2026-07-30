@@ -1,0 +1,51 @@
+# One regex per line, matched case-insensitively with a leading \b.
+# Blank lines and #-comments ignored. Edit this list; it needs no code change.
+#
+# Taken from conorbronsdon/avoid-ai-writing's detector, restricted to the tiers
+# that actually fire in source comments: vocabulary, template phrases, and
+# discourse-marker padding. Its prose-only categories (sycophancy, CTA closers,
+# rhetorical questions) do not apply to code and are omitted.
+#
+# Dropped from the upstream list because they are domain vocabulary here, and a
+# linter that cries wolf gets switched off:
+#   landscape  -- energy/translation landscape is standard crystallographic usage
+#   unpack     -- unpacking a tuple is standard Python
+# "underscores" is narrowed to the verb sense ("underscores the need"), since the
+# noun names a character ("attributes with underscores").
+
+# -- tier 1/2 vocabulary --
+delve\s+into
+deep\s+dive
+dive\s+into
+realm\b
+testament\s+to
+leverag(?:e|es|ing|ed)\b
+utiliz(?:e|es|ing|ed)\b
+showcas(?:e|es|ing|ed)\b
+underscor(?:es|ing|ed)\s+(?:the|how|that|a)\b
+ascertain(?:s|ing|ed)?\b
+endeavou?r(?:s|ing|ed)?\b
+embark(?:s|ing|ed)?\b
+commenc(?:e|es|ing|ed)\b
+complexities\b
+
+# -- template phrases / padding --
+at\s+its\s+core
+in\s+order\s+to
+due\s+to\s+the\s+fact\s+that
+when\s+it\s+comes\s+to
+the\s+intersection\s+of
+best\s+practices
+it(?:'|’)?s\s+worth\s+noting
+it\s+is\s+important\s+to\s+note
+important\s+to\s+remember
+in\s+conclusion
+in\s+summary
+to\s+summarize
+that\s+(?:being\s+)?said
+at\s+the\s+end\s+of\s+the\s+day
+
+# -- discourse markers that pad a sentence without adding information --
+moreover\b
+furthermore\b
+notably\b

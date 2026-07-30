@@ -1,23 +1,17 @@
-"""
-diffraction_embedding.py
-========================
-Dynamic-length (N <= N_max) diffraction-informed template embedding module.
-"""
+"""Dynamic-length (N <= N_max) diffraction-informed template embedding."""
 
 import pickle
+
 import haiku as hk
 import jax
 import jax.numpy as jnp
 import numpy as np
-from typing import Dict, Any, Optional
-
 from alphafold3.model import features, model_config
-from alphafold3.model.scoring import scoring
 from alphafold3.model.network.template_modules import (
-    TemplateEmbedding,
     SingleTemplateEmbedding,
+    TemplateEmbedding,
 )
-
+from alphafold3.model.scoring import scoring
 
 # ==============================================================================
 # 1. Mask-Aware Diffraction Feature Calculators
@@ -33,14 +27,14 @@ def sample_patterson_map(
     """Queries 3D Patterson map density at u_ij = r_i - r_j for valid pairs."""
     u_ij = positions[:, None, :] - positions[None, :, :]
     grid_coords = (u_ij - grid_origin) / grid_spacing
-    
+
     sampled = jax.scipy.ndimage.map_coordinates(
         patterson_grid,
         jnp.moveaxis(grid_coords, -1, 0),
         order=1,
         mode="nearest",
     )[..., None]
-    
+
     # Zero out padded residue pairs
     return sampled * mask_2d[..., None]
 
@@ -51,11 +45,11 @@ def compute_debye_features(
 ) -> jnp.ndarray:
     diff = positions[:, None, :] - positions[None, :, :]
     d_ij = jnp.sqrt(jnp.sum(jnp.square(diff), axis=-1, keepdims=True) + 1e-8)
-    
+
     q_d = d_ij * q_bins[None, None, :]
     # Compute sinc wave
     debye_raw = jnp.where(q_d < 1e-4, 1.0, jnp.sin(q_d) / q_d)
-    
+
     # STRICT MASKING: Zero out padded residue pairs entirely
     return debye_raw * mask_2d[..., None]
 
