@@ -1,0 +1,86 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+# A single self-hosted runner takes one job at a time, so this is what keeps a
+# push train from queueing GPU work behind itself.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  UV_VERSION: "0.11.3"
+
+jobs:
+  lint:
+    # IMAGINEX-2 must carry a custom runner label of the same name.
+    runs-on: [self-hosted, IMAGINEX-2]
+    # Never run a fork's code on our own hardware.
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    steps:
+      - uses: actions/checkout@v4
+
+      # The runner service uses a non-login shell, so ~/.local/bin is not
+      # necessarily on PATH even though uv is installed there.
+      - name: Put uv on PATH
+        run: |
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
+
+      # tools/lint_docs.py is stdlib-only and ruff runs from uvx, so linting
+      # needs none of the CUDA/alphafold3 install the test job pays for.
+      - name: Docstring and comment budget
+        run: uv run --no-project --python 3.12 python tools/lint_docs.py .
+
+      - name: Offender ranking (informational)
+        if: always()
+        run: uv run --no-project --python 3.12 python tools/lint_docs.py . --report
+
+      - name: ruff check
+        run: uvx --from 'ruff>=0.9,<1' ruff check --output-format=github .
+
+      # TODO: enable `ruff format --check` once the tree has been formatted in a
+      # single mechanical commit. Turning it on now would fail on 21 of 25 files.
+
+  test:
+    runs-on: [self-hosted, IMAGINEX-2]
+    needs: lint
+    if: >-
+      github.event_name != 'pull_request' ||
+      github.event.pull_request.head.repo.full_name == github.repository
+    env:
+      # Leave headroom on the H100s so a stray concurrent job cannot OOM this one.
+      XLA_PYTHON_CLIENT_PREALLOCATE: "false"
+      XLA_PYTHON_CLIENT_ALLOCATOR: platform
+    steps:
+      - uses: actions/checkout@v4
+
+      # The runner service uses a non-login shell, so ~/.local/bin is not
+      # necessarily on PATH even though uv is installed there.
+      - name: Put uv on PATH
+        run: |
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          command -v uv >/dev/null || curl -LsSf https://astral.sh/uv/install.sh | sh
+
+      - name: Show GPUs
+        run: nvidia-smi
+
+      # alphafold3 is a local path dependency, which is the reason this cannot
+      # run on a hosted runner.
+      - name: Sync environment
+        run: uv sync --locked --group dev
+
+      - name: Confirm JAX sees the GPUs
+        run: uv run python -c "import jax; d = jax.devices(); print(d); assert any(x.platform == 'gpu' for x in d), d"
+
+      - name: pytest
+        run: uv run pytest tests/ -q --durations=10

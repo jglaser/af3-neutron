@@ -5,15 +5,13 @@ from typing import Any, Callable, Dict
 import haiku as hk
 import jax
 import jax.numpy as jnp
-
-from alphafold3.model import model, params, feat_batch
+from alphafold3.model import feat_batch, model, params
+from alphafold3.model.network import confidence_head, diffusion_head
 from alphafold3.model.network import evoformer as evoformer_network
-from alphafold3.model.network import diffusion_head
-from alphafold3.model.network import confidence_head
-from alphafold3.model import feat_batch
 
 from . import smc as smc_mod
 from .types import HostEmbeddings
+
 
 def make_model_config(
     num_recycles: int = 10, num_diffusion_samples: int = 5
@@ -33,7 +31,7 @@ class _HostTrunkWrapper(_HostModule):
     def __call__(self, batch: feat_batch.Batch) -> HostEmbeddings:
         embedding_module = evoformer_network.Evoformer(self.config.evoformer, self.config.global_config)
         target_feat = model.create_target_feat_embedding(batch, config=embedding_module.config, global_config=self.config.global_config)
-        
+
         def recycle_body(_, args):
             prev, key = args
             key, subkey = jax.random.split(key)
@@ -86,7 +84,7 @@ class _DiffusionHijackWrapper(_HostModule):
                 embeddings={"pair": embeddings.pair, "single": embeddings.single, "target_feat": embeddings.target_feat},
                 use_conditioning=True,
             )
-            
+
             # 2. Evaluate proximal_fn natively on the device
             return proximal_fn(x_0_real, t_hat)
 
@@ -129,16 +127,14 @@ class HostRunner:
         return functools.partial(jax.jit(forward_sample.apply, static_argnames=['proximal_fn', 'steps', 'smc_config'], device=self._device), self.model_params)
 
     def predict_confidence(self, sample_key, batch_dict, embeddings, positions_denoised):
-        """
-        Evaluates the AF3 Confidence Head using the denoised positions to extract pLDDT.
-        """
+        """Evaluate AF3's Confidence Head on the denoised positions to get pLDDT."""
         # The true positional signature for AF3 ConfidenceHead:
         def forward_confidence(pos, emb, seq_mask_arr, token_to_pseudo, asym_id_arr):
             head = confidence_head.ConfidenceHead(
                 self._model_config.heads.confidence,
                 self._model_config.global_config
             )
-                
+
             # Convert HostEmbeddings dataclass to a subscriptable dict
             if not isinstance(emb, dict):
                 emb = {
@@ -146,15 +142,15 @@ class HostRunner:
                     "single": emb.single,
                     "target_feat": emb.target_feat
                 }
-                
+
             # Call positionally in the EXACT order AF3 expects
             return head(pos, emb, seq_mask_arr, token_to_pseudo, asym_id_arr)
 
         confidence_fn = hk.transform(forward_confidence)
-        
+
         # Rebuild the Batch object outside to safely extract required topology arrays
         batch_obj = feat_batch.Batch.from_data_dict(batch_dict)
-        
+
         # Extract the specific tensors needed by the network
         token_to_pseudo = batch_obj.pseudo_beta_info.token_atoms_to_pseudo_beta
         asym_id = batch_obj.token_features.asym_id
@@ -173,13 +169,13 @@ class HostRunner:
 
         # Evaluate the confidence head using the properly scoped params
         confidence_dict = confidence_fn.apply(
-            confidence_params, 
-            sample_key, 
+            confidence_params,
+            sample_key,
             positions_denoised,  # 1st: pred_positions
             embeddings,          # 2nd: embeddings
             seq_mask,            # 3rd: seq_mask array
             token_to_pseudo,     # 4th: token_atoms_to_pseudo_beta
             asym_id              # 5th: asym_id
         )
-        
+
         return confidence_dict
