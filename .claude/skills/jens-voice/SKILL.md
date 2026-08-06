@@ -58,6 +58,14 @@ register right or the imitation fails:
   genuinely effusive — *extraordinary, remarkable, wholeheartedly* — but every
   compliment earned with a specific; courteous and faintly Continental (*"Please
   do not hesitate to reach out"*); signs *"Best,"*.
+- **Academic** (papers, technical reports) — his most impersonal register. One
+  long, dense opening sentence that front-loads the whole scope, then a short
+  declarative verdict: big sentence, then a hammer. *"We"* for what was done,
+  agentless passive to put a result or a number on stage (*"Over one billion
+  compounds were docked …"*). Assertive verbs (*demonstrate, strongly support,
+  fails*); qualifiers bound the domain (*"even for rather short chains"*) rather
+  than soften the claim; closes on a verdict or a mechanism — *why* it works or
+  fails — never on future work.
 
 Same person throughout: concrete, purposeful, unpadded, American spelling
 (*generalization, optimization*). The dial is sentence length and warmth, not the
@@ -68,8 +76,14 @@ DNA. See `references/samples.md` for real prose in each register.
 - **Lead with the point.** *"Current bet."* *"I am writing to lend my support for
   Vivek."* State it, then support it. No wind-up, no "In today's fast-moving…".
 - **Anchor every claim to a specific**, and **put a number on the quantitative
-  ones** — *three hours*, *1327 tests*, *1.8× slower* — never *fast*, *many*,
-  *much better*.
+  ones**, precise and unrounded — *three hours*, *1327 tests*, *3375 GPUs*, *1.8×
+  slower* — never *fast*, *many*, *much better*. The number carries the sentence;
+  keep the adjectives out of its way.
+- **Compare to the number, do not categorize around it.** When something clears
+  or misses a threshold, say how it compares — *"4BD1 has more"* — not *"4BD1
+  isn't one."* The positive quantitative form keeps the number in view; the
+  categorical negation buries it. He edits negations into positive facts, so
+  reach for the positive first.
 - **Warm is fine; hollow is not.** In a letter he is effusive, but the praise
   always lands on a fact or an anecdote (*a colleague was "in awe" of `uv`*). Cut
   any compliment floating free of evidence.
@@ -125,7 +139,9 @@ measured commit-essays from about July 2026 on are Claude drafting toward him: h
 endorsed the *direction* by merging them, but their mannerisms (heavy `--` asides,
 `->` arrows, "So:"-conclusions, define-by-negation, British spelling) are Claude's
 amplification, not confirmed his. Trust the ground-truth registers first; treat
-those essays as a target for measured *content*, not a source of tics.
+those essays as a target for measured *content*, not a source of tics. His papers
+settle the mechanics: American spelling, commas and parentheses over em-dashes and
+semicolons, and contrast carried by *but* rather than by negation.
 
 ## Boundaries
 

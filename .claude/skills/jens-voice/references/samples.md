@@ -83,9 +83,58 @@ he will send, give him this voice made clean.
 
 ## 4. Academic — first-author papers
 
-_To be filled from his first-author papers (the most impersonal register). Until
-then, expect: problem or result stated first, "we" for the method, quantitative
-claims with units, no hype._
+His most impersonal register. Six first-author papers span F-actin (PRL 2010) →
+block-copolymer field theory (Soft Matter / Macromolecules / PRL, 2012–14) → GPU
+molecular dynamics and COVID docking (CPC 2015, IJHPCA 2021).
+
+The signature cadence — one long, dense scope-setting sentence, then a short
+verdict (big sentence, then a hammer):
+
+> Simulations of five different coarse-grained models of symmetric diblock
+> copolymer melts are compared to demonstrate a universal (i.e., model-independent)
+> dependence of the free energy on the invariant degree of polymerization N̄, and to
+> study universal properties of the order-disorder transition (ODT).
+> — PRL 113, 068302 (2014), opening
+
+> The results strongly support the scaling hypothesis, even for rather short chains,
+> confirming that it is indeed possible to give an accurate universal description of
+> diblock copolymer systems.
+> — Soft Matter 8, 11310 (2012), closing
+
+"We" for what the authors did; agentless passive to put the result or the number
+on stage:
+
+> We demonstrate equivalent or superior scaling on up to 3375 GPUs in Lennard-Jones
+> and dissipative particle dynamics (DPD) simulations of up to 108 million particles.
+> — CPC 192, 97 (2015)
+
+> Over one billion compounds were docked to two SARS-CoV-2 protein structures with
+> full optimization of ligand position and 20 poses per docking, each in under 24
+> hours. — IJHPCA 35(5) (2021)
+
+Closes on the mechanism — *why* it fails, not on future work:
+
+> The FH theory fails for modest N̄ because the competing phases become strongly
+> segregated near the ODT, violating an underlying assumption of weak segregation.
+> — PRL 113, 068302 (2014)
+
+His contrast move is a pivot on *but*, never a negation:
+
+> The approach is inspired by a traditional CPU-based code, LAMMPS, but is
+> implemented within a code that was designed for execution on GPUs from the start.
+> — CPC 192, 97 (2015)
+
+**What to copy:** one long scope-setting sentence, then a short verdict; *we* for
+the work, passive to spotlight a result or a number; assertive verbs (*demonstrate,
+strongly support, fails*); qualifiers that bound the domain (*even for rather short
+chains*), not the confidence; precise unrounded numbers (*3375*, *19,028 per
+second*) carrying the sentence while adjectives stay scarce; contrast via *but*;
+parentheses for acronyms and enumeration; no em-dashes, no semicolons; American
+spelling; recurring frame *"a universal dependence of … on …"*.
+
+_These are corroborated across search snippets, not pages rendered directly
+(academic hosts were egress-blocked). Use them as voice samples, not as citations
+to quote back verbatim._
 
 ---
 
