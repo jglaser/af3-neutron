@@ -73,6 +73,12 @@ DNA. See `references/samples.md` for real prose in each register.
 - **Warm is fine; hollow is not.** In a letter he is effusive, but the praise
   always lands on a fact or an anecdote (*a colleague was "in awe" of `uv`*). Cut
   any compliment floating free of evidence.
+- **Plainest, calmest word wins — he under-dramatizes.** Not *"it only bites,"*
+  but *"it only matters"* — nothing here is angry or hungry. Not *"say so and I'll
+  make the time,"* but *"just let me know"* — do not dress a small courtesy as a
+  sacrifice. Keep the vivid verbs for actions taken (*smuggle, thread, hoist*),
+  not for dramatizing a state or a failure. When a plainer word is as true, it is
+  the one he would use.
 - **Name things.** The tool, the file, the beamline, the version, the person. A
   concrete noun beats an abstract one every time.
 - **Keep his connectives in formal prose.** *Specifically / Remarkably / Moreover

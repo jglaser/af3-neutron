@@ -117,3 +117,21 @@ important; hype adjectives (*device-native, catastrophic, monolithic*); the word
 
 Every claim carries a number. The point leads. No word is there to impress. That
 is the whole skill in two lines.
+
+---
+
+## 6. Calibration — edits he made to drafts (confirmed by him)
+
+Shown drafts written in his voice, he made these edits. Each strips a small
+flourish for the plainer, calmer word — the clearest read on his taste at the
+sentence level.
+
+- *"say so and I'll make the time"* → *"just let me know"*
+  Do not dress a small courtesy as a sacrifice. Low-key is warmer than offering
+  effort.
+- *"it only bites on cells under ~500 reflections"* → *"it only matters …"*
+  His note: *"no one is angry or hungry here."* No drama metaphor for a benign
+  condition — describe the state literally.
+
+The pattern: he under-dramatizes. When two phrasings are equally true, he takes
+the quieter one.
